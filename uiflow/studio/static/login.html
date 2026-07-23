@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>uiflow studio - Anmeldung</title>
+<link rel="stylesheet" href="/static/style.css">
+<style>
+  body { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+  .login-box {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: var(--shadow-md);
+    padding: 28px 32px;
+    width: 320px;
+  }
+  .login-box h1 { font-size: 1.1rem; margin: 0 0 18px; }
+  .login-box input {
+    width: 100%;
+    padding: 8px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 0.9rem;
+    margin-bottom: 12px;
+  }
+  .login-error { color: var(--danger); font-size: 0.82rem; margin: -6px 0 12px; }
+</style>
+</head>
+<body>
+<form class="login-box" method="post" action="/login">
+  <h1><span style="color:var(--accent)">uiflow</span> studio</h1>
+  <input type="password" name="password" placeholder="Passwort" autofocus>
+  <div class="login-error hidden" id="login-error">Falsches Passwort.</div>
+  <button type="submit" class="btn btn-primary" style="width:100%">Anmelden</button>
+</form>
+<script>
+  if (new URLSearchParams(location.search).has("error")) {
+    document.getElementById("login-error").classList.remove("hidden");
+  }
+</script>
+</body>
+</html>

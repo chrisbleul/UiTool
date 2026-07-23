@@ -1,0 +1,12 @@
+name: Notepad Hello World
+backend: desktop
+steps:
+  - action: launch
+    path: "notepad.exe"
+  - action: wait_for_element
+    control_type: "Document"
+  - action: type
+    control_type: "Document"
+    text: "Hello from uiflow MVP!"
+  - action: screenshot
+    path: "notepad.png"

@@ -1,0 +1,14 @@
+name: DoubleUI Deposit Demo
+backend: desktop
+steps:
+- action: connect
+  title: DoubleUI
+- action: type
+  auto_id: cashintb
+  text: '150.00'
+  breakpoint: true
+- action: type
+  auto_id: onustb
+  text: '25.00'
+- action: screenshot
+  path: demo_deposit.png

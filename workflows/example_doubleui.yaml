@@ -1,0 +1,10 @@
+name: DoubleUI Deposit
+backend: desktop
+steps:
+  - action: connect
+    title: "DoubleUI"
+  - action: type
+    auto_id: "cashintb"
+    text: "100.00"
+  - action: screenshot
+    path: "doubleui.png"

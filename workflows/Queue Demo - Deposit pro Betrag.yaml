@@ -1,0 +1,13 @@
+name: Queue Demo - Deposit pro Betrag
+backend: desktop
+steps:
+- action: launch
+  path: DoubleUI.exe
+- action: type
+  auto_id: cashintb
+  text: '{item.betrag}'
+- action: screenshot
+  path: queue_demo_current.png
+- action: click
+  title: Accept
+  control_type: Button

@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+*.log
+orchestrator.db
+orchestrator.db-wal
+orchestrator.db-shm
+search_result.png
+notepad.png
+doubleui.png
+studio_run.png
+studio_ui_screenshot.png

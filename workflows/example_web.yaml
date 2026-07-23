@@ -1,0 +1,16 @@
+name: DuckDuckGo Search
+backend: web
+steps:
+  - action: navigate
+    url: "https://duckduckgo.com"
+  - action: wait_for_selector
+    selector: "input[name=q]"
+  - action: type
+    selector: "input[name=q]"
+    text: "UiPath alternative open source"
+  - action: click
+    selector: "button[type=submit]"
+  - action: wait
+    seconds: 2
+  - action: screenshot
+    path: "search_result.png"

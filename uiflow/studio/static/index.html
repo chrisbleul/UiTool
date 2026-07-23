@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>&#9889;</text></svg>">
+<title>uiflow studio</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">uiflow <span>studio</span></div>
+
+  <input id="wf-name" type="text" placeholder="Workflow-Name" value="Neuer Workflow">
+
+  <select id="wf-backend">
+    <option value="web">Web</option>
+    <option value="desktop">Desktop</option>
+  </select>
+
+  <select id="wf-load">
+    <option value="">Workflow laden...</option>
+  </select>
+
+  <input id="wf-queue" type="text" list="queue-names" placeholder="Queue (optional)" title="Queue-Name: der Workflow läuft dann einmal pro Queue-Item statt nur einmal">
+  <datalist id="queue-names"></datalist>
+
+  <button id="btn-queues" class="btn" title="Queues ansehen">📋 Queues</button>
+  <button id="btn-credentials" class="btn" title="Anmeldedaten verwalten">🔑 Anmeldedaten</button>
+  <button id="btn-schedules" class="btn" title="Zeitpläne verwalten">⏱ Zeitplan</button>
+  <button id="btn-undo" class="btn" title="Rückgängig (Strg+Z)" disabled>↶ Rückgängig</button>
+  <button id="btn-save" class="btn">Speichern</button>
+  <button id="btn-run" class="btn btn-primary">Ausführen</button>
+  <button id="btn-logout" class="btn-icon" title="Abmelden">⏻</button>
+</header>
+
+<main>
+  <section id="steps" class="steps"></section>
+  <button id="btn-add-step" class="btn btn-add">+ Schritt hinzufügen</button>
+</main>
+
+<aside id="log-panel" class="log-panel hidden">
+  <div class="log-header">
+    <span id="log-status">Läuft...</span>
+    <button id="btn-stop" class="btn hidden">Stoppen</button>
+    <button id="btn-continue" class="btn btn-primary hidden">Weiter</button>
+    <button id="btn-close-log" class="btn-icon">&times;</button>
+  </div>
+  <div id="variables-watch" class="variables-watch hidden"></div>
+  <pre id="log-output"></pre>
+  <div id="log-screenshot" class="log-screenshot hidden"></div>
+</aside>
+
+<aside id="queues-panel" class="log-panel hidden">
+  <div class="log-header">
+    <span>Queues</span>
+    <button id="btn-refresh-queues" class="btn-icon" title="Aktualisieren">⟳</button>
+    <button id="btn-close-queues" class="btn-icon">&times;</button>
+  </div>
+  <div class="excel-import-row">
+    <input id="excel-queue-name" type="text" placeholder="Queue-Name">
+    <input id="excel-file" type="file" accept=".xlsx">
+    <button id="btn-import-excel" class="btn">Aus Excel importieren</button>
+  </div>
+  <div id="queues-list" class="queues-list"></div>
+</aside>
+
+<aside id="credentials-panel" class="log-panel hidden">
+  <div class="log-header">
+    <span>Anmeldedaten</span>
+    <button id="btn-close-credentials" class="btn-icon">&times;</button>
+  </div>
+  <div class="excel-import-row">
+    <input id="credential-name" type="text" placeholder="Name (z.B. smtp_password)">
+    <input id="credential-value" type="password" placeholder="Geheimwert">
+    <button id="btn-add-credential" class="btn">Speichern</button>
+  </div>
+  <p class="panel-hint">
+    Werte werden im Betriebssystem-Anmeldeinformationsspeicher abgelegt (nicht in dieser Datenbank).
+    Im Workflow nutzbar über einen <code>get_credential</code>-Schritt, danach als <code>{var.name}</code>.
+  </p>
+  <div id="credentials-list" class="queues-list"></div>
+</aside>
+
+<aside id="schedules-panel" class="log-panel hidden">
+  <div class="log-header">
+    <span>Zeitplan</span>
+    <button id="btn-close-schedules" class="btn-icon">&times;</button>
+  </div>
+  <div class="excel-import-row">
+    <input id="schedule-name" type="text" placeholder="Name">
+    <input id="schedule-cron" type="text" placeholder="Cron (z.B. 0 2 * * *)">
+    <button id="btn-add-schedule" class="btn">Aktuellen Workflow planen</button>
+  </div>
+  <p class="panel-hint">
+    Plant den aktuell im Builder geöffneten Workflow (inkl. Queue-Name oben, falls gesetzt).
+  </p>
+  <div id="schedules-list" class="queues-list"></div>
+</aside>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

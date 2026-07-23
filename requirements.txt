@@ -1,0 +1,13 @@
+PyYAML>=6.0
+Flask>=3.0
+openpyxl>=3.1
+playwright>=1.45
+pywinauto>=0.6.8; platform_system == "Windows"
+Pillow>=10.0; platform_system == "Windows"
+pynput>=1.7; platform_system == "Windows"
+requests>=2.31
+keyring>=24.0
+croniter>=2.0
+pypdf>=4.0
+pytesseract>=0.3.10
+pytest>=8.0
