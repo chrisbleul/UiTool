@@ -15,11 +15,11 @@ def _cli_breakpoint(index: int, step: Step, variables: dict) -> None:
     input()
 
 
-def _make_backend(name: str, headless: bool):
+def _make_backend(name: str, headless: bool, browser_channel: str | None = None):
     if name == "web":
         from .backends.web import WebBackend
 
-        return WebBackend(headless=headless)
+        return WebBackend(headless=headless, channel=browser_channel)
     if name == "desktop":
         from .backends.desktop import DesktopBackend
 
@@ -29,7 +29,7 @@ def _make_backend(name: str, headless: bool):
 
 def cmd_run(args: argparse.Namespace) -> int:
     workflow = Workflow.load(args.workflow)
-    backend = _make_backend(workflow.backend, headless=args.headless)
+    backend = _make_backend(workflow.backend, headless=args.headless, browser_channel=workflow.browser_channel)
     engine = WorkflowEngine(backend)
     try:
         engine.run(workflow, on_breakpoint=_cli_breakpoint)

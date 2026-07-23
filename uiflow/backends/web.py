@@ -26,9 +26,15 @@ class WebBackend:
     workflows without Playwright (and its browser binaries) installed.
     """
 
-    def __init__(self, headless: bool = False, browser: str = "chromium"):
+    def __init__(self, headless: bool = False, browser: str = "chromium", channel: str | None = None):
         self._headless = headless
         self._browser_name = browser
+        # Playwright's own bundled Chromium build by default (channel=None). Set
+        # channel="chrome" / "msedge" to instead drive the user's actually
+        # installed Google Chrome / Microsoft Edge - same automation, just a
+        # different, already-installed binary (must be installed on the machine;
+        # Playwright does not download these for you like it does its own build).
+        self._channel = channel
         self._playwright: Any = None
         self._browser: Any = None
         self._page: Any = None
@@ -38,7 +44,10 @@ class WebBackend:
 
         self._playwright = sync_playwright().start()
         browser_type = getattr(self._playwright, self._browser_name)
-        self._browser = browser_type.launch(headless=self._headless)
+        launch_kwargs: dict[str, Any] = {"headless": self._headless}
+        if self._channel:
+            launch_kwargs["channel"] = self._channel
+        self._browser = browser_type.launch(**launch_kwargs)
         self._page = self._browser.new_page()
 
     @property

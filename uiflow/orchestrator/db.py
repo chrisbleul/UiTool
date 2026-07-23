@@ -292,6 +292,12 @@ def get_queue_by_name(name: str) -> dict[str, Any] | None:
         return dict(row) if row else None
 
 
+def delete_queue(queue_id: int) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM queue_items WHERE queue_id=?", (queue_id,))
+        conn.execute("DELETE FROM queues WHERE id=?", (queue_id,))
+
+
 def list_queues() -> list[dict[str, Any]]:
     with connect() as conn:
         rows = conn.execute(

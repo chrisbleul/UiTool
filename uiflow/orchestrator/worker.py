@@ -49,18 +49,26 @@ class _DbLogHandler(logging.Handler):
         db.add_log(self._job_id, record.levelname, self.format(record))
 
 
-def _make_backend(backend_name: str) -> Any:
-    if backend_name == "web":
+def _make_backend(workflow: Workflow) -> Any:
+    if workflow.backend == "web":
         from ..backends.web import WebBackend
 
-        return WebBackend()
+        return WebBackend(channel=workflow.browser_channel)
     from ..backends.desktop import DesktopBackend
 
     return DesktopBackend()
 
 
 def _run_workflow_once(job_id: str, workflow: Workflow, variables: dict[str, Any] | None = None) -> None:
+    # Tracks whether this run was ever paused at a breakpoint - if the user then
+    # clicks "Stoppen" while paused there (mid-debug), we deliberately skip
+    # backend.close() below so the browser/desktop app stays open exactly where
+    # they left it, instead of yanking it away right as they start inspecting.
+    reached_breakpoint = False
+
     def on_breakpoint(index: int, step, variables: dict[str, Any]) -> None:
+        nonlocal reached_breakpoint
+        reached_breakpoint = True
         db.set_paused(job_id, index, step.action, variables)
         while not db.wait_and_clear_resume(job_id):
             if db.is_stop_requested(job_id):
@@ -68,7 +76,7 @@ def _run_workflow_once(job_id: str, workflow: Workflow, variables: dict[str, Any
             time.sleep(0.3)
         db.set_paused(job_id, None, None)
 
-    backend = _make_backend(workflow.backend)
+    backend = _make_backend(workflow)
     try:
         WorkflowEngine(backend).run(
             workflow,
@@ -77,12 +85,16 @@ def _run_workflow_once(job_id: str, workflow: Workflow, variables: dict[str, Any
             variables=variables,
         )
     finally:
-        close = getattr(backend, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:  # noqa: BLE001 - best-effort cleanup
-                pass
+        stopped_while_debugging = reached_breakpoint and db.is_stop_requested(job_id)
+        if stopped_while_debugging:
+            logger.info("Stopped while paused at a breakpoint - leaving the target application open")
+        else:
+            close = getattr(backend, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001 - best-effort cleanup
+                    pass
 
 
 def _run_job(job: dict[str, Any]) -> None:

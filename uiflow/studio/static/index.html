@@ -5,98 +5,216 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>&#9889;</text></svg>">
 <title>uiflow studio</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<header class="topbar">
-  <div class="brand">uiflow <span>studio</span></div>
+<div class="app-shell">
+  <nav class="sidebar">
+    <div class="sidebar-brand">uiflow<span>studio</span></div>
 
-  <input id="wf-name" type="text" placeholder="Workflow-Name" value="Neuer Workflow">
+    <button class="nav-item" data-view="dashboard" aria-label="Übersicht">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 11.5 12 4l8 7.5"/><path d="M6 10v9a1 1 0 0 0 1 1h3v-6h4v6h3a1 1 0 0 0 1-1v-9"/></svg>
+      <span>Übersicht</span>
+    </button>
+    <button class="nav-item" data-view="builder" aria-label="Builder">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="4" width="6" height="6" rx="1.5"/><rect x="14.5" y="14" width="6" height="6" rx="1.5"/><path d="M9.5 7h4a3 3 0 0 1 3 3v4"/></svg>
+      <span>Builder</span>
+    </button>
+    <button class="nav-item" data-view="orchestrator" aria-label="Orchestrator">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6"/><path d="M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"/></svg>
+      <span>Orchestrator</span>
+    </button>
+    <button class="nav-item" data-view="runs" aria-label="Runs">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><polyline points="8.5 12.5 10.5 14.5 15.5 9.5"/></svg>
+      <span>Runs</span>
+    </button>
 
-  <select id="wf-backend">
-    <option value="web">Web</option>
-    <option value="desktop">Desktop</option>
-  </select>
+    <div class="sidebar-spacer"></div>
 
-  <select id="wf-load">
-    <option value="">Workflow laden...</option>
-  </select>
+    <button id="btn-logout" class="nav-item" title="Abmelden" aria-label="Abmelden">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="3" x2="12" y2="11"/><path d="M6.3 6.3a8 8 0 1 0 11.4 0"/></svg>
+      <span>Abmelden</span>
+    </button>
+  </nav>
 
-  <input id="wf-queue" type="text" list="queue-names" placeholder="Queue (optional)" title="Queue-Name: der Workflow läuft dann einmal pro Queue-Item statt nur einmal">
-  <datalist id="queue-names"></datalist>
+  <div class="app-main">
 
-  <button id="btn-queues" class="btn" title="Queues ansehen">📋 Queues</button>
-  <button id="btn-credentials" class="btn" title="Anmeldedaten verwalten">🔑 Anmeldedaten</button>
-  <button id="btn-schedules" class="btn" title="Zeitpläne verwalten">⏱ Zeitplan</button>
-  <button id="btn-undo" class="btn" title="Rückgängig (Strg+Z)" disabled>↶ Rückgängig</button>
-  <button id="btn-save" class="btn">Speichern</button>
-  <button id="btn-run" class="btn btn-primary">Ausführen</button>
-  <button id="btn-logout" class="btn-icon" title="Abmelden">⏻</button>
-</header>
+    <section class="view" data-view="dashboard" id="view-dashboard">
+      <div class="view-header">
+        <div>
+          <h1>Übersicht</h1>
+          <p class="view-sub">Der aktuelle Stand deiner Automatisierungen auf einen Blick.</p>
+        </div>
+      </div>
+      <div class="stat-grid" id="dashboard-stats"></div>
+      <div class="dashboard-grid">
+        <div class="panel-card">
+          <div class="panel-card-head">
+            <h2>Letzte Läufe</h2>
+            <button class="btn-icon" data-goto="runs" title="Alle Runs ansehen" aria-label="Alle Runs ansehen">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="M13 6l6 6-6 6"/></svg>
+            </button>
+          </div>
+          <div id="dashboard-recent-runs" class="queues-list"></div>
+        </div>
+        <div class="panel-card">
+          <h2>Schnellzugriff</h2>
+          <div class="quick-actions">
+            <button class="btn" id="btn-quick-new-workflow">+ Neuer Workflow</button>
+            <button class="btn" data-goto="orchestrator">Orchestrator öffnen</button>
+            <button class="btn" data-goto="runs">Alle Läufe ansehen</button>
+          </div>
+        </div>
+      </div>
+    </section>
 
-<main>
-  <section id="steps" class="steps"></section>
-  <button id="btn-add-step" class="btn btn-add">+ Schritt hinzufügen</button>
-</main>
+    <section class="view" data-view="builder" id="view-builder">
+      <div class="builder-toolbar">
+        <input id="wf-name" type="text" placeholder="Workflow-Name" value="Neuer Workflow">
+
+        <select id="wf-backend">
+          <option value="web">Web</option>
+          <option value="desktop">Desktop</option>
+        </select>
+
+        <select id="wf-browser-channel" title="Welcher Browser die Web-Schritte ausführt">
+          <option value="">Chromium (Standard)</option>
+          <option value="chrome">Chrome</option>
+          <option value="msedge">Edge</option>
+        </select>
+
+        <select id="wf-load">
+          <option value="">Workflow laden...</option>
+        </select>
+
+        <input id="wf-queue" type="text" list="queue-names" placeholder="Queue (optional)" title="Queue-Name: der Workflow läuft dann einmal pro Queue-Item statt nur einmal">
+        <datalist id="queue-names"></datalist>
+
+        <button id="btn-undo" class="btn" title="Rückgängig (Strg+Z)" aria-label="Rückgängig" disabled>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9h10a6 6 0 0 1 0 12h-2"/><polyline points="9 4 4 9 9 14"/></svg>
+          <span>Rückgängig</span>
+        </button>
+        <button id="btn-save" class="btn">Speichern</button>
+        <button id="btn-run" class="btn btn-primary">Ausführen</button>
+      </div>
+
+      <div class="builder-canvas">
+        <section id="steps" class="steps"></section>
+        <button id="btn-add-step" class="btn btn-add">+ Schritt hinzufügen</button>
+      </div>
+    </section>
+
+    <section class="view" data-view="orchestrator" id="view-orchestrator">
+      <div class="view-header">
+        <div>
+          <h1>Orchestrator</h1>
+          <p class="view-sub">Workflows, Queues, Anmeldedaten und Zeitpläne verwalten.</p>
+        </div>
+      </div>
+
+      <div class="tabs" role="tablist">
+        <button class="tab-btn active" data-tab="workflows" role="tab">Workflows</button>
+        <button class="tab-btn" data-tab="queues" role="tab">Queues</button>
+        <button class="tab-btn" data-tab="credentials" role="tab">Anmeldedaten</button>
+        <button class="tab-btn" data-tab="schedules" role="tab">Zeitplan</button>
+      </div>
+
+      <div class="tab-panel active" data-tab-panel="workflows">
+        <div id="workflows-list" class="queues-list"></div>
+      </div>
+
+      <div class="tab-panel" data-tab-panel="queues">
+        <div class="excel-import-row">
+          <input id="excel-queue-name" type="text" placeholder="Queue-Name">
+          <input id="excel-file" type="file" accept=".xlsx">
+          <button id="btn-import-excel" class="btn">Aus Excel importieren</button>
+          <button id="btn-refresh-queues" class="btn-icon" title="Aktualisieren" aria-label="Aktualisieren">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-3-6.3"/><polyline points="20 3 20 8 15 8"/></svg>
+          </button>
+        </div>
+        <div id="queues-list" class="queues-list"></div>
+      </div>
+
+      <div class="tab-panel" data-tab-panel="credentials">
+        <div class="excel-import-row">
+          <input id="credential-name" type="text" placeholder="Name (z.B. smtp_password)">
+          <input id="credential-value" type="password" placeholder="Geheimwert">
+          <button id="btn-add-credential" class="btn">Speichern</button>
+        </div>
+        <p class="panel-hint">
+          Werte werden im Betriebssystem-Anmeldeinformationsspeicher abgelegt (nicht in dieser Datenbank).
+          Im Workflow nutzbar über einen <code>get_credential</code>-Schritt, danach als <code>{var.name}</code>.
+        </p>
+        <div id="credentials-list" class="queues-list"></div>
+      </div>
+
+      <div class="tab-panel" data-tab-panel="schedules">
+        <div class="excel-import-row">
+          <input id="schedule-name" type="text" placeholder="Name">
+          <input id="schedule-cron" type="text" placeholder="Cron (z.B. 0 2 * * *)">
+          <button id="btn-add-schedule" class="btn">Aktuellen Workflow planen</button>
+        </div>
+        <p class="panel-hint">
+          Plant den zuletzt im Builder geöffneten Workflow (inkl. Queue-Name, falls gesetzt).
+        </p>
+        <div id="schedules-list" class="queues-list"></div>
+      </div>
+    </section>
+
+    <section class="view" data-view="runs" id="view-runs">
+      <div class="view-header">
+        <div>
+          <h1>Runs</h1>
+          <p class="view-sub">Verlauf aller Ausführungen, inklusive Logs.</p>
+        </div>
+        <button id="btn-refresh-runs" class="btn-icon" title="Aktualisieren" aria-label="Aktualisieren">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-3-6.3"/><polyline points="20 3 20 8 15 8"/></svg>
+        </button>
+      </div>
+      <div id="runs-list" class="queues-list"></div>
+    </section>
+
+  </div>
+</div>
 
 <aside id="log-panel" class="log-panel hidden">
   <div class="log-header">
     <span id="log-status">Läuft...</span>
     <button id="btn-stop" class="btn hidden">Stoppen</button>
     <button id="btn-continue" class="btn btn-primary hidden">Weiter</button>
-    <button id="btn-close-log" class="btn-icon">&times;</button>
+    <button id="btn-close-log" class="btn-icon" aria-label="Schließen">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="5" y1="5" x2="19" y2="19"/><line x1="19" y1="5" x2="5" y2="19"/></svg>
+    </button>
   </div>
   <div id="variables-watch" class="variables-watch hidden"></div>
   <pre id="log-output"></pre>
   <div id="log-screenshot" class="log-screenshot hidden"></div>
 </aside>
 
-<aside id="queues-panel" class="log-panel hidden">
+<aside id="run-detail-panel" class="log-panel hidden">
   <div class="log-header">
-    <span>Queues</span>
-    <button id="btn-refresh-queues" class="btn-icon" title="Aktualisieren">⟳</button>
-    <button id="btn-close-queues" class="btn-icon">&times;</button>
+    <span id="run-detail-title">Run</span>
+    <button id="btn-close-run-detail" class="btn-icon" aria-label="Schließen">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="5" y1="5" x2="19" y2="19"/><line x1="19" y1="5" x2="5" y2="19"/></svg>
+    </button>
   </div>
-  <div class="excel-import-row">
-    <input id="excel-queue-name" type="text" placeholder="Queue-Name">
-    <input id="excel-file" type="file" accept=".xlsx">
-    <button id="btn-import-excel" class="btn">Aus Excel importieren</button>
-  </div>
-  <div id="queues-list" class="queues-list"></div>
+  <pre id="run-detail-logs"></pre>
 </aside>
 
-<aside id="credentials-panel" class="log-panel hidden">
-  <div class="log-header">
-    <span>Anmeldedaten</span>
-    <button id="btn-close-credentials" class="btn-icon">&times;</button>
-  </div>
-  <div class="excel-import-row">
-    <input id="credential-name" type="text" placeholder="Name (z.B. smtp_password)">
-    <input id="credential-value" type="password" placeholder="Geheimwert">
-    <button id="btn-add-credential" class="btn">Speichern</button>
-  </div>
-  <p class="panel-hint">
-    Werte werden im Betriebssystem-Anmeldeinformationsspeicher abgelegt (nicht in dieser Datenbank).
-    Im Workflow nutzbar über einen <code>get_credential</code>-Schritt, danach als <code>{var.name}</code>.
-  </p>
-  <div id="credentials-list" class="queues-list"></div>
-</aside>
+<div id="toast-host" class="toast-host" aria-live="polite"></div>
 
-<aside id="schedules-panel" class="log-panel hidden">
-  <div class="log-header">
-    <span>Zeitplan</span>
-    <button id="btn-close-schedules" class="btn-icon">&times;</button>
+<div id="confirm-overlay" class="modal-overlay hidden">
+  <div class="modal-box" role="alertdialog" aria-modal="true" aria-labelledby="confirm-message">
+    <p id="confirm-message"></p>
+    <div class="modal-actions">
+      <button id="confirm-cancel" class="btn">Abbrechen</button>
+      <button id="confirm-ok" class="btn btn-danger">Löschen</button>
+    </div>
   </div>
-  <div class="excel-import-row">
-    <input id="schedule-name" type="text" placeholder="Name">
-    <input id="schedule-cron" type="text" placeholder="Cron (z.B. 0 2 * * *)">
-    <button id="btn-add-schedule" class="btn">Aktuellen Workflow planen</button>
-  </div>
-  <p class="panel-hint">
-    Plant den aktuell im Builder geöffneten Workflow (inkl. Queue-Name oben, falls gesetzt).
-  </p>
-  <div id="schedules-list" class="queues-list"></div>
-</aside>
+</div>
 
 <script src="/static/app.js"></script>
 </body>

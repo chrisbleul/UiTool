@@ -110,6 +110,14 @@ def create_app() -> Flask:
         workflow.save(path)
         return jsonify({"saved": path.name})
 
+    @app.delete("/api/workflows/<name>")
+    def delete_workflow(name: str) -> Response:
+        path = _safe_workflow_path(name)
+        if not path.exists():
+            return jsonify({"error": "not found"}), 404
+        path.unlink()
+        return jsonify({"deleted": name})
+
     @app.post("/api/run")
     def run_workflow() -> Response:
         data = request.get_json(force=True)
@@ -227,6 +235,14 @@ def create_app() -> Flask:
             return jsonify({"error": "not found"}), 404
         status = request.args.get("status")
         return jsonify(db.list_queue_items(found["id"], status=status))
+
+    @app.delete("/api/queues/<name>")
+    def delete_queue_route(name: str) -> Response:
+        found = db.get_queue_by_name(name)
+        if found is None:
+            return jsonify({"error": "not found"}), 404
+        db.delete_queue(found["id"])
+        return jsonify({"deleted": name})
 
     @app.post("/api/queues/<name>/import-excel")
     def import_excel_to_queue(name: str) -> Response:

@@ -11,6 +11,71 @@ let recordingSource = null;
 
 const el = (id) => document.getElementById(id);
 
+// --- icons: one consistent, monochrome SVG set (currentColor) instead of
+// mixed emoji, so icon-only controls render identically across platforms ---
+function icon(inner) {
+  return `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${inner}</svg>`;
+}
+const ICONS = {
+  clipboard: icon('<rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 4V3a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v1"/><line x1="9" y1="11" x2="15" y2="11"/><line x1="9" y1="15" x2="15" y2="15"/>'),
+  target: icon('<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="4"/><circle cx="12" cy="12" r="1" fill="currentColor" stroke="none"/>'),
+  keyboard: icon('<rect x="3" y="6" width="18" height="12" rx="2"/><line x1="7" y1="10" x2="7" y2="10"/><line x1="10" y1="10" x2="10" y2="10"/><line x1="13" y1="10" x2="13" y2="10"/><line x1="16" y1="10" x2="16" y2="10"/><line x1="8" y1="14" x2="15" y2="14"/>'),
+  dot: icon('<circle cx="12" cy="12" r="6" fill="currentColor" stroke="none"/>'),
+  stop: icon('<rect x="7" y="7" width="10" height="10" rx="1.5" fill="currentColor" stroke="none"/>'),
+  monitor: icon('<rect x="3" y="4" width="18" height="12" rx="2"/><line x1="8" y1="20" x2="16" y2="20"/><line x1="12" y1="16" x2="12" y2="20"/>'),
+  pause: icon('<rect x="6" y="5" width="4" height="14" rx="1" fill="currentColor" stroke="none"/><rect x="14" y="5" width="4" height="14" rx="1" fill="currentColor" stroke="none"/>'),
+  play: icon('<path d="M7 4.5v15l13-7.5z" fill="currentColor" stroke="none"/>'),
+  grip: icon('<circle cx="9" cy="6" r="1.3" fill="currentColor" stroke="none"/><circle cx="9" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="9" cy="18" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="6" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="18" r="1.3" fill="currentColor" stroke="none"/>'),
+  pencil: icon('<path d="M4 20l1-4 11-11 3 3-11 11-4 1z"/><path d="M13.5 6.5l4 4"/>'),
+  copy: icon('<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/>'),
+  trash: icon('<path d="M4 7h16"/><path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/><path d="M6 7l1 13a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-13"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>'),
+  document: icon('<path d="M7 3h7l4 4v14a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M14 3v4h4"/>'),
+  check: icon('<polyline points="5 13 9 17 19 7"/>'),
+};
+
+// --- toasts + confirm modal: replace native alert()/confirm(), which break out
+// of the app's design language with an unstyled browser dialog ---
+function toast(message, type = "info") {
+  const host = el("toast-host");
+  const node = document.createElement("div");
+  node.className = "toast" + (type === "error" ? " toast-error" : type === "success" ? " toast-success" : "");
+  node.textContent = message;
+  host.appendChild(node);
+  setTimeout(() => node.remove(), 4000);
+}
+
+function confirmDialog(message, confirmLabel = "Löschen") {
+  return new Promise((resolve) => {
+    const overlay = el("confirm-overlay");
+    const okBtn = el("confirm-ok");
+    const cancelBtn = el("confirm-cancel");
+    el("confirm-message").textContent = message;
+    okBtn.textContent = confirmLabel;
+    overlay.classList.remove("hidden");
+
+    const cleanup = (result) => {
+      overlay.classList.add("hidden");
+      okBtn.removeEventListener("click", onOk);
+      cancelBtn.removeEventListener("click", onCancel);
+      overlay.removeEventListener("click", onOverlay);
+      document.removeEventListener("keydown", onKey);
+      resolve(result);
+    };
+    const onOk = () => cleanup(true);
+    const onCancel = () => cleanup(false);
+    const onOverlay = (e) => {
+      if (e.target === overlay) cleanup(false);
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape") cleanup(false);
+    };
+    okBtn.addEventListener("click", onOk);
+    cancelBtn.addEventListener("click", onCancel);
+    overlay.addEventListener("click", onOverlay);
+    document.addEventListener("keydown", onKey);
+  });
+}
+
 function newStepFor(backend) {
   const firstAction = Object.keys(schema[backend])[0];
   return { action: firstAction, params: {}, breakpoint: false, save_as: "" };
@@ -22,7 +87,12 @@ let undoStack = [];
 const MAX_UNDO = 50;
 
 function snapshotState() {
-  return JSON.stringify({ name: el("wf-name").value, backend: state.backend, steps: state.steps });
+  return JSON.stringify({
+    name: el("wf-name").value,
+    backend: state.backend,
+    browserChannel: el("wf-browser-channel").value,
+    steps: state.steps,
+  });
 }
 
 function pushUndo() {
@@ -37,9 +107,15 @@ function undo() {
   el("wf-name").value = snap.name;
   state.backend = snap.backend;
   el("wf-backend").value = snap.backend;
+  el("wf-browser-channel").value = snap.browserChannel || "";
+  updateBrowserChannelVisibility();
   state.steps = snap.steps;
   renderSteps();
   updateUndoButton();
+}
+
+function updateBrowserChannelVisibility() {
+  el("wf-browser-channel").classList.toggle("hidden", state.backend !== "web");
 }
 
 function updateUndoButton() {
@@ -71,6 +147,8 @@ async function loadWorkflow(name) {
   el("wf-name").value = data.name;
   el("wf-backend").value = data.backend;
   state.backend = data.backend;
+  el("wf-browser-channel").value = data.browser_channel || "";
+  updateBrowserChannelVisibility();
   state.steps = data.steps.map((s) => {
     const { action, breakpoint, save_as, ...params } = s;
     return { action, params, breakpoint: !!breakpoint, save_as: save_as || "" };
@@ -142,7 +220,7 @@ function renderStepCard(step, index, actions, opts) {
     const dragHandle = document.createElement("span");
     dragHandle.className = "drag-handle";
     dragHandle.title = "Ziehen zum Umsortieren";
-    dragHandle.textContent = "⠿";
+    dragHandle.innerHTML = ICONS.grip;
     dragHandle.draggable = true;
     dragHandle.addEventListener("dragstart", (e) => {
       e.dataTransfer.effectAllowed = "move";
@@ -221,6 +299,7 @@ function renderStepCard(step, index, actions, opts) {
     upBtn.className = "btn-icon";
     upBtn.textContent = "↑";
     upBtn.title = "Nach oben";
+    upBtn.setAttribute("aria-label", "Schritt nach oben verschieben");
     const topOffset = opts.isNested ? 0 : isScopeStep(stepsArray[0], 0) ? 1 : 0;
     upBtn.disabled = index <= topOffset;
     upBtn.addEventListener("click", () => {
@@ -233,6 +312,7 @@ function renderStepCard(step, index, actions, opts) {
     downBtn.className = "btn-icon";
     downBtn.textContent = "↓";
     downBtn.title = "Nach unten";
+    downBtn.setAttribute("aria-label", "Schritt nach unten verschieben");
     downBtn.disabled = index === stepsArray.length - 1;
     downBtn.addEventListener("click", () => {
       pushUndo();
@@ -244,6 +324,7 @@ function renderStepCard(step, index, actions, opts) {
     delBtn.className = "btn-icon danger";
     delBtn.textContent = "✕";
     delBtn.title = "Löschen";
+    delBtn.setAttribute("aria-label", "Schritt löschen");
     delBtn.addEventListener("click", () => {
       pushUndo();
       stepsArray.splice(index, 1);
@@ -257,6 +338,7 @@ function renderStepCard(step, index, actions, opts) {
     delBtn.className = "btn-icon danger";
     delBtn.textContent = "✕";
     delBtn.title = "Scope entfernen";
+    delBtn.setAttribute("aria-label", "Scope entfernen");
     delBtn.style.marginLeft = "auto";
     delBtn.addEventListener("click", () => {
       pushUndo();
@@ -364,8 +446,9 @@ function renderStepCard(step, index, actions, opts) {
       const recordBtn = document.createElement("button");
       recordBtn.type = "button";
       recordBtn.className = "btn-icon hotkey-record";
-      recordBtn.textContent = "🎹";
+      recordBtn.innerHTML = ICONS.keyboard;
       recordBtn.title = "Tastenkombination aufnehmen";
+      recordBtn.setAttribute("aria-label", "Tastenkombination aufnehmen");
       recordBtn.addEventListener("click", () => recordHotkey(input, step, fieldDef.name));
       const inputRow = document.createElement("div");
       inputRow.className = "hotkey-row";
@@ -402,8 +485,8 @@ function renderStepCard(step, index, actions, opts) {
   if (hasSelectorField || hasDesktopTargetFields) {
     const pickBtn = document.createElement("button");
     pickBtn.type = "button";
-    pickBtn.className = "btn-pick";
-    pickBtn.textContent = "🎯 Element auf dem Bildschirm wählen";
+    pickBtn.className = "btn btn-pick";
+    pickBtn.innerHTML = ICONS.target + "<span>Element auf dem Bildschirm wählen</span>";
     pickBtn.addEventListener("click", () => {
       if (hasSelectorField) pickWebSelector(step);
       else pickDesktopSelector(step);
@@ -527,6 +610,7 @@ function renderCasesField(parentStep, fieldName, label, actions, opts) {
     removeBtn.className = "btn-icon danger";
     removeBtn.textContent = "✕";
     removeBtn.title = "Fall entfernen";
+    removeBtn.setAttribute("aria-label", "Fall entfernen");
     removeBtn.addEventListener("click", () => {
       pushUndo();
       entries.splice(entries.indexOf(entry), 1);
@@ -594,7 +678,9 @@ function renderRecordingControls() {
   wrap.className = "record-controls";
   const btn = document.createElement("button");
   btn.className = "btn" + (currentRecordId ? " btn-recording" : "");
-  btn.textContent = currentRecordId ? "⏹ Aufnahme stoppen" : "🔴 Aufnahme starten";
+  btn.innerHTML = currentRecordId
+    ? ICONS.stop + "<span>Aufnahme stoppen</span>"
+    : ICONS.dot + "<span>Aufnahme starten</span>";
   btn.addEventListener("click", () => (currentRecordId ? stopRecording() : startRecording()));
   wrap.appendChild(btn);
   if (currentRecordId) {
@@ -617,7 +703,7 @@ function renderSteps() {
 
     const scopeLabel = document.createElement("div");
     scopeLabel.className = "scope-label";
-    scopeLabel.textContent = "🖥 Anwendungs-Scope";
+    scopeLabel.innerHTML = ICONS.monitor + "<span>Anwendungs-Scope</span>";
     scopeWrap.appendChild(scopeLabel);
 
     scopeWrap.appendChild(renderStepCard(state.steps[0], 0, actions, { isScope: true }));
@@ -718,10 +804,10 @@ async function pickWebSelector(step) {
       step.params.selector = data.selector;
       renderSteps();
     } else {
-      alert("Auswahl fehlgeschlagen: " + data.error);
+      toast("Auswahl fehlgeschlagen: " + data.error, "error");
     }
   } catch (err) {
-    alert("Auswahl fehlgeschlagen: " + err);
+    toast("Auswahl fehlgeschlagen: " + err, "error");
   } finally {
     hidePickStatus(banner);
   }
@@ -765,10 +851,10 @@ async function pickDesktopSelector(step) {
       if (data.title) step.params.title = data.title;
       renderSteps();
     } else {
-      alert("Auswahl fehlgeschlagen: " + data.error);
+      toast("Auswahl fehlgeschlagen: " + data.error, "error");
     }
   } catch (err) {
-    alert("Auswahl fehlgeschlagen: " + err);
+    toast("Auswahl fehlgeschlagen: " + err, "error");
   } finally {
     hidePickStatus(banner);
   }
@@ -777,7 +863,7 @@ async function pickDesktopSelector(step) {
 async function startRecording() {
   const scope = findDesktopScope();
   if (!scope) {
-    alert("Aufnahme benötigt einen Scope: der erste Schritt muss 'launch' oder 'connect' sein.");
+    toast("Aufnahme benötigt einen Scope: der erste Schritt muss 'launch' oder 'connect' sein.", "error");
     return;
   }
   const res = await fetch("/api/record/start", {
@@ -787,7 +873,7 @@ async function startRecording() {
   });
   const data = await res.json();
   if (!data.ok) {
-    alert("Aufnahme konnte nicht gestartet werden: " + (data.error || res.status));
+    toast("Aufnahme konnte nicht gestartet werden: " + (data.error || res.status), "error");
     return;
   }
   currentRecordId = data.record_id;
@@ -824,6 +910,7 @@ function currentWorkflowPayload() {
   return {
     name: el("wf-name").value || "workflow",
     backend: state.backend,
+    browser_channel: state.backend === "web" ? el("wf-browser-channel").value || undefined : undefined,
     steps: state.steps.map((s) => {
       const entry = { action: s.action, ...s.params };
       if (s.breakpoint) entry.breakpoint = true;
@@ -843,9 +930,10 @@ async function saveWorkflow() {
   if (res.ok) {
     await loadWorkflowList();
     el("wf-load").value = payload.name;
+    toast("Workflow gespeichert.", "success");
   } else {
     const err = await res.json();
-    alert("Speichern fehlgeschlagen: " + (err.error || res.status));
+    toast("Speichern fehlgeschlagen: " + (err.error || res.status), "error");
   }
 }
 
@@ -1027,7 +1115,24 @@ async function renderQueuesPanel() {
 
     const head = document.createElement("div");
     head.className = "queue-card-head";
-    head.textContent = `📋 ${q.name}`;
+    const headIcon = document.createElement("span");
+    headIcon.innerHTML = ICONS.clipboard;
+    const headName = document.createElement("span");
+    headName.style.flex = "1";
+    headName.textContent = q.name;
+    const delQueueBtn = document.createElement("button");
+    delQueueBtn.className = "btn-icon danger";
+    delQueueBtn.innerHTML = ICONS.trash;
+    delQueueBtn.title = "Queue löschen";
+    delQueueBtn.setAttribute("aria-label", `Queue "${q.name}" löschen`);
+    delQueueBtn.addEventListener("click", async () => {
+      if (!(await confirmDialog(`Queue "${q.name}" inklusive aller Items wirklich löschen?`))) return;
+      await fetch(`/api/queues/${encodeURIComponent(q.name)}`, { method: "DELETE" });
+      await renderQueuesPanel();
+      await loadQueueNames();
+      toast(`Queue "${q.name}" gelöscht.`, "success");
+    });
+    head.append(headIcon, headName, delQueueBtn);
     card.appendChild(head);
 
     const counts = document.createElement("div");
@@ -1074,10 +1179,12 @@ async function renderCredentialsPanel() {
     delBtn.className = "btn-icon danger";
     delBtn.textContent = "✕";
     delBtn.title = "Löschen";
+    delBtn.setAttribute("aria-label", `Anmeldedaten "${name}" löschen`);
     delBtn.addEventListener("click", async () => {
-      if (!confirm(`Anmeldedaten "${name}" wirklich löschen?`)) return;
+      if (!(await confirmDialog(`Anmeldedaten "${name}" wirklich löschen?`))) return;
       await fetch(`/api/credentials/${encodeURIComponent(name)}`, { method: "DELETE" });
       renderCredentialsPanel();
+      toast(`Anmeldedaten "${name}" gelöscht.`, "success");
     });
     row.append(label, delBtn);
     container.appendChild(row);
@@ -1088,7 +1195,7 @@ async function addCredential() {
   const name = el("credential-name").value.trim();
   const value = el("credential-value").value;
   if (!name || !value) {
-    alert("Bitte Name und Wert angeben.");
+    toast("Bitte Name und Wert angeben.", "error");
     return;
   }
   const res = await fetch("/api/credentials", {
@@ -1098,9 +1205,10 @@ async function addCredential() {
   });
   const data = await res.json();
   if (!res.ok) {
-    alert("Speichern fehlgeschlagen: " + (data.error || res.status));
+    toast("Speichern fehlgeschlagen: " + (data.error || res.status), "error");
     return;
   }
+  toast(`Anmeldedaten "${name}" gespeichert.`, "success");
   el("credential-name").value = "";
   el("credential-value").value = "";
   await renderCredentialsPanel();
@@ -1145,8 +1253,9 @@ async function renderSchedulesPanel() {
 
     const toggleBtn = document.createElement("button");
     toggleBtn.className = "btn-icon";
-    toggleBtn.textContent = s.enabled ? "⏸" : "▶";
+    toggleBtn.innerHTML = s.enabled ? ICONS.pause : ICONS.play;
     toggleBtn.title = s.enabled ? "Deaktivieren" : "Aktivieren";
+    toggleBtn.setAttribute("aria-label", s.enabled ? "Zeitplan deaktivieren" : "Zeitplan aktivieren");
     toggleBtn.addEventListener("click", async () => {
       await fetch(`/api/schedules/${s.id}/toggle`, { method: "POST" });
       renderSchedulesPanel();
@@ -1156,10 +1265,12 @@ async function renderSchedulesPanel() {
     delBtn.className = "btn-icon danger";
     delBtn.textContent = "✕";
     delBtn.title = "Löschen";
+    delBtn.setAttribute("aria-label", `Zeitplan "${s.name}" löschen`);
     delBtn.addEventListener("click", async () => {
-      if (!confirm(`Zeitplan "${s.name}" wirklich löschen?`)) return;
+      if (!(await confirmDialog(`Zeitplan "${s.name}" wirklich löschen?`))) return;
       await fetch(`/api/schedules/${s.id}`, { method: "DELETE" });
       renderSchedulesPanel();
+      toast(`Zeitplan "${s.name}" gelöscht.`, "success");
     });
 
     row.append(info, toggleBtn, delBtn);
@@ -1171,7 +1282,7 @@ async function addSchedule() {
   const name = el("schedule-name").value.trim();
   const cronExpr = el("schedule-cron").value.trim();
   if (!name || !cronExpr) {
-    alert("Bitte Name und Cron-Ausdruck angeben.");
+    toast("Bitte Name und Cron-Ausdruck angeben.", "error");
     return;
   }
   const payload = currentWorkflowPayload();
@@ -1183,12 +1294,13 @@ async function addSchedule() {
   });
   const data = await res.json();
   if (!res.ok) {
-    alert("Planen fehlgeschlagen: " + (data.error || res.status));
+    toast("Planen fehlgeschlagen: " + (data.error || res.status), "error");
     return;
   }
   el("schedule-name").value = "";
   el("schedule-cron").value = "";
   await renderSchedulesPanel();
+  toast(`Zeitplan "${name}" angelegt.`, "success");
 }
 
 function escapeHtml(text) {
@@ -1202,7 +1314,7 @@ async function importExcelToQueue() {
   const fileInput = el("excel-file");
   const file = fileInput.files[0];
   if (!name || !file) {
-    alert("Bitte Queue-Name und Excel-Datei angeben.");
+    toast("Bitte Queue-Name und Excel-Datei angeben.", "error");
     return;
   }
   const formData = new FormData();
@@ -1213,13 +1325,290 @@ async function importExcelToQueue() {
   });
   const data = await res.json();
   if (!res.ok) {
-    alert("Import fehlgeschlagen: " + (data.error || res.status));
+    toast("Import fehlgeschlagen: " + (data.error || res.status), "error");
     return;
   }
   fileInput.value = "";
   el("excel-queue-name").value = "";
   await renderQueuesPanel();
   await loadQueueNames();
+  toast(`${data.added} Zeile(n) importiert.`, "success");
+}
+
+// --- Orchestrator > Workflows: list, open, rename, duplicate, delete -------
+
+function startInlineRename(row, oldName, mode) {
+  const original = Array.from(row.children);
+  original.forEach((c) => (c.style.display = "none"));
+
+  const editRow = document.createElement("div");
+  editRow.className = "inline-edit-row";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = mode === "duplicate" ? `${oldName} (Kopie)` : oldName;
+
+  const confirmBtn = document.createElement("button");
+  confirmBtn.type = "button";
+  confirmBtn.className = "btn-icon";
+  confirmBtn.innerHTML = ICONS.check;
+  confirmBtn.title = mode === "duplicate" ? "Duplizieren" : "Umbenennen";
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.className = "btn-icon";
+  cancelBtn.textContent = "✕";
+  cancelBtn.title = "Abbrechen";
+
+  const cleanup = () => {
+    editRow.remove();
+    original.forEach((c) => (c.style.display = ""));
+  };
+  cancelBtn.addEventListener("click", cleanup);
+
+  const commit = async () => {
+    const newName = input.value.trim();
+    if (!newName || newName === oldName) {
+      cleanup();
+      return;
+    }
+    const data = await (await fetch(`/api/workflows/${encodeURIComponent(oldName)}`)).json();
+    data.name = newName;
+    const res = await fetch(`/api/workflows/${encodeURIComponent(newName)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      toast("Fehlgeschlagen: " + (err.error || res.status), "error");
+      return;
+    }
+    if (mode === "rename") {
+      await fetch(`/api/workflows/${encodeURIComponent(oldName)}`, { method: "DELETE" });
+    }
+    await renderWorkflowsPanel();
+    await loadWorkflowList();
+    toast(
+      mode === "rename" ? `Workflow umbenannt in "${newName}".` : `Workflow als "${newName}" dupliziert.`,
+      "success"
+    );
+  };
+
+  confirmBtn.addEventListener("click", commit);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") commit();
+    if (e.key === "Escape") cleanup();
+  });
+
+  editRow.append(input, confirmBtn, cancelBtn);
+  row.appendChild(editRow);
+  input.focus();
+  input.select();
+}
+
+async function renderWorkflowsPanel() {
+  const container = el("workflows-list");
+  container.innerHTML = "Lädt...";
+  const names = await (await fetch("/api/workflows")).json();
+  if (names.length === 0) {
+    container.innerHTML = '<p style="color:var(--muted)">Noch keine Workflows gespeichert.</p>';
+    return;
+  }
+  container.innerHTML = "";
+  for (const name of names) {
+    const row = document.createElement("div");
+    row.className = "list-row";
+
+    const label = document.createElement("span");
+    label.className = "list-row-name";
+    label.textContent = name;
+
+    const openBtn = document.createElement("button");
+    openBtn.className = "btn-icon";
+    openBtn.innerHTML = ICONS.document;
+    openBtn.title = "Im Builder öffnen";
+    openBtn.setAttribute("aria-label", `Workflow "${name}" im Builder öffnen`);
+    openBtn.addEventListener("click", async () => {
+      await loadWorkflow(name);
+      switchView("builder");
+    });
+
+    const renameBtn = document.createElement("button");
+    renameBtn.className = "btn-icon";
+    renameBtn.innerHTML = ICONS.pencil;
+    renameBtn.title = "Umbenennen";
+    renameBtn.setAttribute("aria-label", `Workflow "${name}" umbenennen`);
+    renameBtn.addEventListener("click", () => startInlineRename(row, name, "rename"));
+
+    const duplicateBtn = document.createElement("button");
+    duplicateBtn.className = "btn-icon";
+    duplicateBtn.innerHTML = ICONS.copy;
+    duplicateBtn.title = "Duplizieren";
+    duplicateBtn.setAttribute("aria-label", `Workflow "${name}" duplizieren`);
+    duplicateBtn.addEventListener("click", () => startInlineRename(row, name, "duplicate"));
+
+    const delBtn = document.createElement("button");
+    delBtn.className = "btn-icon danger";
+    delBtn.innerHTML = ICONS.trash;
+    delBtn.title = "Löschen";
+    delBtn.setAttribute("aria-label", `Workflow "${name}" löschen`);
+    delBtn.addEventListener("click", async () => {
+      if (!(await confirmDialog(`Workflow "${name}" wirklich löschen?`))) return;
+      await fetch(`/api/workflows/${encodeURIComponent(name)}`, { method: "DELETE" });
+      await renderWorkflowsPanel();
+      await loadWorkflowList();
+      toast(`Workflow "${name}" gelöscht.`, "success");
+    });
+
+    row.append(label, openBtn, renameBtn, duplicateBtn, delBtn);
+    container.appendChild(row);
+  }
+}
+
+// --- Runs: history list + log detail drawer, backed by the already-existing
+// /api/jobs endpoints (previously persisted but never surfaced in the UI) ---
+
+function formatDuration(job) {
+  if (!job.started_at) return "wartet...";
+  const start = new Date(job.started_at);
+  const end = job.finished_at ? new Date(job.finished_at) : new Date();
+  const secs = Math.max(0, Math.round((end - start) / 1000));
+  if (secs < 60) return `${secs}s`;
+  return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+}
+
+function buildRunRow(job) {
+  const row = document.createElement("div");
+  row.className = "list-row run-row";
+
+  const badge = document.createElement("span");
+  badge.className = `run-status-badge ${job.status}`;
+  badge.textContent = job.status;
+
+  const info = document.createElement("div");
+  info.style.flex = "1";
+  const name = document.createElement("div");
+  name.className = "list-row-name";
+  name.textContent = job.name;
+  const meta = document.createElement("div");
+  meta.className = "list-row-meta";
+  meta.textContent =
+    (job.queue_name ? `Queue: ${job.queue_name} · ` : "") +
+    (job.started_at ? new Date(job.started_at).toLocaleString() : "wartet noch") +
+    ` · ${formatDuration(job)}`;
+  info.append(name, meta);
+
+  row.append(badge, info);
+  row.addEventListener("click", () => openRunDetail(job));
+  return row;
+}
+
+async function openRunDetail(job) {
+  el("run-detail-title").textContent = `${job.name} · ${job.status}`;
+  el("run-detail-logs").textContent = "Lädt...";
+  el("run-detail-panel").classList.remove("hidden");
+  const logs = await (await fetch(`/api/jobs/${job.id}/logs`)).json();
+  el("run-detail-logs").textContent = logs.length ? logs.map((l) => l.message).join("\n") : "Keine Logs für diesen Lauf.";
+}
+
+async function renderRunsView() {
+  const container = el("runs-list");
+  container.innerHTML = "Lädt...";
+  const jobs = await (await fetch("/api/jobs")).json();
+  if (jobs.length === 0) {
+    container.innerHTML = '<p style="color:var(--muted)">Noch keine Läufe.</p>';
+    return;
+  }
+  container.innerHTML = "";
+  for (const job of jobs) {
+    container.appendChild(buildRunRow(job));
+  }
+}
+
+// --- Dashboard: aggregate KPIs from the existing endpoints, no new backend --
+
+async function renderDashboard() {
+  const statsBox = el("dashboard-stats");
+  statsBox.innerHTML = '<p style="color:var(--muted)">Lädt...</p>';
+  const [workflowNames, jobs, queues, schedules] = await Promise.all([
+    fetch("/api/workflows").then((r) => r.json()),
+    fetch("/api/jobs").then((r) => r.json()),
+    fetch("/api/queues").then((r) => r.json()),
+    fetch("/api/schedules").then((r) => r.json()),
+  ]);
+
+  const successCount = jobs.filter((j) => j.status === "success").length;
+  const finishedCount = jobs.filter((j) => ["success", "error", "cancelled"].includes(j.status)).length;
+  const successRate = finishedCount ? Math.round((successCount / finishedCount) * 100) : null;
+  const backlog = queues.reduce((sum, q) => sum + (q.new_count || 0) + (q.in_progress_count || 0), 0);
+  const activeSchedules = schedules.filter((s) => s.enabled).length;
+
+  const tiles = [
+    { value: workflowNames.length, label: "Workflows" },
+    { value: jobs.length, label: "Läufe (letzte 100)" },
+    { value: successRate === null ? "–" : `${successRate}%`, label: "Erfolgsquote" },
+    { value: backlog, label: "Offene Queue-Items" },
+    { value: activeSchedules, label: "Aktive Zeitpläne" },
+  ];
+  statsBox.innerHTML = tiles
+    .map(
+      (t) =>
+        `<div class="stat-tile"><div class="stat-tile-value">${t.value}</div><div class="stat-tile-label">${t.label}</div></div>`
+    )
+    .join("");
+
+  const recentBox = el("dashboard-recent-runs");
+  const recent = jobs.slice(0, 5);
+  if (recent.length === 0) {
+    recentBox.innerHTML = '<p style="color:var(--muted)">Noch keine Läufe.</p>';
+    return;
+  }
+  recentBox.innerHTML = "";
+  for (const job of recent) {
+    recentBox.appendChild(buildRunRow(job));
+  }
+}
+
+// --- view navigation (Übersicht / Builder / Orchestrator / Runs) -----------
+
+const VIEW_LOADERS = {
+  dashboard: renderDashboard,
+  orchestrator: renderWorkflowsPanel, // "Workflows" is the default active tab
+  runs: renderRunsView,
+};
+
+function switchView(name) {
+  document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.dataset.view === name));
+  document
+    .querySelectorAll(".nav-item[data-view]")
+    .forEach((b) => b.classList.toggle("active", b.dataset.view === name));
+  const loader = VIEW_LOADERS[name];
+  if (loader) loader();
+}
+
+function switchTab(name) {
+  document.querySelectorAll(".tab-btn").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
+  document
+    .querySelectorAll(".tab-panel")
+    .forEach((p) => p.classList.toggle("active", p.dataset.tabPanel === name));
+  if (name === "workflows") renderWorkflowsPanel();
+  if (name === "queues") renderQueuesPanel();
+  if (name === "credentials") renderCredentialsPanel();
+  if (name === "schedules") renderSchedulesPanel();
+}
+
+function startNewWorkflow() {
+  el("wf-name").value = "Neuer Workflow";
+  el("wf-load").value = "";
+  el("wf-queue").value = "";
+  state.backend = "web";
+  el("wf-backend").value = "web";
+  el("wf-browser-channel").value = "";
+  updateBrowserChannelVisibility();
+  state.steps = [newStepFor(state.backend)];
+  undoStack = [];
+  updateUndoButton();
+  renderSteps();
 }
 
 function init() {
@@ -1238,28 +1627,27 @@ function init() {
     location.href = "/";
   });
   el("btn-close-log").addEventListener("click", () => el("log-panel").classList.add("hidden"));
+  el("btn-close-run-detail").addEventListener("click", () => el("run-detail-panel").classList.add("hidden"));
 
-  el("btn-queues").addEventListener("click", () => {
-    el("queues-panel").classList.remove("hidden");
-    renderQueuesPanel();
-  });
   el("btn-refresh-queues").addEventListener("click", renderQueuesPanel);
-  el("btn-close-queues").addEventListener("click", () => el("queues-panel").classList.add("hidden"));
   el("btn-import-excel").addEventListener("click", importExcelToQueue);
-
-  el("btn-credentials").addEventListener("click", () => {
-    el("credentials-panel").classList.remove("hidden");
-    renderCredentialsPanel();
-  });
-  el("btn-close-credentials").addEventListener("click", () => el("credentials-panel").classList.add("hidden"));
   el("btn-add-credential").addEventListener("click", addCredential);
-
-  el("btn-schedules").addEventListener("click", () => {
-    el("schedules-panel").classList.remove("hidden");
-    renderSchedulesPanel();
-  });
-  el("btn-close-schedules").addEventListener("click", () => el("schedules-panel").classList.add("hidden"));
   el("btn-add-schedule").addEventListener("click", addSchedule);
+  el("btn-refresh-runs").addEventListener("click", renderRunsView);
+  el("btn-quick-new-workflow").addEventListener("click", () => {
+    startNewWorkflow();
+    switchView("builder");
+  });
+
+  document.querySelectorAll(".nav-item[data-view]").forEach((btn) => {
+    btn.addEventListener("click", () => switchView(btn.dataset.view));
+  });
+  document.querySelectorAll("[data-goto]").forEach((btn) => {
+    btn.addEventListener("click", () => switchView(btn.dataset.goto));
+  });
+  document.querySelectorAll(".tab-btn").forEach((btn) => {
+    btn.addEventListener("click", () => switchTab(btn.dataset.tab));
+  });
 
   document.addEventListener("keydown", (e) => {
     const isUndoShortcut = (e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "z";
@@ -1273,6 +1661,7 @@ function init() {
     pushUndo();
     state.backend = e.target.value;
     state.steps = [];
+    updateBrowserChannelVisibility();
     renderSteps();
   });
 
@@ -1287,6 +1676,8 @@ function init() {
   loadWorkflowList();
   loadQueueNames();
   updateUndoButton();
+  updateBrowserChannelVisibility();
+  switchView("dashboard");
 }
 
 init();

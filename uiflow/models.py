@@ -28,19 +28,29 @@ class Step:
         return cls(action=action, params=data, breakpoint=breakpoint_flag, save_as=save_as)
 
 
+VALID_BROWSER_CHANNELS = (None, "chrome", "msedge")
+
+
 @dataclass
 class Workflow:
     name: str
     backend: str
     steps: list[Step]
+    # Only meaningful when backend == "web": None runs Playwright's own bundled
+    # Chromium build; "chrome"/"msedge" instead drive the locally installed
+    # Google Chrome / Microsoft Edge (must already be installed on the machine).
+    browser_channel: str | None = None
 
     @classmethod
     def from_raw(cls, raw: dict[str, Any]) -> "Workflow":
         backend = raw.get("backend", "web")
         if backend not in VALID_BACKENDS:
             raise ValueError(f"Unknown backend '{backend}', expected one of {VALID_BACKENDS}")
+        browser_channel = raw.get("browser_channel") or None
+        if browser_channel not in VALID_BROWSER_CHANNELS:
+            raise ValueError(f"Unknown browser_channel '{browser_channel}', expected one of {VALID_BROWSER_CHANNELS}")
         steps = [Step.from_dict(s) for s in raw.get("steps", [])]
-        return cls(name=raw.get("name", "workflow"), backend=backend, steps=steps)
+        return cls(name=raw.get("name", "workflow"), backend=backend, steps=steps, browser_channel=browser_channel)
 
     @classmethod
     def load(cls, path: str | Path) -> "Workflow":
@@ -58,7 +68,10 @@ class Workflow:
             if s.save_as:
                 entry["save_as"] = s.save_as
             steps.append(entry)
-        return {"name": self.name, "backend": self.backend, "steps": steps}
+        result: dict[str, Any] = {"name": self.name, "backend": self.backend, "steps": steps}
+        if self.browser_channel:
+            result["browser_channel"] = self.browser_channel
+        return result
 
     def save(self, path: str | Path) -> None:
         Path(path).write_text(
