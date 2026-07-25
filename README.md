@@ -763,6 +763,25 @@ tausende Einträge pro Job); die Job-Historie unter **Runs** ist dessen eigene, 
 Aufzeichnung. In der Studio-Oberfläche über `GET /api/audit-log?limit=200` abrufbar (Standard: die
 letzten 200 Einträge, neueste zuerst).
 
+## Proaktive Fehlerbenachrichtigung
+
+Tab **Benachrichtigungen** (nur für Admins sichtbar) — verschickt automatisch eine E-Mail, sobald ein
+Job endgültig fehlschlägt (`status: error`, egal ob ein einzelner Workflow-Lauf oder ein Queue-Item,
+das seine Wiederholungen aufgebraucht hat), unabhängig vom Workflow-Inhalt. Anders als ein eigener
+`send_email`-Schritt (den ein Workflow-Autor pro Workflow selbst einbauen müsste) ist das eine
+Installations-weite Einstellung: SMTP-Server/Port/TLS, Absender, Empfänger, und ein Anmeldedaten-Name
+(siehe Tab **Anmeldedaten**), aus dem das SMTP-Passwort nachgeschlagen wird — das Passwort selbst wird
+nirgends in dieser Einstellung eingegeben oder gespeichert. Der Button **Test senden** verschickt sofort
+eine Testnachricht und zeigt einen echten SMTP-Fehler an (z.B. eine falsche Anmeldung), statt ihn erst
+beim nächsten echten Fehlschlag zu bemerken.
+
+Funktioniert unabhängig davon, ob der fehlgeschlagene Job lokal oder über einen Remote-Worker (siehe
+oben) lief: `orchestrator/db.py`s `notify_job_failed()` läuft entweder direkt im lokalen Worker-Prozess
+oder — für einen Remote-Worker, der keinen lokalen Zugriff auf diese Einstellung hätte — im
+Studio-Server selbst, sobald der die passende `/api/worker/jobs/<id>/finish`-Meldung entgegennimmt. Ein
+Fehlschlag beim Versenden selbst (falsches SMTP-Passwort, Netzwerkproblem) lässt den eigentlichen Job
+nicht zusätzlich fehlschlagen — er wird nur als Warnung geloggt.
+
 ## Tests
 
 ```powershell
@@ -834,10 +853,9 @@ Ideen, was als Nächstes sinnvoll sein könnte. Reihenfolge ist keine Priorität
   (viewer/operator/admin, siehe "Benutzer & Rollen" oben) — kein "Team A darf nur Workflows in Ordner
   X sehen/starten". Setzt vermutlich eine Ordner-/Projektstruktur (siehe unten) als Voraussetzung
   voraus, bevor sich Rechte überhaupt sinnvoll darauf beziehen lassen.
-- **Proaktive Fehlerbenachrichtigung** (E-Mail/Slack/Webhook, wenn ein Job oder Queue-Item endgültig
-  fehlschlägt): heute muss man aktiv die Runs-Ansicht oder `/api/jobs?status=error` abfragen. Die
-  Bausteine (`send_email`-Aktion, `http_request`) existieren im Workflow selbst bereits — hier ginge es
-  um eine Orchestrator-seitige Benachrichtigung, unabhängig vom Workflow-Inhalt.
+- ~~**Proaktive Fehlerbenachrichtigung**~~ — als E-Mail erledigt, siehe "Proaktive
+  Fehlerbenachrichtigung" oben. Was fehlt: Slack- oder Webhook-Kanäle statt/zusätzlich zu E-Mail — die
+  Einstellung kennt aktuell nur SMTP.
 - **Workflow-Versionierung**: "Speichern" überschreibt die YAML-Datei ohne Historie — kein Diff
   zwischen zwei Ständen, kein Zurückrollen auf eine ältere Version direkt im Studio. Ließe sich
   entweder über echtes Git im Hintergrund lösen oder über eine einfache eigene Versions-Tabelle

@@ -2008,6 +2008,7 @@ function applyRoleVisibility() {
   el("tab-btn-globals").classList.toggle("hidden", !isAdmin);
   el("tab-btn-users").classList.toggle("hidden", !currentUser.multiuser || !isAdmin);
   el("tab-btn-audit").classList.toggle("hidden", !isAdmin);
+  el("tab-btn-notifications").classList.toggle("hidden", !isAdmin);
 
   const userBox = el("current-user");
   if (currentUser.multiuser && currentUser.username) {
@@ -2054,6 +2055,52 @@ async function renderAuditLogPanel() {
     row.append(badge, info);
     container.appendChild(row);
   }
+}
+
+async function renderNotificationsPanel() {
+  const res = await fetch("/api/notifications");
+  if (!res.ok) return; // not an admin - the tab itself is already hidden for that case
+  const settings = await res.json();
+  el("notif-enabled").checked = settings.enabled;
+  el("notif-smtp-host").value = settings.smtp_host || "";
+  el("notif-smtp-port").value = settings.smtp_port || 587;
+  el("notif-use-tls").checked = settings.use_tls;
+  el("notif-username").value = settings.username || "";
+  el("notif-from").value = settings.from_addr || "";
+  el("notif-to").value = settings.to_addr || "";
+  el("notif-credential").value = settings.credential_name || "";
+}
+
+async function saveNotificationSettings() {
+  const res = await fetch("/api/notifications", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      enabled: el("notif-enabled").checked,
+      smtp_host: el("notif-smtp-host").value.trim(),
+      smtp_port: parseInt(el("notif-smtp-port").value, 10) || 587,
+      use_tls: el("notif-use-tls").checked,
+      username: el("notif-username").value.trim(),
+      from_addr: el("notif-from").value.trim(),
+      to_addr: el("notif-to").value.trim(),
+      credential_name: el("notif-credential").value.trim(),
+    }),
+  });
+  if (!res.ok) {
+    toast("Speichern fehlgeschlagen.", "error");
+    return;
+  }
+  toast("Benachrichtigungseinstellungen gespeichert.", "success");
+}
+
+async function sendTestNotification() {
+  const res = await fetch("/api/notifications/test", { method: "POST" });
+  const data = await res.json();
+  if (!res.ok) {
+    toast("Test fehlgeschlagen: " + (data.error || res.status), "error");
+    return;
+  }
+  toast("Testbenachrichtigung gesendet.", "success");
 }
 
 // --- declared workflow variables (per-workflow, saved as part of its own
@@ -2761,6 +2808,7 @@ function switchTab(name) {
   if (name === "schedules") renderSchedulesPanel();
   if (name === "users") renderUsersPanel();
   if (name === "audit") renderAuditLogPanel();
+  if (name === "notifications") renderNotificationsPanel();
 }
 
 function startNewWorkflow() {
@@ -2823,6 +2871,8 @@ function init() {
   el("btn-add-global").addEventListener("click", addGlobal);
   el("btn-add-schedule").addEventListener("click", addSchedule);
   el("btn-add-user").addEventListener("click", addUser);
+  el("btn-save-notifications").addEventListener("click", saveNotificationSettings);
+  el("btn-test-notification").addEventListener("click", sendTestNotification);
   el("btn-refresh-runs").addEventListener("click", renderRunsView);
   el("btn-quick-new-workflow").addEventListener("click", () => {
     startNewWorkflow();

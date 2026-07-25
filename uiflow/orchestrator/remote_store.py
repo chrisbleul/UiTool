@@ -101,6 +101,13 @@ class RemoteStore:
     def finish_job(self, job_id: str, status: str, error_message: str | None = None) -> None:
         self._post(f"/api/worker/jobs/{quote(job_id)}/finish", {"status": status, "error_message": error_message})
 
+    def notify_job_failed(self, job_id: str, job_name: str, error_message: str | None) -> None:
+        # A no-op here on purpose: the Studio server already sends this
+        # itself, from inside the same /api/worker/jobs/<id>/finish call
+        # finish_job() above just made (see studio/app.py) - a remote worker
+        # has no local notification settings/credentials to read anyway.
+        pass
+
     def get_global_variables(self) -> dict[str, Any]:
         return self._get("/api/worker/globals")
 

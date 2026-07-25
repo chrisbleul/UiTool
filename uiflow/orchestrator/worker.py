@@ -160,6 +160,16 @@ def _run_job(job: dict[str, Any], store: Any = db, heartbeat_interval: float = H
     }
     queue_name = job["queue_name"]
 
+    def _finish(status: str, error_message: str | None = None) -> None:
+        store.finish_job(job_id, status, error_message)
+        if status == "error":
+            # store.notify_job_failed is a no-op for a RemoteStore - the
+            # Studio server already sends this itself when it handles the
+            # matching /api/worker/jobs/<id>/finish call (see studio/app.py),
+            # since a remote worker has no local SMTP-notification config to
+            # read in the first place.
+            store.notify_job_failed(job_id, job["name"], error_message)
+
     try:
         failed = 0
         processed = 0
@@ -169,22 +179,22 @@ def _run_job(job: dict[str, Any], store: Any = db, heartbeat_interval: float = H
             logger.info("Running job '%s'", job["name"])
             _run_workflow_once(job_id, Workflow.from_raw(workflow_dict), sub_workflows=sub_workflows, store=store)
         if store.is_stop_requested(job_id):
-            store.finish_job(job_id, "cancelled")
+            _finish("cancelled")
         elif failed:
             # A queue-driven job keeps going past a failing item on purpose, but
             # it must not then report "success" - the job is only successful if
             # every item it processed ended up succeeding.
-            store.finish_job(job_id, "error", f"{failed} of {processed} queue item(s) failed permanently")
+            _finish("error", f"{failed} of {processed} queue item(s) failed permanently")
         else:
-            store.finish_job(job_id, "success")
+            _finish("success")
     except WorkflowCancelled:
-        store.finish_job(job_id, "cancelled")
+        _finish("cancelled")
     except StepError as exc:
         logger.error(str(exc))
-        store.finish_job(job_id, "error", str(exc))
+        _finish("error", str(exc))
     except Exception as exc:  # noqa: BLE001 - surface any failure instead of crashing the worker loop
         logger.error(str(exc))
-        store.finish_job(job_id, "error", str(exc))
+        _finish("error", str(exc))
     finally:
         heartbeat_stop.set()
         heartbeat_thread.join(timeout=2.0)

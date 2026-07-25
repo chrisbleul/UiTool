@@ -157,6 +157,26 @@ CREATE TABLE IF NOT EXISTS audit_log (
     status_code INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts);
+
+-- Singleton (id is always 1) installation-wide config for the proactive
+-- "a job failed" e-mail notification (see notify_job_failed) - separate from
+-- a workflow's own `send_email` step, which is per-workflow and requires an
+-- author to build it in explicitly. The SMTP password itself is never stored
+-- here - `credential_name` names an existing entry in the credentials table
+-- (see credentials.py), resolved through the same OS keyring every
+-- `get_credential` step already uses.
+CREATE TABLE IF NOT EXISTS notification_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled INTEGER NOT NULL DEFAULT 0,
+    smtp_host TEXT,
+    smtp_port INTEGER NOT NULL DEFAULT 587,
+    use_tls INTEGER NOT NULL DEFAULT 1,
+    username TEXT,
+    from_addr TEXT,
+    to_addr TEXT,
+    credential_name TEXT,
+    updated_at TEXT
+);
 """
 
 
@@ -753,3 +773,112 @@ def list_audit_entries(limit: int = 200) -> list[dict[str, Any]]:
     with connect() as conn:
         rows = conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
+
+
+# --- proactive failure notification ------------------------------------------
+
+_DEFAULT_NOTIFICATION_SETTINGS: dict[str, Any] = {
+    "enabled": False,
+    "smtp_host": None,
+    "smtp_port": 587,
+    "use_tls": True,
+    "username": None,
+    "from_addr": None,
+    "to_addr": None,
+    "credential_name": None,
+}
+
+
+def get_notification_settings() -> dict[str, Any]:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM notification_settings WHERE id=1").fetchone()
+    if row is None:
+        return dict(_DEFAULT_NOTIFICATION_SETTINGS)
+    result = dict(row)
+    result["enabled"] = bool(result["enabled"])
+    result["use_tls"] = bool(result["use_tls"])
+    return result
+
+
+def set_notification_settings(
+    enabled: bool,
+    smtp_host: str | None,
+    smtp_port: int,
+    use_tls: bool,
+    username: str | None,
+    from_addr: str | None,
+    to_addr: str | None,
+    credential_name: str | None,
+) -> None:
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO notification_settings "
+            "(id, enabled, smtp_host, smtp_port, use_tls, username, from_addr, to_addr, credential_name, updated_at) "
+            "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled, smtp_host=excluded.smtp_host, "
+            "smtp_port=excluded.smtp_port, use_tls=excluded.use_tls, username=excluded.username, "
+            "from_addr=excluded.from_addr, to_addr=excluded.to_addr, credential_name=excluded.credential_name, "
+            "updated_at=excluded.updated_at",
+            (
+                int(enabled),
+                smtp_host,
+                smtp_port,
+                int(use_tls),
+                username,
+                from_addr,
+                to_addr,
+                credential_name,
+                _now(),
+            ),
+        )
+
+
+def send_notification_email(subject: str, body: str) -> None:
+    """Sends via the installation-wide notification settings above. Raises if
+    notifications aren't enabled/configured, or if the SMTP send itself fails
+    - unlike notify_job_failed below, which wraps this for the "fire and
+    forget from a job completion" case. Used directly by the Studio's "Test
+    senden" button, where a real error is exactly what an admin fixing their
+    SMTP config needs to see."""
+    settings = get_notification_settings()
+    if not settings["enabled"]:
+        raise RuntimeError("Benachrichtigungen sind nicht aktiviert")
+    if not settings["smtp_host"] or not settings["to_addr"]:
+        raise RuntimeError("SMTP-Host und Empfänger müssen gesetzt sein")
+
+    from .. import credentials
+    from ..email_client import send_email
+
+    password = ""
+    if settings["credential_name"]:
+        password = credentials.get_credential(settings["credential_name"])
+    send_email(
+        smtp_host=settings["smtp_host"],
+        username=settings["username"] or "",
+        password=password,
+        to=settings["to_addr"],
+        subject=subject,
+        body=body,
+        smtp_port=settings["smtp_port"],
+        use_tls=settings["use_tls"],
+        from_addr=settings["from_addr"],
+    )
+
+
+def notify_job_failed(job_id: str, job_name: str, error_message: str | None) -> None:
+    """Best-effort - never raises, so a bad SMTP config or a network blip
+    can't fail the job bookkeeping this is called from (see worker.py's
+    _run_job and studio/app.py's remote-worker finish endpoint). Silently
+    does nothing if notifications aren't enabled - that's the default,
+    unconfigured state, not an error worth logging."""
+    if not get_notification_settings()["enabled"]:
+        return
+    try:
+        send_notification_email(
+            f"uiflow: Job '{job_name}' fehlgeschlagen",
+            f"Job-ID: {job_id}\nName: {job_name}\nFehler: {error_message or '(keine Meldung)'}",
+        )
+    except Exception:  # noqa: BLE001 - a notification hiccup must never fail the job itself
+        import logging
+
+        logging.getLogger("uiflow").warning("Fehlerbenachrichtigung konnte nicht gesendet werden", exc_info=True)

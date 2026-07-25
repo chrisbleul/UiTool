@@ -42,6 +42,7 @@ def _required_role(method: str, path: str) -> str:
         or path.startswith("/api/credentials")
         or path.startswith("/api/globals")
         or path.startswith("/api/audit-log")
+        or path.startswith("/api/notifications")
     ):
         return "admin"
     if path.startswith("/api/worker/"):
@@ -366,6 +367,14 @@ def create_app() -> Flask:
     def worker_job_finish(job_id: str) -> Response:
         data = request.get_json(force=True)
         db.finish_job(job_id, data["status"], data.get("error_message"))
+        if data["status"] == "error":
+            # The remote worker's own RemoteStore.notify_job_failed is a
+            # no-op (it has no local notification settings/credentials to
+            # read) - this is the one place that call was skipped for, so the
+            # notification still has to fire from somewhere.
+            job = db.get_job(job_id)
+            if job is not None:
+                db.notify_job_failed(job_id, job["name"], data.get("error_message"))
         return jsonify({"ok": True})
 
     @app.get("/api/worker/globals")
@@ -793,6 +802,36 @@ def create_app() -> Flask:
     def delete_schedule_route(schedule_id: int) -> Response:
         db.delete_schedule(schedule_id)
         return jsonify({"deleted": schedule_id})
+
+    @app.get("/api/notifications")
+    def get_notification_settings_route() -> Response:
+        return jsonify(db.get_notification_settings())
+
+    @app.post("/api/notifications")
+    def set_notification_settings_route() -> Response:
+        data = request.get_json(force=True) or {}
+        db.set_notification_settings(
+            enabled=bool(data.get("enabled")),
+            smtp_host=data.get("smtp_host") or None,
+            smtp_port=int(data.get("smtp_port") or 587),
+            use_tls=bool(data.get("use_tls", True)),
+            username=data.get("username") or None,
+            from_addr=data.get("from_addr") or None,
+            to_addr=data.get("to_addr") or None,
+            credential_name=data.get("credential_name") or None,
+        )
+        return jsonify(db.get_notification_settings())
+
+    @app.post("/api/notifications/test")
+    def send_test_notification_route() -> Response:
+        try:
+            db.send_notification_email(
+                "uiflow: Testbenachrichtigung",
+                "Falls diese E-Mail ankommt, ist die Konfiguration für Fehlerbenachrichtigungen korrekt.",
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced to the admin testing their SMTP config
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"sent": True})
 
     @app.get("/api/screenshot")
     def get_screenshot() -> Response:

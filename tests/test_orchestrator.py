@@ -350,6 +350,9 @@ class _HeartbeatRecordingStore:
     def finish_job(self, job_id, status, error_message=None):
         self.finished = (status, error_message)
 
+    def notify_job_failed(self, job_id, job_name, error_message):
+        pass
+
 
 def test_run_job_heartbeats_periodically_while_a_step_is_slow(monkeypatch):
     import time as time_module
@@ -488,6 +491,44 @@ def test_queue_job_reports_error_when_an_item_fails_permanently(monkeypatch):
     assert "1 of 2" in job["error_message"]
     by_status = {i["status"] for i in db.list_queue_items(queue_id)}
     assert by_status == {"success", "failed"}  # the good item was still processed
+
+
+def test_run_job_sends_a_failure_notification_when_configured(monkeypatch):
+    from uiflow.orchestrator import worker
+
+    captured = {}
+    monkeypatch.setattr("uiflow.email_client.send_email", lambda **kwargs: captured.update(kwargs))
+    db.set_notification_settings(
+        enabled=True, smtp_host="smtp.example.com", smtp_port=587, use_tls=True,
+        username=None, from_addr=None, to_addr="ops@example.com", credential_name=None,
+    )
+    monkeypatch.setattr(worker, "_make_backend", lambda name: _SelectivelyFailingBackend())
+    job_id = db.create_job(
+        "demo", {"name": "demo", "backend": "web", "steps": [{"action": "navigate", "url": "https://bad"}]}
+    )
+
+    worker._run_job(db.claim_next_job("test-worker"))
+
+    assert db.get_job(job_id)["status"] == "error"
+    assert captured["to"] == "ops@example.com"
+    assert "demo" in captured["subject"]
+
+
+def test_run_job_does_not_notify_on_success(monkeypatch):
+    from uiflow.orchestrator import worker
+
+    def _boom(**kwargs):
+        raise AssertionError("must not notify on a successful job")
+
+    monkeypatch.setattr("uiflow.email_client.send_email", _boom)
+    db.set_notification_settings(
+        enabled=True, smtp_host="smtp.example.com", smtp_port=587, use_tls=True,
+        username=None, from_addr=None, to_addr="ops@example.com", credential_name=None,
+    )
+    monkeypatch.setattr(worker, "_make_backend", lambda name: _RecordingFakeBackend())
+    db.create_job("demo", {"name": "demo", "backend": "web", "steps": [{"action": "navigate", "url": "https://ok"}]})
+
+    worker._run_job(db.claim_next_job("test-worker"))  # must not raise via the monkeypatched _boom
 
 
 def test_business_error_marks_an_item_failed_immediately_without_consuming_a_retry():
@@ -792,6 +833,140 @@ def test_list_audit_entries_newest_first_and_respects_limit():
     entries = db.list_audit_entries(limit=2)
 
     assert [e["action"] for e in entries] == ["POST /api/x4", "POST /api/x3"]
+
+
+# --- proactive failure notification ------------------------------------------
+
+
+def test_get_notification_settings_defaults_to_disabled():
+    settings = db.get_notification_settings()
+
+    assert settings["enabled"] is False
+    assert settings["smtp_host"] is None
+    assert settings["smtp_port"] == 587
+    assert settings["use_tls"] is True
+
+
+def test_set_and_get_notification_settings_round_trip():
+    db.set_notification_settings(
+        enabled=True,
+        smtp_host="smtp.example.com",
+        smtp_port=465,
+        use_tls=False,
+        username="bot@example.com",
+        from_addr="bot@example.com",
+        to_addr="ops@example.com",
+        credential_name="smtp_password",
+    )
+
+    settings = db.get_notification_settings()
+
+    assert settings["enabled"] is True
+    assert settings["smtp_host"] == "smtp.example.com"
+    assert settings["smtp_port"] == 465
+    assert settings["use_tls"] is False
+    assert settings["to_addr"] == "ops@example.com"
+    assert settings["credential_name"] == "smtp_password"
+
+
+def test_set_notification_settings_can_be_updated_in_place():
+    db.set_notification_settings(
+        enabled=True, smtp_host="a", smtp_port=587, use_tls=True,
+        username=None, from_addr=None, to_addr="a@x.de", credential_name=None,
+    )
+    db.set_notification_settings(
+        enabled=False, smtp_host="b", smtp_port=25, use_tls=False,
+        username=None, from_addr=None, to_addr="b@x.de", credential_name=None,
+    )
+
+    settings = db.get_notification_settings()
+    assert settings["enabled"] is False
+    assert settings["smtp_host"] == "b"
+    assert settings["to_addr"] == "b@x.de"
+
+
+def test_send_notification_email_raises_when_not_enabled():
+    with pytest.raises(RuntimeError, match="nicht aktiviert"):
+        db.send_notification_email("subject", "body")
+
+
+def test_send_notification_email_raises_when_missing_smtp_host_or_recipient():
+    db.set_notification_settings(
+        enabled=True, smtp_host=None, smtp_port=587, use_tls=True,
+        username=None, from_addr=None, to_addr=None, credential_name=None,
+    )
+
+    with pytest.raises(RuntimeError):
+        db.send_notification_email("subject", "body")
+
+
+def test_send_notification_email_resolves_the_credential_and_sends(monkeypatch):
+    captured = {}
+    monkeypatch.setattr("uiflow.email_client.send_email", lambda **kwargs: captured.update(kwargs))
+    monkeypatch.setattr("uiflow.credentials.get_credential", lambda name: f"secret-for-{name}")
+    db.set_notification_settings(
+        enabled=True, smtp_host="smtp.example.com", smtp_port=587, use_tls=True,
+        username="bot@example.com", from_addr="bot@example.com", to_addr="ops@example.com",
+        credential_name="smtp_password",
+    )
+
+    db.send_notification_email("Betreff", "Text")
+
+    assert captured["smtp_host"] == "smtp.example.com"
+    assert captured["to"] == "ops@example.com"
+    assert captured["subject"] == "Betreff"
+    assert captured["body"] == "Text"
+    assert captured["password"] == "secret-for-smtp_password"
+
+
+def test_send_notification_email_works_without_a_credential_name(monkeypatch):
+    captured = {}
+    monkeypatch.setattr("uiflow.email_client.send_email", lambda **kwargs: captured.update(kwargs))
+    db.set_notification_settings(
+        enabled=True, smtp_host="smtp.example.com", smtp_port=587, use_tls=True,
+        username=None, from_addr=None, to_addr="ops@example.com", credential_name=None,
+    )
+
+    db.send_notification_email("Betreff", "Text")
+
+    assert captured["password"] == ""
+
+
+def test_notify_job_failed_is_a_no_op_when_disabled(monkeypatch):
+    def _boom(**kwargs):
+        raise AssertionError("must not be called when notifications are disabled")
+
+    monkeypatch.setattr("uiflow.email_client.send_email", _boom)
+
+    db.notify_job_failed("job-1", "demo", "kaputt")  # must not raise either
+
+
+def test_notify_job_failed_sends_when_enabled(monkeypatch):
+    captured = {}
+    monkeypatch.setattr("uiflow.email_client.send_email", lambda **kwargs: captured.update(kwargs))
+    db.set_notification_settings(
+        enabled=True, smtp_host="smtp.example.com", smtp_port=587, use_tls=True,
+        username=None, from_addr=None, to_addr="ops@example.com", credential_name=None,
+    )
+
+    db.notify_job_failed("job-1", "demo", "kaputt")
+
+    assert "demo" in captured["subject"]
+    assert "job-1" in captured["body"]
+    assert "kaputt" in captured["body"]
+
+
+def test_notify_job_failed_never_raises_even_if_sending_fails(monkeypatch):
+    def _boom(**kwargs):
+        raise RuntimeError("SMTP down")
+
+    monkeypatch.setattr("uiflow.email_client.send_email", _boom)
+    db.set_notification_settings(
+        enabled=True, smtp_host="smtp.example.com", smtp_port=587, use_tls=True,
+        username=None, from_addr=None, to_addr="ops@example.com", credential_name=None,
+    )
+
+    db.notify_job_failed("job-1", "demo", "kaputt")  # must not raise
 
 
 # --- global variables -------------------------------------------------------

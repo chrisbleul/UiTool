@@ -148,6 +148,7 @@
         <button class="tab-btn" data-tab="schedules" role="tab">Zeitplan</button>
         <button class="tab-btn hidden" data-tab="users" role="tab" id="tab-btn-users">Benutzer</button>
         <button class="tab-btn hidden" data-tab="audit" role="tab" id="tab-btn-audit">Audit-Log</button>
+        <button class="tab-btn hidden" data-tab="notifications" role="tab" id="tab-btn-notifications">Benachrichtigungen</button>
       </div>
 
       <div class="tab-panel active" data-tab-panel="workflows">
@@ -235,6 +236,38 @@
           eigene Aufzeichnung. Neueste zuerst, die letzten 200 Einträge.
         </p>
         <div id="audit-log-list" class="queues-list"></div>
+      </div>
+
+      <div class="tab-panel" data-tab-panel="notifications">
+        <p class="panel-hint">
+          Verschickt eine E-Mail, sobald ein Job endgültig fehlschlägt (auch ein Queue-Item, das seine
+          Wiederholungen aufgebraucht hat) — unabhängig vom Workflow-Inhalt, im Unterschied zu einem
+          eigenen <code>send_email</code>-Schritt, den man pro Workflow selbst einbauen müsste. Das
+          SMTP-Passwort wird nicht hier eingegeben, sondern per Name aus den bereits gespeicherten
+          <strong>Anmeldedaten</strong> (siehe Tab oben) nachgeschlagen.
+        </p>
+        <div class="notifications-form">
+          <label class="notifications-checkbox">
+            <input id="notif-enabled" type="checkbox">
+            Aktiviert
+          </label>
+          <div class="notifications-grid">
+            <input id="notif-smtp-host" type="text" placeholder="SMTP-Server (z.B. smtp.example.com)">
+            <input id="notif-smtp-port" type="number" placeholder="Port" value="587">
+            <label class="notifications-checkbox">
+              <input id="notif-use-tls" type="checkbox" checked>
+              TLS
+            </label>
+            <input id="notif-username" type="text" placeholder="Benutzername (optional)">
+            <input id="notif-from" type="text" placeholder="Absender (optional, sonst Benutzername)">
+            <input id="notif-to" type="text" placeholder="Empfänger (z.B. ops@firma.de)">
+            <input id="notif-credential" type="text" placeholder="Anmeldedaten-Name für das Passwort (optional)">
+          </div>
+          <div class="notifications-actions">
+            <button id="btn-save-notifications" class="btn">Speichern</button>
+            <button id="btn-test-notification" class="btn">Test senden</button>
+          </div>
+        </div>
       </div>
     </section>
 

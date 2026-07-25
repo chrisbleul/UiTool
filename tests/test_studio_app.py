@@ -363,6 +363,24 @@ def test_worker_job_finish_endpoint_marks_the_job_done(client):
     assert detail["error_message"] == "boom"
 
 
+def test_worker_job_finish_endpoint_notifies_on_error_for_a_remote_worker(client, monkeypatch):
+    # A remote worker's own RemoteStore.notify_job_failed is a no-op (see its
+    # docstring) - the server has to do this itself when it handles a remote
+    # worker's finish call, which is exactly what this endpoint is.
+    captured = {}
+    monkeypatch.setattr("uiflow.email_client.send_email", lambda **kwargs: captured.update(kwargs))
+    client.post(
+        "/api/notifications",
+        json={"enabled": True, "smtp_host": "smtp.example.com", "smtp_port": 587, "to_addr": "ops@example.com"},
+    )
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+
+    client.post(f"/api/worker/jobs/{job_id}/finish", json={"status": "error", "error_message": "boom"})
+
+    assert captured["to"] == "ops@example.com"
+    assert "boom" in captured["body"]
+
+
 def test_worker_globals_endpoint_matches_the_studio_globals(client):
     client.post("/api/globals", json={"name": "basis_url", "value": "https://intern"})
 
@@ -660,6 +678,76 @@ def test_toggle_and_delete_schedule_via_api(client):
     res = client.delete(f"/api/schedules/{schedule_id}")
     assert res.status_code == 200
     assert client.get("/api/schedules").get_json() == []
+
+
+def test_notifications_endpoint_defaults_to_disabled(client):
+    settings = client.get("/api/notifications").get_json()
+
+    assert settings["enabled"] is False
+    assert settings["smtp_host"] is None
+
+
+def test_notifications_endpoint_stores_settings(client):
+    res = client.post(
+        "/api/notifications",
+        json={
+            "enabled": True,
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 465,
+            "use_tls": False,
+            "username": "bot@example.com",
+            "from_addr": "bot@example.com",
+            "to_addr": "ops@example.com",
+            "credential_name": "smtp_password",
+        },
+    )
+
+    assert res.status_code == 200
+    settings = client.get("/api/notifications").get_json()
+    assert settings["enabled"] is True
+    assert settings["smtp_host"] == "smtp.example.com"
+    assert settings["smtp_port"] == 465
+    assert settings["to_addr"] == "ops@example.com"
+
+
+def test_notifications_test_endpoint_reports_a_clear_error_when_not_configured(client):
+    res = client.post("/api/notifications/test")
+
+    assert res.status_code == 400
+    assert "error" in res.get_json()
+
+
+def test_notifications_test_endpoint_sends_when_configured(client, monkeypatch):
+    captured = {}
+    monkeypatch.setattr("uiflow.email_client.send_email", lambda **kwargs: captured.update(kwargs))
+    client.post(
+        "/api/notifications",
+        json={
+            "enabled": True,
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 587,
+            "use_tls": True,
+            "to_addr": "ops@example.com",
+        },
+    )
+
+    res = client.post("/api/notifications/test")
+
+    assert res.status_code == 200
+    assert res.get_json() == {"sent": True}
+    assert captured["to"] == "ops@example.com"
+    assert "Test" in captured["subject"]
+
+
+def test_notifications_endpoint_requires_admin_in_multiuser_mode(multiuser_app):
+    operator = multiuser_app.test_client()
+    _login(operator, "op1", "oppass")
+    assert operator.get("/api/notifications").status_code == 403
+    assert operator.post("/api/notifications", json={}).status_code == 403
+
+    admin = multiuser_app.test_client()
+    _login(admin, "admin1", "adminpass")
+    assert admin.get("/api/notifications").status_code == 200
 
 
 def test_activities_endpoint_lists_every_action_with_catalog_metadata(client):
