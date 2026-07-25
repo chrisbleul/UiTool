@@ -86,6 +86,9 @@ def _run_workflow_once(job_id: str, workflow: Workflow, variables: dict[str, Any
             on_breakpoint=on_breakpoint,
             should_stop=lambda: db.is_stop_requested(job_id),
             variables=variables,
+            # Read per run, not per job: editing a global takes effect on the
+            # next run without re-queuing anything.
+            global_variables=db.get_global_variables(),
         )
     finally:
         stopped_while_debugging = reached_breakpoint and db.is_stop_requested(job_id)

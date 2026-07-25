@@ -19,6 +19,11 @@ from .schema import ACTION_SCHEMAS, activity_catalog
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
+# `global` and `item` are placeholder namespaces, not variable names - a global
+# called either would be unreachable as {global.item} resolves against the
+# namespace, not the value (see engine.py's _NAMESPACE_KEYS).
+_RESERVED_GLOBAL_NAMES = ("global", "item", "var")
+
 # One entry per in-flight recording session (unaffected by the orchestrator -
 # a recording is a live interactive picking session tied to one browser tab,
 # not a durable/queueable unit of work).
@@ -400,6 +405,37 @@ def create_app() -> Flask:
         except Exception as exc:  # noqa: BLE001 - surface any keyring/backend error to the UI
             return jsonify({"error": str(exc)}), 500
         db.delete_credential_name(name)
+        return jsonify({"deleted": name})
+
+    @app.get("/api/globals")
+    def list_globals() -> Response:
+        return jsonify(db.list_global_variables())
+
+    @app.post("/api/globals")
+    def set_global_route() -> Response:
+        data = request.get_json(force=True) or {}
+        name = (data.get("name") or "").strip()
+        if not name:
+            return jsonify({"error": "name required"}), 400
+        if name in _RESERVED_GLOBAL_NAMES:
+            return jsonify({"error": f"'{name}' ist ein reservierter Name"}), 400
+        # The value arrives as text from the form; parse it as JSON when it looks
+        # like JSON so a number stays a number and a list stays a list, and fall
+        # back to the plain string otherwise (the common case).
+        raw = data.get("value", "")
+        if isinstance(raw, str):
+            try:
+                value: Any = json.loads(raw)
+            except (TypeError, ValueError):
+                value = raw
+        else:
+            value = raw
+        db.set_global_variable(name, value)
+        return jsonify({"saved": name, "value": value})
+
+    @app.delete("/api/globals/<name>")
+    def delete_global_route(name: str) -> Response:
+        db.delete_global_variable(name)
         return jsonify({"deleted": name})
 
     @app.get("/api/schedules")

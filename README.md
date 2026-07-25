@@ -24,13 +24,14 @@ uiflow/
   cli.py               `uiflow run ...` / `uiflow inspect-desktop ...` / `uiflow studio` /
                       `uiflow worker` / `uiflow scheduler`
   orchestrator/
-    db.py                Persistenter Job-/Log-/Queue-/Credential-Namen-/Zeitplan-Store (SQLite, WAL-Modus)
+    db.py                Persistenter Job-/Log-/Queue-/Credential-Namen-/Zeitplan-Store und
+                         globale Variablen (SQLite, WAL-Modus)
     worker.py             Job-Ausführung (run_worker_loop) + Cron-Zeitpläne (run_scheduler_loop)
   studio/
     schema.py           Beschreibt pro Backend, welche Actions es gibt und welche Formularfelder sie
                         brauchen, plus die Katalog-Metadaten (Label/Kategorie/Beschreibung/Synonyme)
     app.py              Flask-App: REST-API (Schema/Aktivitäten/Workflows/Jobs/Queues/Credentials/
-                        Schedules/Pick) + SSE-Log-Streaming + optionales Login
+                        Globals/Schedules/Pick) + SSE-Log-Streaming + optionales Login
     picker.py            "Element wählen": Klick-zu-Selektor-Erkennung für Web (Playwright) und Desktop (pynput + UI Automation)
     static/              Builder-Frontend (HTML/CSS/Vanilla JS, kein Build-Step); static/vendor/
                          enthält SortableJS (MIT) für das Drag & Drop des Sequenz-Designers
@@ -385,6 +386,43 @@ steps:
     save_as: eingang                # -> Liste von {subject, from, date, body}
 ```
 
+## Globale Variablen
+
+Werte, die für *alle* Workflows gelten — Basis-URLs, Postfächer, Grenzwerte. Verwaltet im Studio unter
+**Orchestrator → Globale Variablen**; gespeichert in `orchestrator.db` (Tabelle `global_variables`) als
+JSON, damit eine Zahl eine Zahl und eine Liste eine Liste bleibt.
+
+Genutzt werden sie auf zwei Wegen — genau wie Workflow-Variablen:
+
+```yaml
+steps:
+  - action: navigate
+    url: "{global.basis_url}/anmelden"     # in Parametern: eigener Namensraum
+
+  - action: if
+    condition: "betrag > max_betrag"        # in Ausdrücken: direkt unter ihrem Namen
+    then:
+      - action: click
+        selector: "#freigabe-anfordern"
+```
+
+Vier Punkte dazu:
+
+- **Sie gelten auch in Unterprozessen**, ohne als Argument übergeben zu werden. Ein Unterprozess ist
+  gegen die Variablen seines Aufrufers abgeschottet (siehe `run_workflow`), aber nicht gegen die
+  globalen — sonst müsste man Konfiguration durch jede Aufrufkette schleifen.
+- **Eine gleichnamige Workflow-Variable hat in Ausdrücken Vorrang.** Ein Lauf kann einen globalen Wert
+  damit lokal überschreiben, ohne ihn für andere zu ändern; `{global.name}` liest weiterhin den globalen.
+- **Ein Unterprozess kann einen globalen Wert nicht für seinen Aufrufer verändern** — ein `assign` legt
+  eine gewöhnliche Workflow-Variable an, nicht den globalen Eintrag.
+- **Sie werden pro Lauf gelesen**, nicht beim Einreihen. Eine Änderung wirkt also auf den nächsten Lauf,
+  ohne dass etwas neu eingereiht werden muss — und gilt gleichermaßen für `uiflow run` von der
+  Kommandozeile wie für einen Job über den Worker.
+
+`global`, `item` und `var` sind als Namen reserviert, weil sie die Platzhalter-Namensräume benennen.
+**Keine Geheimnisse hier ablegen** — dafür gibt es Anmeldedaten, deren Werte gar nicht erst in dieser
+Datenbank landen:
+
 ## Anmeldedaten (Credentials)
 
 `get_credential` liest ein Geheimnis (Passwort, API-Key, ...) zur Laufzeit in eine Variable ein, ohne
@@ -449,16 +487,13 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
   Job-Zeile ab, damit ein Job exakt das ausführt, was beim Einreihen galt — für Unterprozesse gilt diese
   Zusage derzeit nicht. Sie ließe sich wiederherstellen, indem referenzierte Unterprozesse beim Einreihen
   mit in den Snapshot aufgenommen werden.
-- **Globale Variablen**: Zwei verschiedene Dinge, die beide fehlen und sich sauber trennen lassen:
-  - **Deklarierte Workflow-Variablen** (UiPaths Variablen-Panel): Variablen entstehen heute stillschweigend
-    beim ersten `assign`; nirgends steht, welche ein Workflow überhaupt verwendet, und es gibt keine
-    Startwerte oder Typen. Nebenwirkung: ein Tippfehler verhält sich je nach Weg unterschiedlich —
-    `{var.tippfehler}` wird stumm zu einem leeren String, `safe_eval("tippfehler")` bricht mit einem
-    Fehler ab. Eine Deklarationsliste würde beides prüfbar machen und dem Eigenschaften-Panel erlauben,
-    Variablennamen zur Auswahl anzubieten statt sie tippen zu lassen.
-  - **Installationsweite Werte** (UiPaths Assets): Basis-URLs, Postfächer, Schwellwerte — heute stehen
-    sie in jedem Workflow einzeln. Die `credentials`-Tabelle ist genau dieser Speicher für Geheimnisse;
-    Assets wären das nicht-geheime Gegenstück, inklusive Pflege im Orchestrator-Bereich des Studios.
+- **Deklarierte Workflow-Variablen** (UiPaths Variablen-Panel): Installationsweite globale Variablen
+  gibt es inzwischen (siehe oben), die *workflow-eigenen* entstehen aber weiterhin stillschweigend beim
+  ersten `assign` — nirgends steht, welche ein Workflow verwendet, und es gibt keine Startwerte oder
+  Typen. Nebenwirkung: ein Tippfehler verhält sich je nach Weg unterschiedlich — `{var.tippfehler}` wird
+  stumm zu einem leeren String, derselbe Name in einem Ausdruck bricht mit einem Fehler ab. Eine
+  Deklarationsliste würde beides prüfbar machen und dem Eigenschaften-Panel erlauben, Variablennamen zur
+  Auswahl anzubieten statt sie tippen zu lassen.
 - **Framework-Vorlage nach Vorbild des UiPath REFramework**: Die Kernschleife gibt es bereits —
   `_run_queue_driven` ist das "Process Transaction"-Muster, mit Retry samt Backoff, Status je Item und
   Job-Logs. Was fehlt, ist der Rahmen darum herum, den man heute in jedem Projekt neu baut:

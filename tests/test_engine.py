@@ -1111,3 +1111,132 @@ def test_queue_item_fields_can_be_passed_whole(workflows_dir):
     engine.run(workflow, variables={"item": {"positionen": ["a", "b"]}})
 
     assert engine.variables["erste_position"] == "a"
+
+
+# --- global variables -------------------------------------------------------
+
+
+def test_globals_are_readable_as_a_placeholder_namespace():
+    workflow = Workflow(name="t", backend="web", steps=[Step("navigate", {"url": "{global.basis_url}/start"})])
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow, global_variables={"basis_url": "https://erp.example.com"})
+
+    assert backend.calls == [("navigate", "https://erp.example.com/start")]
+
+
+def test_globals_are_readable_in_expressions_under_their_plain_name():
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[
+            Step("if", {"condition": "betrag > max_betrag", "then": [{"action": "navigate", "url": "freigabe"}]})
+        ],
+    )
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow, variables={"betrag": 9000}, global_variables={"max_betrag": 5000})
+
+    assert backend.calls == [("navigate", "freigabe")]
+
+
+def test_a_workflow_variable_shadows_a_global_of_the_same_name_in_expressions():
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[
+            Step("assign", {"variable": "max_betrag", "expression": "100"}),
+            Step("assign", {"variable": "grenze", "expression": "max_betrag"}),
+        ],
+    )
+    engine = WorkflowEngine(RecordingBackend())
+
+    engine.run(workflow, global_variables={"max_betrag": 5000})
+
+    assert engine.variables["grenze"] == 100  # the run's own value, not the global
+
+
+def test_assigning_a_shadowing_variable_leaves_the_global_untouched():
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[
+            Step("assign", {"variable": "max_betrag", "expression": "100"}),
+            Step("navigate", {"url": "{global.max_betrag}"}),
+        ],
+    )
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow, global_variables={"max_betrag": 5000})
+
+    assert backend.calls == [("navigate", "5000")]
+
+
+def test_globals_keep_their_type_in_expressions():
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[Step("assign", {"variable": "wie_viele", "expression": "len(empfaenger)"})],
+    )
+    engine = WorkflowEngine(RecordingBackend())
+
+    engine.run(workflow, global_variables={"empfaenger": ["a@x.de", "b@x.de", "c@x.de"]})
+
+    assert engine.variables["wie_viele"] == 3
+
+
+def test_an_unknown_global_placeholder_is_blank_like_any_other():
+    workflow = Workflow(name="t", backend="web", steps=[Step("navigate", {"url": "x/{global.fehlt}"})])
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow, global_variables={})
+
+    assert backend.calls == [("navigate", "x/")]
+
+
+def test_globals_reach_a_sub_workflow_without_being_passed(workflows_dir):
+    write_workflow(workflows_dir, "teilprozess", [{"action": "navigate", "url": "{global.basis_url}/sub"}])
+    workflow = Workflow(name="haupt", backend="web", steps=[Step("run_workflow", {"workflow": "teilprozess"})])
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow, global_variables={"basis_url": "https://erp.example.com"})
+
+    # No `arguments` at all - a global is installation-wide, not something that
+    # has to be threaded through every call.
+    assert backend.calls == [("navigate", "https://erp.example.com/sub")]
+
+
+def test_a_sub_workflow_cannot_change_a_global_for_its_caller(workflows_dir):
+    write_workflow(
+        workflows_dir, "teilprozess", [{"action": "assign", "variable": "basis_url", "value": "gekapert"}]
+    )
+    workflow = Workflow(
+        name="haupt",
+        backend="web",
+        steps=[
+            Step("run_workflow", {"workflow": "teilprozess"}),
+            Step("navigate", {"url": "{global.basis_url}"}),
+        ],
+    )
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow, global_variables={"basis_url": "https://erp.example.com"})
+
+    assert backend.calls == [("navigate", "https://erp.example.com")]
+
+
+def test_breakpoint_shows_globals_only_when_there_are_some():
+    workflow = Workflow(name="t", backend="web", steps=[Step("navigate", {"url": "a"}, breakpoint=True)])
+    seen = []
+
+    def on_breakpoint(index, step, variables, path):
+        seen.append(variables)
+
+    WorkflowEngine(RecordingBackend()).run(workflow, on_breakpoint=on_breakpoint)
+    assert seen == [{}]  # no permanent empty "global" row in the variables watch
+
+    seen.clear()
+    WorkflowEngine(RecordingBackend()).run(
+        workflow, on_breakpoint=on_breakpoint, global_variables={"basis_url": "https://x"}
+    )
+    assert seen == [{"global": {"basis_url": "https://x"}}]

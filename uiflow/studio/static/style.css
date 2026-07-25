@@ -1113,3 +1113,17 @@ body {
   text-transform: uppercase;
 }
 .scope-badge svg { width: 13px; height: 13px; }
+
+/* A global's value can be long (a URL, a JSON list) - keep the row one line. */
+.global-value {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The globals row holds a name and a free-form value (a URL, a JSON list), so
+   it needs more room than the shared 120px import inputs give it. */
+#global-name { width: 200px; }
+#global-value { flex: 1; min-width: 260px; }

@@ -220,3 +220,42 @@ def test_catalog_primary_fields_exist_on_every_backend(client):
                 continue
             available = {f["name"] for f in fields}
             assert available & set(candidates), f"{backend}/{name}: none of {candidates} in {sorted(available)}"
+
+
+def test_globals_endpoint_stores_and_lists_values(client):
+    assert client.post("/api/globals", json={"name": "basis_url", "value": "https://x"}).status_code == 200
+
+    [entry] = client.get("/api/globals").get_json()
+    assert entry["name"] == "basis_url"
+    assert entry["value"] == "https://x"
+
+
+def test_globals_endpoint_parses_json_values_but_keeps_plain_text(client):
+    client.post("/api/globals", json={"name": "max_betrag", "value": "5000"})
+    client.post("/api/globals", json={"name": "empfaenger", "value": '["a@x.de", "b@x.de"]'})
+    client.post("/api/globals", json={"name": "basis_url", "value": "https://erp.example.com"})
+
+    values = {e["name"]: e["value"] for e in client.get("/api/globals").get_json()}
+    assert values == {
+        "max_betrag": 5000,
+        "empfaenger": ["a@x.de", "b@x.de"],
+        "basis_url": "https://erp.example.com",  # not valid JSON, so kept as text
+    }
+
+
+def test_globals_endpoint_requires_a_name(client):
+    assert client.post("/api/globals", json={"name": "", "value": "x"}).status_code == 400
+
+
+def test_globals_endpoint_refuses_a_reserved_namespace_name(client):
+    """`{global.global}` would resolve against the namespace rather than the
+    value, so such an entry could never be read back."""
+    for name in ("global", "item", "var"):
+        assert client.post("/api/globals", json={"name": name, "value": "x"}).status_code == 400
+
+
+def test_delete_global_endpoint(client):
+    client.post("/api/globals", json={"name": "x", "value": "1"})
+
+    assert client.delete("/api/globals/x").status_code == 200
+    assert client.get("/api/globals").get_json() == []

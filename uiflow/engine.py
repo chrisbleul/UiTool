@@ -14,21 +14,28 @@ OnBreakpoint = Callable[[int, Step, "dict[str, Any]", str], None]
 ShouldStop = Callable[[], bool]
 
 # {item.field} reads from the current queue item's payload (variables["item"]);
-# {var.name} reads any other workflow variable. Two explicit namespaces rather
-# than one generic one, matching how they're introduced to workflow authors.
-_PLACEHOLDER_RE = re.compile(r"\{(item|var)\.([a-zA-Z0-9_]+)\}")
+# {global.name} from the installation-wide values (variables["global"], see the
+# orchestrator's global_variables table); {var.name} from any other workflow
+# variable. Explicit namespaces rather than one generic one, matching how they
+# are introduced to workflow authors - and making it visible at a glance where a
+# value comes from.
+_PLACEHOLDER_RE = re.compile(r"\{(item|var|global)\.([a-zA-Z0-9_]+)\}")
+
+# Namespaces that live as a nested dict inside `variables` rather than being a
+# variable themselves.
+_NAMESPACE_KEYS = ("item", "global")
 
 
 def _resolve_placeholder(namespace: str, name: str, variables: dict[str, Any]) -> str:
-    if namespace == "item":
-        item = variables.get("item") or {}
-        return str(item.get(name, ""))
+    if namespace in _NAMESPACE_KEYS:
+        container = variables.get(namespace) or {}
+        return str(container.get(name, ""))
     return str(variables.get(name, ""))
 
 
 def substitute_variables(value: Any, variables: dict[str, Any]) -> Any:
-    """Recursively replaces {item.x}/{var.x} placeholders in strings (and inside
-    nested dicts/lists) using the current variables. Non-string values pass
+    """Recursively replaces {item.x}/{var.x}/{global.x} placeholders in strings
+    (and inside nested dicts/lists) using the current variables. Non-string values pass
     through unchanged - e.g. a `by: 1` int in an `increment` step's params."""
     if isinstance(value, str):
         return _PLACEHOLDER_RE.sub(lambda m: _resolve_placeholder(m.group(1), m.group(2), variables), value)
@@ -97,6 +104,7 @@ class WorkflowEngine:
     def __init__(self, backend: object):
         self.backend = backend
         self.variables: dict[str, Any] = {}
+        self._globals: dict[str, Any] = {}
         # Values pulled in via `get_credential`, tracked so step logging
         # (see _log/_redact_secrets) can mask them instead of writing secrets
         # to the job log / console in plain text.
@@ -108,8 +116,15 @@ class WorkflowEngine:
         on_breakpoint: Optional[OnBreakpoint] = None,
         should_stop: Optional[ShouldStop] = None,
         variables: Optional[dict[str, Any]] = None,
+        global_variables: Optional[dict[str, Any]] = None,
     ) -> None:
         self.variables = dict(variables) if variables else {}
+        # Installation-wide values, kept apart from the run's own variables so
+        # they survive a sub-workflow's isolated scope and can't be overwritten
+        # by an `assign`. The engine is handed them rather than reading the
+        # orchestrator DB itself, which keeps it free of that dependency.
+        self._globals = dict(global_variables) if global_variables else {}
+        self.variables["global"] = self._globals
         self._secrets = set()
         self._counter = 0
         self._backend_name = workflow.backend
@@ -142,7 +157,7 @@ class WorkflowEngine:
 
             if step.breakpoint and on_breakpoint is not None:
                 self._log("[%d] Haltepunkt bei '%s'", index, step.action)
-                on_breakpoint(index, step, self._redact_secrets(dict(self.variables)), path)
+                on_breakpoint(index, step, self._redact_secrets(self._variables_snapshot()), path)
                 if should_stop is not None and should_stop():
                     logger.info("Workflow abgebrochen vor Schritt %d", index)
                     raise WorkflowCancelled(index)
@@ -196,7 +211,7 @@ class WorkflowEngine:
     ) -> None:
         condition = step.params.get("condition", "False")
         try:
-            result = bool(safe_eval(condition, self.variables))
+            result = bool(safe_eval(condition, self._eval_scope()))
         except ValueError as exc:
             raise StepError(index, step, exc) from exc
         self._log("[%d] if %s -> %s", index, condition, result)
@@ -213,7 +228,7 @@ class WorkflowEngine:
     ) -> None:
         expression = step.params.get("expression", "")
         try:
-            value = safe_eval(expression, self.variables)
+            value = safe_eval(expression, self._eval_scope())
         except ValueError as exc:
             raise StepError(index, step, exc) from exc
         cases = step.params.get("cases") or {}
@@ -236,7 +251,7 @@ class WorkflowEngine:
     ) -> None:
         items_expr = step.params.get("items", "[]")
         try:
-            items = safe_eval(items_expr, self.variables)
+            items = safe_eval(items_expr, self._eval_scope())
         except ValueError as exc:
             raise StepError(index, step, exc) from exc
         try:
@@ -346,7 +361,9 @@ class WorkflowEngine:
         self._log("[%d] run_workflow '%s' (%d step(s), arguments: %s)", index, name, len(sub.steps), arguments)
 
         caller_variables = self.variables
-        self.variables = dict(arguments)
+        # Arguments only - except the global namespace, which is installation-wide
+        # and therefore visible everywhere without being threaded through.
+        self.variables = {**arguments, "global": self._globals}
         self._workflow_stack.append(name)
         try:
             # The path prefix carries the sub-workflow's name because its steps
@@ -372,7 +389,7 @@ class WorkflowEngine:
             raise StepError(index, step, ValueError("assign requires 'variable'"))
         if "expression" in step.params:
             try:
-                value = safe_eval(step.params["expression"], self.variables)
+                value = safe_eval(step.params["expression"], self._eval_scope())
             except ValueError as exc:
                 raise StepError(index, step, exc) from exc
         else:
@@ -413,7 +430,7 @@ class WorkflowEngine:
         if not path or not data_expr:
             raise StepError(index, step, ValueError("write_excel requires 'path' and 'data'"))
         try:
-            rows = safe_eval(data_expr, self.variables)
+            rows = safe_eval(data_expr, self._eval_scope())
         except ValueError as exc:
             raise StepError(index, step, exc) from exc
         try:
@@ -534,6 +551,21 @@ class WorkflowEngine:
             raise StepError(index, step, exc) from exc
         self._log("[%d] ocr_image '%s' -> %d char(s) into '%s'", index, path, len(text), step.save_as)
         self.variables[step.save_as] = text
+
+    def _variables_snapshot(self) -> dict[str, Any]:
+        """What a breakpoint reports. Includes the global namespace so the values
+        actually in play are visible while paused, but drops it when empty rather
+        than showing a permanent "global: {}" row in the variables watch."""
+        snapshot = dict(self.variables)
+        if not snapshot.get("global"):
+            snapshot.pop("global", None)
+        return snapshot
+
+    def _eval_scope(self) -> dict[str, Any]:
+        """Names visible to a condition/expression: the run's own variables, plus
+        the global ones under their plain names. A workflow variable of the same
+        name wins, so a run can shadow a global locally without editing it."""
+        return {**self._globals, **self.variables}
 
     def _log(self, message: str, *args: Any) -> None:
         """Logs a step line with every interpolated argument run through

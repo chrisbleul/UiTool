@@ -1408,6 +1408,83 @@ async function renderCredentialsPanel() {
   }
 }
 
+async function renderGlobalsPanel() {
+  const container = el("globals-list");
+  container.innerHTML = "Lädt...";
+  const entries = await (await fetch("/api/globals")).json();
+  if (entries.length === 0) {
+    container.innerHTML = '<p style="color:var(--muted)">Noch keine globalen Variablen gespeichert.</p>';
+    return;
+  }
+  container.innerHTML = "";
+  for (const entry of entries) {
+    const row = document.createElement("div");
+    row.className = "list-row";
+
+    const info = document.createElement("div");
+    info.style.flex = "1";
+    info.style.minWidth = "0";
+    const label = document.createElement("div");
+    label.className = "list-row-name";
+    label.textContent = entry.name;
+    const value = document.createElement("div");
+    value.className = "list-row-meta global-value";
+    // Objects and lists are shown as JSON - the same form the input accepts back
+    value.textContent = typeof entry.value === "string" ? entry.value : JSON.stringify(entry.value);
+    info.append(label, value);
+
+    const editBtn = document.createElement("button");
+    editBtn.className = "btn-icon";
+    editBtn.innerHTML = ICONS.pencil;
+    editBtn.title = "Bearbeiten";
+    editBtn.setAttribute("aria-label", `Globale Variable "${entry.name}" bearbeiten`);
+    editBtn.addEventListener("click", () => {
+      el("global-name").value = entry.name;
+      el("global-value").value =
+        typeof entry.value === "string" ? entry.value : JSON.stringify(entry.value);
+      el("global-value").focus();
+    });
+
+    const delBtn = document.createElement("button");
+    delBtn.className = "btn-icon danger";
+    delBtn.textContent = "✕";
+    delBtn.title = "Löschen";
+    delBtn.setAttribute("aria-label", `Globale Variable "${entry.name}" löschen`);
+    delBtn.addEventListener("click", async () => {
+      if (!(await confirmDialog(`Globale Variable "${entry.name}" wirklich löschen?`))) return;
+      await fetch(`/api/globals/${encodeURIComponent(entry.name)}`, { method: "DELETE" });
+      renderGlobalsPanel();
+      toast(`Globale Variable "${entry.name}" gelöscht.`, "success");
+    });
+
+    row.append(info, editBtn, delBtn);
+    container.appendChild(row);
+  }
+}
+
+async function addGlobal() {
+  const name = el("global-name").value.trim();
+  const value = el("global-value").value;
+  if (!name) {
+    toast("Bitte einen Namen angeben.", "error");
+    return;
+  }
+  const res = await fetch("/api/globals", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, value }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    toast("Speichern fehlgeschlagen: " + (data.error || res.status), "error");
+    return;
+  }
+  el("global-name").value = "";
+  el("global-value").value = "";
+  renderGlobalsPanel();
+  toast(`Globale Variable "${name}" gespeichert.`, "success");
+}
+
 async function addCredential() {
   const name = el("credential-name").value.trim();
   const value = el("credential-value").value;
@@ -1818,6 +1895,7 @@ function switchTab(name) {
   if (name === "workflows") renderWorkflowsPanel();
   if (name === "queues") renderQueuesPanel();
   if (name === "credentials") renderCredentialsPanel();
+  if (name === "globals") renderGlobalsPanel();
   if (name === "schedules") renderSchedulesPanel();
 }
 
@@ -1865,6 +1943,7 @@ function init() {
   el("btn-refresh-queues").addEventListener("click", renderQueuesPanel);
   el("btn-import-excel").addEventListener("click", importExcelToQueue);
   el("btn-add-credential").addEventListener("click", addCredential);
+  el("btn-add-global").addEventListener("click", addGlobal);
   el("btn-add-schedule").addEventListener("click", addSchedule);
   el("btn-refresh-runs").addEventListener("click", renderRunsView);
   el("btn-quick-new-workflow").addEventListener("click", () => {

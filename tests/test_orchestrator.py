@@ -454,3 +454,58 @@ def test_run_scheduler_loop_enqueues_a_job_for_a_due_schedule(monkeypatch):
     [job] = db.list_jobs()
     assert job["queue_name"] == "q1"
     assert db.get_schedule(schedule_id)["last_run_at"] is not None
+
+
+# --- global variables -------------------------------------------------------
+
+
+def test_global_variables_round_trip_with_their_type():
+    db.set_global_variable("basis_url", "https://erp.example.com")
+    db.set_global_variable("max_betrag", 5000)
+    db.set_global_variable("empfaenger", ["a@x.de", "b@x.de"])
+
+    assert db.get_global_variables() == {
+        "basis_url": "https://erp.example.com",
+        "max_betrag": 5000,
+        "empfaenger": ["a@x.de", "b@x.de"],
+    }
+
+
+def test_setting_a_global_twice_updates_it_in_place():
+    db.set_global_variable("basis_url", "https://alt")
+    db.set_global_variable("basis_url", "https://neu")
+
+    assert db.get_global_variables() == {"basis_url": "https://neu"}
+    assert len(db.list_global_variables()) == 1
+
+
+def test_delete_global_variable():
+    db.set_global_variable("x", 1)
+    db.delete_global_variable("x")
+
+    assert db.get_global_variables() == {}
+
+
+def test_a_job_run_sees_the_global_variables(monkeypatch):
+    from uiflow.orchestrator import worker
+
+    seen = {}
+
+    class _UrlRecordingBackend:
+        def navigate(self, url):
+            seen["url"] = url
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(worker, "_make_backend", lambda name: _UrlRecordingBackend())
+    db.set_global_variable("basis_url", "https://erp.example.com")
+    job_id = db.create_job(
+        "demo",
+        {"name": "demo", "backend": "web", "steps": [{"action": "navigate", "url": "{global.basis_url}/x"}]},
+    )
+
+    worker._run_job(db.claim_next_job("test-worker"))
+
+    assert db.get_job(job_id)["status"] == "success"
+    assert seen["url"] == "https://erp.example.com/x"

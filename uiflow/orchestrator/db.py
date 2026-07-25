@@ -96,6 +96,17 @@ CREATE TABLE IF NOT EXISTS credentials (
     created_at TEXT NOT NULL
 );
 
+-- Non-secret values shared by every workflow on this installation (base URLs,
+-- mailboxes, thresholds). The sibling of the credentials table above: secrets
+-- go there and never touch this database, everything else lives here so it is
+-- edited in one place instead of in each workflow. Values are stored as JSON so
+-- a number stays a number and a list stays a list.
+CREATE TABLE IF NOT EXISTS global_variables (
+    name TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS schedules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -491,6 +502,35 @@ def list_credential_names() -> list[str]:
 def delete_credential_name(name: str) -> None:
     with connect() as conn:
         conn.execute("DELETE FROM credentials WHERE name=?", (name,))
+
+
+# --- global variables (see the global_variables table comment) --------------
+
+
+def set_global_variable(name: str, value: Any) -> None:
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO global_variables (name, value_json, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+            (name, json.dumps(value), _now()),
+        )
+
+
+def list_global_variables() -> list[dict[str, Any]]:
+    """Name + decoded value per entry, for the Studio's management view."""
+    with connect() as conn:
+        rows = conn.execute("SELECT * FROM global_variables ORDER BY name").fetchall()
+        return [{"name": r["name"], "value": json.loads(r["value_json"]), "updated_at": r["updated_at"]} for r in rows]
+
+
+def get_global_variables() -> dict[str, Any]:
+    """The flat name -> value mapping a run is seeded with."""
+    return {entry["name"]: entry["value"] for entry in list_global_variables()}
+
+
+def delete_global_variable(name: str) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM global_variables WHERE name=?", (name,))
 
 
 # --- schedules ---------------------------------------------------------------

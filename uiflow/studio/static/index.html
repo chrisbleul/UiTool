@@ -132,7 +132,7 @@
       <div class="view-header">
         <div>
           <h1>Orchestrator</h1>
-          <p class="view-sub">Workflows, Queues, Anmeldedaten und Zeitpläne verwalten.</p>
+          <p class="view-sub">Workflows, Queues, Anmeldedaten, globale Variablen und Zeitpläne verwalten.</p>
         </div>
       </div>
 
@@ -140,6 +140,7 @@
         <button class="tab-btn active" data-tab="workflows" role="tab">Workflows</button>
         <button class="tab-btn" data-tab="queues" role="tab">Queues</button>
         <button class="tab-btn" data-tab="credentials" role="tab">Anmeldedaten</button>
+        <button class="tab-btn" data-tab="globals" role="tab">Globale Variablen</button>
         <button class="tab-btn" data-tab="schedules" role="tab">Zeitplan</button>
       </div>
 
@@ -170,6 +171,22 @@
           Im Workflow nutzbar über einen <code>get_credential</code>-Schritt, danach als <code>{var.name}</code>.
         </p>
         <div id="credentials-list" class="queues-list"></div>
+      </div>
+
+      <div class="tab-panel" data-tab-panel="globals">
+        <div class="excel-import-row">
+          <input id="global-name" type="text" placeholder="Name (z.B. basis_url)">
+          <input id="global-value" type="text" placeholder="Wert (Text, Zahl oder JSON)">
+          <button id="btn-add-global" class="btn">Speichern</button>
+        </div>
+        <p class="panel-hint">
+          Werte, die für <em>alle</em> Workflows gelten — Basis-URLs, Postfächer, Grenzwerte. Nutzbar in
+          Parametern als <code>{global.name}</code> und in Ausdrücken direkt unter ihrem Namen. Sie gelten
+          auch in Unterprozessen, ohne als Argument übergeben zu werden. Eine gleichnamige Workflow-Variable
+          hat in Ausdrücken Vorrang. <strong>Keine Geheimnisse hier ablegen</strong> — dafür gibt es
+          Anmeldedaten, deren Werte gar nicht erst in dieser Datenbank landen.
+        </p>
+        <div id="globals-list" class="queues-list"></div>
       </div>
 
       <div class="tab-panel" data-tab-panel="schedules">
