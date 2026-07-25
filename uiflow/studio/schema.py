@@ -15,7 +15,10 @@ identical for both backends."""
 # switch statement's {value: [steps]} map, rendered as editable key + nested
 # step list per case), hotkey (text input + "record" button that captures a
 # key combo from the browser and fills it in), workflow (text input backed by a
-# datalist of the workflows that exist, for referencing a sub-workflow by name).
+# datalist of the workflows that exist, for referencing a sub-workflow by name),
+# variable (text input backed by a datalist of the current workflow's declared
+# variables - see the "Variablen" button in the builder toolbar - for a field
+# that *writes* to a named variable, so picking an existing name avoids typos).
 
 _CONTROL_FLOW_AND_VARIABLES: dict[str, list[dict]] = {
     "if": [
@@ -29,12 +32,12 @@ _CONTROL_FLOW_AND_VARIABLES: dict[str, list[dict]] = {
         {"name": "default", "label": "Standard-Fall", "type": "steps", "required": False},
     ],
     "assign": [
-        {"name": "variable", "label": "Variable", "type": "text", "required": True},
+        {"name": "variable", "label": "Variable", "type": "variable", "required": True},
         {"name": "value", "label": "Wert (Text, erlaubt {var.x}/{item.x})", "type": "text", "required": False},
         {"name": "expression", "label": "oder: Ausdruck (Python, z.B. a + b)", "type": "text", "required": False},
     ],
     "increment": [
-        {"name": "variable", "label": "Variable", "type": "text", "required": True},
+        {"name": "variable", "label": "Variable", "type": "variable", "required": True},
         {"name": "by", "label": "Um wie viel", "type": "number", "required": False},
     ],
     "read_excel": [
@@ -55,7 +58,7 @@ _CONTROL_FLOW_AND_VARIABLES: dict[str, list[dict]] = {
     "try": [
         {"name": "steps", "label": "Versuchen", "type": "steps", "required": False},
         {"name": "catch", "label": "Bei Fehler", "type": "steps", "required": False},
-        {"name": "error_var", "label": "Fehlermeldung speichern als (optional)", "type": "text", "required": False},
+        {"name": "error_var", "label": "Fehlermeldung speichern als (optional)", "type": "variable", "required": False},
     ],
     "run_workflow": [
         {"name": "workflow", "label": "Workflow", "type": "workflow", "required": True},

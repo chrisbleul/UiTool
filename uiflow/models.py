@@ -60,6 +60,11 @@ class Step:
 
 VALID_BROWSER_CHANNELS = (None, "chrome", "msedge")
 
+# `{global.x}`/`{item.x}`/`{var.x}` reserve these as namespace names (see
+# engine.py's _PLACEHOLDER_RE) - a declared workflow variable can't reuse one
+# without colliding with that namespace itself.
+RESERVED_VARIABLE_NAMES = ("global", "item", "var")
+
 
 @dataclass
 class Workflow:
@@ -70,6 +75,14 @@ class Workflow:
     # Chromium build; "chrome"/"msedge" instead drive the locally installed
     # Google Chrome / Microsoft Edge (must already be installed on the machine).
     browser_channel: str | None = None
+    # Declared workflow-own variables (UiPath's "Variables" panel): name ->
+    # default value, seeded into the run before its first step (see
+    # WorkflowEngine.run/_run_sub_workflow). A variable still doesn't need to
+    # be declared to be used - it's created implicitly on first `assign`,
+    # exactly as before - this only gives a name a starting value (and, via
+    # that value's own JSON type, an implicit type) instead of starting out
+    # absent until the first `assign` sets it.
+    variables: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_raw(cls, raw: dict[str, Any]) -> "Workflow":
@@ -79,8 +92,20 @@ class Workflow:
         browser_channel = raw.get("browser_channel") or None
         if browser_channel not in VALID_BROWSER_CHANNELS:
             raise ValueError(f"Unknown browser_channel '{browser_channel}', expected one of {VALID_BROWSER_CHANNELS}")
+        variables = raw.get("variables") or {}
+        if not isinstance(variables, dict):
+            raise ValueError("'variables' must be a mapping of name -> default value")
+        reserved = [name for name in variables if name in RESERVED_VARIABLE_NAMES]
+        if reserved:
+            raise ValueError(f"'{reserved[0]}' is a reserved name and can't be declared as a variable")
         steps = [Step.from_dict(s) for s in raw.get("steps", [])]
-        return cls(name=raw.get("name", "workflow"), backend=backend, steps=steps, browser_channel=browser_channel)
+        return cls(
+            name=raw.get("name", "workflow"),
+            backend=backend,
+            steps=steps,
+            browser_channel=browser_channel,
+            variables=variables,
+        )
 
     @classmethod
     def load(cls, path: str | Path) -> "Workflow":
@@ -106,6 +131,8 @@ class Workflow:
         result: dict[str, Any] = {"name": self.name, "backend": self.backend, "steps": steps}
         if self.browser_channel:
             result["browser_channel"] = self.browser_channel
+        if self.variables:
+            result["variables"] = self.variables
         return result
 
     def save(self, path: str | Path) -> None:

@@ -93,6 +93,8 @@
         <input id="wf-queue" type="text" list="queue-names" placeholder="Queue (optional)" title="Queue-Name: der Workflow läuft dann einmal pro Queue-Item statt nur einmal">
         <datalist id="queue-names"></datalist>
 
+        <button id="btn-variables" class="btn" title="Deklarierte Variablen dieses Workflows verwalten">Variablen</button>
+
         <button id="btn-undo" class="btn" title="Rückgängig (Strg+Z)" aria-label="Rückgängig" disabled>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9h10a6 6 0 0 1 0 12h-2"/><polyline points="9 4 4 9 9 14"/></svg>
           <span>Rückgängig</span>
@@ -246,6 +248,11 @@
      "workflow"-typed field (see run_workflow in schema.py). -->
 <datalist id="workflow-names"></datalist>
 
+<!-- Names of the current workflow's declared variables, offered as
+     suggestions by every "variable"-typed field (see assign/increment/try in
+     schema.py) - populated from state.variables, not a server round-trip. -->
+<datalist id="variable-names"></datalist>
+
 <div id="toast-host" class="toast-host" aria-live="polite"></div>
 
 <div id="confirm-overlay" class="modal-overlay hidden">
@@ -255,6 +262,29 @@
       <button id="confirm-cancel" class="btn">Abbrechen</button>
       <button id="confirm-ok" class="btn btn-danger">Löschen</button>
     </div>
+  </div>
+</div>
+
+<div id="variables-overlay" class="modal-overlay hidden">
+  <div class="modal-box modal-box-wide" role="dialog" aria-modal="true" aria-labelledby="variables-title">
+    <div class="modal-head">
+      <h2 id="variables-title">Workflow-Variablen</h2>
+      <button id="btn-close-variables" class="btn-icon" aria-label="Schließen">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="5" y1="5" x2="19" y2="19"/><line x1="19" y1="5" x2="5" y2="19"/></svg>
+      </button>
+    </div>
+    <p class="panel-hint">
+      Deklarierte Variablen dieses Workflows mit Startwert. Sie stehen ab dem ersten Schritt als
+      <code>{var.name}</code> zur Verfügung, statt erst beim ersten <code>Variable zuweisen</code>-Schritt
+      zu entstehen, und erscheinen als Vorschlag in Feldern wie "Variable" (Variable zuweisen, Zähler
+      erhöhen, Fehlermeldung speichern als).
+    </p>
+    <div class="excel-import-row">
+      <input id="var-decl-name" type="text" placeholder="Name (z.B. zaehler)">
+      <input id="var-decl-default" type="text" placeholder="Startwert (Text, Zahl, JSON — optional)">
+      <button id="btn-add-var-decl" class="btn">Hinzufügen</button>
+    </div>
+    <div id="variables-decl-list" class="queues-list"></div>
   </div>
 </div>
 

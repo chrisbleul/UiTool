@@ -1083,6 +1083,10 @@ body {
 }
 .modal-box p { margin: 0 0 18px; font-size: 0.92rem; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.modal-box-wide { width: 560px; max-height: 80vh; display: flex; flex-direction: column; }
+.modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.modal-head h2 { margin: 0; font-size: 1.05rem; }
+.modal-box-wide .queues-list { padding: 0; overflow-y: auto; }
 .btn-danger { background: var(--danger); border-color: var(--danger); color: #fff; }
 .btn-danger:hover { background: #b91c1c; border-color: #b91c1c; }
 

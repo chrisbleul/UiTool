@@ -943,10 +943,10 @@ def workflows_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
-def write_workflow(directory, name, steps, backend="web"):
-    Workflow(name=name, backend=backend, steps=[Step.from_dict(s) for s in steps]).save(
-        directory / f"{name}.yaml"
-    )
+def write_workflow(directory, name, steps, backend="web", variables=None):
+    Workflow(
+        name=name, backend=backend, steps=[Step.from_dict(s) for s in steps], variables=variables or {}
+    ).save(directory / f"{name}.yaml")
 
 
 def test_run_workflow_executes_the_referenced_workflow(workflows_dir):
@@ -1184,6 +1184,82 @@ def test_a_name_missing_from_the_snapshot_still_falls_back_to_the_live_file(work
     WorkflowEngine(backend).run(workflow, sub_workflows={"andere": unrelated})
 
     assert backend.calls == [("navigate", "von der platte")]
+
+
+# --- declared workflow variables ---------------------------------------------
+
+
+def test_declared_variable_default_is_seeded_before_the_first_step():
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[Step("navigate", {"url": "{var.basis}"})],
+        variables={"basis": "https://x"},
+    )
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow)
+
+    assert backend.calls == [("navigate", "https://x")]
+
+
+def test_declared_variable_without_a_default_stays_unset_until_assigned():
+    workflow = Workflow(
+        name="t", backend="web", steps=[Step("navigate", {"url": "a"})], variables={"zaehler": None}
+    )
+    engine = WorkflowEngine(RecordingBackend())
+
+    engine.run(workflow)
+
+    assert "zaehler" not in engine.variables
+
+
+def test_an_explicit_run_variable_overrides_the_declared_default():
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[Step("navigate", {"url": "{var.basis}"})],
+        variables={"basis": "https://default"},
+    )
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow, variables={"basis": "https://override"})
+
+    assert backend.calls == [("navigate", "https://override")]
+
+
+def test_sub_workflow_own_declared_default_is_seeded_when_entering_it(workflows_dir):
+    write_workflow(
+        workflows_dir,
+        "teilprozess",
+        [{"action": "navigate", "url": "{var.zaehler}"}],
+        variables={"zaehler": 0},
+    )
+    workflow = Workflow(name="haupt", backend="web", steps=[Step("run_workflow", {"workflow": "teilprozess"})])
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow)
+
+    assert backend.calls == [("navigate", "0")]
+
+
+def test_sub_workflow_argument_overrides_its_own_declared_default(workflows_dir):
+    write_workflow(
+        workflows_dir,
+        "teilprozess",
+        [{"action": "navigate", "url": "{var.zaehler}"}],
+        variables={"zaehler": 0},
+    )
+    workflow = Workflow(
+        name="haupt",
+        backend="web",
+        steps=[Step("run_workflow", {"workflow": "teilprozess", "arguments": {"zaehler": 5}})],
+    )
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow)
+
+    assert backend.calls == [("navigate", "5")]
 
 
 def test_a_whole_placeholder_argument_keeps_its_type(workflows_dir):

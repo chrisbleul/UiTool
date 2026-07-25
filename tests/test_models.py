@@ -218,3 +218,41 @@ def test_resolve_sub_workflows_does_not_loop_forever_on_a_cycle(workflows_dir):
     resolved = resolve_sub_workflows(workflow)  # must return instead of recursing forever
 
     assert set(resolved) == {"a", "b"}
+
+
+# --- declared workflow variables ---------------------------------------------
+
+
+def test_workflow_from_raw_parses_declared_variables():
+    workflow = Workflow.from_raw(
+        {"name": "t", "backend": "web", "steps": [], "variables": {"zaehler": 0, "kunden": []}}
+    )
+
+    assert workflow.variables == {"zaehler": 0, "kunden": []}
+
+
+def test_workflow_from_raw_defaults_variables_to_empty_dict():
+    workflow = Workflow.from_raw({"name": "t", "backend": "web", "steps": []})
+
+    assert workflow.variables == {}
+
+
+def test_workflow_from_raw_rejects_a_non_mapping_variables_value():
+    with pytest.raises(ValueError):
+        Workflow.from_raw({"name": "t", "backend": "web", "steps": [], "variables": ["zaehler"]})
+
+
+@pytest.mark.parametrize("reserved", ["global", "item", "var"])
+def test_workflow_from_raw_rejects_a_reserved_variable_name(reserved):
+    with pytest.raises(ValueError):
+        Workflow.from_raw({"name": "t", "backend": "web", "steps": [], "variables": {reserved: 1}})
+
+
+def test_workflow_to_dict_round_trips_variables_only_when_declared():
+    with_vars = Workflow(name="t", backend="web", steps=[], variables={"zaehler": 0})
+    without_vars = Workflow(name="t", backend="web", steps=[])
+
+    assert "variables" not in without_vars.to_dict()
+    data = with_vars.to_dict()
+    assert data["variables"] == {"zaehler": 0}
+    assert Workflow.from_raw(data).variables == {"zaehler": 0}

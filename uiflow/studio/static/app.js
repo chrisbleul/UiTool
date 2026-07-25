@@ -4,6 +4,7 @@ let state = {
   backend: "web",
   steps: [],
   selected: null, // the model step whose parameters the properties panel shows
+  variables: {}, // declared workflow variables: name -> default value (see resolve_sub_workflows/Workflow.variables)
 };
 
 let currentJobId = null;
@@ -93,6 +94,7 @@ function snapshotState() {
     backend: state.backend,
     browserChannel: el("wf-browser-channel").value,
     steps: state.steps,
+    variables: state.variables,
   });
 }
 
@@ -111,6 +113,8 @@ function undo() {
   el("wf-browser-channel").value = snap.browserChannel || "";
   updateBrowserChannelVisibility();
   state.steps = snap.steps;
+  state.variables = snap.variables || {};
+  refreshVariableNamesDatalist();
   state.selected = null;
   renderSteps();
   updateUndoButton();
@@ -158,6 +162,8 @@ async function loadWorkflow(name) {
   el("wf-browser-channel").value = data.browser_channel || "";
   updateBrowserChannelVisibility();
   state.steps = rawStepsToModel(data.steps, schema[state.backend] || {});
+  state.variables = data.variables || {};
+  refreshVariableNamesDatalist();
   state.selected = null;
   undoStack = [];
   updateUndoButton();
@@ -789,6 +795,24 @@ function renderField(step, fieldDef) {
     input.addEventListener("blur", () => {
       editing = false;
     });
+  } else if (fieldDef.type === "variable") {
+    // Free text with suggestions from the workflow's declared variables (see
+    // the "Variablen" button) - a field that *writes* to a name, so it isn't
+    // restricted to only declared ones (assign still creates new names too).
+    input = document.createElement("input");
+    input.type = "text";
+    input.setAttribute("list", "variable-names");
+    input.placeholder = "Variablenname";
+    input.value = step.params[fieldDef.name] ?? "";
+    input.addEventListener("focus", () => {
+      if (!editing) {
+        pushUndo();
+        editing = true;
+      }
+    });
+    input.addEventListener("blur", () => {
+      editing = false;
+    });
   } else {
     input = document.createElement("input");
     input.type = fieldDef.type === "number" ? "number" : "text";
@@ -1197,12 +1221,14 @@ async function stopRecording() {
 }
 
 function currentWorkflowPayload() {
-  return {
+  const payload = {
     name: el("wf-name").value || "workflow",
     backend: state.backend,
     browser_channel: state.backend === "web" ? el("wf-browser-channel").value || undefined : undefined,
     steps: modelStepsToRaw(state.steps),
   };
+  if (Object.keys(state.variables).length) payload.variables = state.variables;
+  return payload;
 }
 
 function saveWorkflowAs(name, payload, { overwrite }) {
@@ -1579,6 +1605,116 @@ async function addGlobal() {
   el("global-value").value = "";
   renderGlobalsPanel();
   toast(`Globale Variable "${name}" gespeichert.`, "success");
+}
+
+// --- declared workflow variables (per-workflow, saved as part of its own
+// YAML - see models.Workflow.variables - not the installation-wide globals
+// above, which live in orchestrator.db instead) ------------------------------
+
+// Same "try JSON, fall back to plain string" rule as the server applies to a
+// global variable's value (studio/app.py's set_global_route) - kept in sync
+// here since declared-variable defaults never leave the browser to be parsed
+// server-side; a number stays a number, a list stays a list.
+function parseLooseValue(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+}
+
+function refreshVariableNamesDatalist() {
+  const datalist = el("variable-names");
+  datalist.innerHTML = "";
+  for (const name of Object.keys(state.variables)) {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = name;
+    datalist.appendChild(opt);
+  }
+}
+
+function renderVariableDeclarations() {
+  const container = el("variables-decl-list");
+  const names = Object.keys(state.variables);
+  if (names.length === 0) {
+    container.innerHTML = '<p style="color:var(--muted)">Noch keine Variablen deklariert.</p>';
+    return;
+  }
+  container.innerHTML = "";
+  for (const name of names) {
+    const value = state.variables[name];
+    const row = document.createElement("div");
+    row.className = "list-row";
+
+    const info = document.createElement("div");
+    info.style.flex = "1";
+    info.style.minWidth = "0";
+    const label = document.createElement("div");
+    label.className = "list-row-name";
+    label.textContent = name;
+    const valueEl = document.createElement("div");
+    valueEl.className = "list-row-meta";
+    valueEl.textContent = value === null ? "(kein Startwert)" : typeof value === "string" ? value : JSON.stringify(value);
+    info.append(label, valueEl);
+
+    const editBtn = document.createElement("button");
+    editBtn.className = "btn-icon";
+    editBtn.innerHTML = ICONS.pencil;
+    editBtn.title = "Bearbeiten";
+    editBtn.setAttribute("aria-label", `Variable "${name}" bearbeiten`);
+    editBtn.addEventListener("click", () => {
+      el("var-decl-name").value = name;
+      el("var-decl-default").value = value === null ? "" : typeof value === "string" ? value : JSON.stringify(value);
+      el("var-decl-default").focus();
+    });
+
+    const delBtn = document.createElement("button");
+    delBtn.className = "btn-icon danger";
+    delBtn.textContent = "✕";
+    delBtn.title = "Löschen";
+    delBtn.setAttribute("aria-label", `Variable "${name}" löschen`);
+    delBtn.addEventListener("click", async () => {
+      if (!(await confirmDialog(`Variable "${name}" wirklich löschen?`))) return;
+      pushUndo();
+      delete state.variables[name];
+      refreshVariableNamesDatalist();
+      renderVariableDeclarations();
+      toast(`Variable "${name}" gelöscht.`, "success");
+    });
+
+    row.append(info, editBtn, delBtn);
+    container.appendChild(row);
+  }
+}
+
+function addVariableDeclaration() {
+  const name = el("var-decl-name").value.trim();
+  const rawValue = el("var-decl-default").value;
+  if (!name) {
+    toast("Bitte einen Namen angeben.", "error");
+    return;
+  }
+  if (["global", "item", "var"].includes(name)) {
+    toast(`"${name}" ist ein reservierter Name.`, "error");
+    return;
+  }
+  pushUndo();
+  state.variables[name] = rawValue === "" ? null : parseLooseValue(rawValue);
+  el("var-decl-name").value = "";
+  el("var-decl-default").value = "";
+  refreshVariableNamesDatalist();
+  renderVariableDeclarations();
+  toast(`Variable "${name}" gespeichert.`, "success");
+}
+
+function openVariablesOverlay() {
+  renderVariableDeclarations();
+  el("variables-overlay").classList.remove("hidden");
+}
+
+function closeVariablesOverlay() {
+  el("variables-overlay").classList.add("hidden");
 }
 
 async function addCredential() {
@@ -2004,6 +2140,8 @@ function startNewWorkflow() {
   el("wf-browser-channel").value = "";
   updateBrowserChannelVisibility();
   state.steps = [newStepFor(state.backend)];
+  state.variables = {};
+  refreshVariableNamesDatalist();
   state.selected = null;
   undoStack = [];
   updateUndoButton();
@@ -2029,6 +2167,12 @@ function init() {
   el("btn-continue").addEventListener("click", continueRun);
   el("btn-stop").addEventListener("click", stopRun);
   el("btn-undo").addEventListener("click", undo);
+  el("btn-variables").addEventListener("click", openVariablesOverlay);
+  el("btn-close-variables").addEventListener("click", closeVariablesOverlay);
+  el("btn-add-var-decl").addEventListener("click", addVariableDeclaration);
+  el("variables-overlay").addEventListener("click", (e) => {
+    if (e.target === el("variables-overlay")) closeVariablesOverlay();
+  });
   el("btn-logout").addEventListener("click", async () => {
     await fetch("/logout", { method: "POST" });
     location.href = "/";

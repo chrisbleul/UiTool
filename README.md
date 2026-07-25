@@ -444,6 +444,42 @@ steps:
     save_as: eingang                # -> Liste von {subject, from, date, body}
 ```
 
+## Deklarierte Workflow-Variablen
+
+Bislang entstand jede Workflow-eigene Variable stillschweigend beim ersten `assign` — nirgends stand,
+welche ein Workflow überhaupt verwendet, und `{var.tippfehler}` wurde stumm zu einem leeren String,
+während derselbe Tippfehler in einer `condition`/`expression` mit einem Fehler abbrach. Der Button
+**Variablen** im Builder öffnet ein Panel, in dem sich Variablen des *aktuell geöffneten* Workflows mit
+Namen und optionalem Startwert deklarieren lassen — analog zu UiPaths Variablen-Panel:
+
+```yaml
+name: Rechnung buchen
+backend: web
+variables:
+  zaehler: 0          # Startwert - eine Zahl bleibt eine Zahl, eine Liste eine Liste (wie bei Anmeldedaten/globalen Variablen: JSON statt Text)
+  kunden: []
+  status:             # ohne Startwert (Name nur reserviert) - entsteht wie bisher erst beim ersten assign
+steps:
+  - action: increment
+    variable: zaehler
+```
+
+Drei Punkte dazu:
+
+- **Der Startwert steht ab dem allerersten Schritt.** Anders als bei einem `assign` mitten im Ablauf ist
+  `{var.zaehler}` schon vor dem ersten Schritt `0`, nicht erst danach — nützlich für einen Zähler, der
+  vor der ersten `increment` gelesen wird, oder eine Liste, die per `for_each` durchlaufen wird, bevor
+  irgendein Schritt sie befüllt.
+- **Ein Name ohne Startwert reserviert nur den Namen** (erscheint im Eigenschaften-Panel als Vorschlag),
+  ändert aber nichts am bisherigen Verhalten — die Variable entsteht weiterhin erst beim ersten `assign`.
+- **Eine gleichnamige Variable in `arguments` beim Aufruf eines Unterprozesses gewinnt** über dessen
+  eigenen Startwert, genau wie ein Funktionsargument einen Default überschreibt — der Unterprozess bringt
+  seinen Startwert nur mit, wenn der Aufrufer ihn nicht selbst setzt.
+
+Die Felder `Variable` (`assign`, `increment`) und `Fehlermeldung speichern als` (`try`) bieten die
+deklarierten Namen im Eigenschaften-Panel als Vorschlag an, ersetzen freies Tippen aber nicht — eine neue
+Variable entsteht weiterhin einfach durch Eintippen eines neuen Namens.
+
 ## Globale Variablen
 
 Werte, die für *alle* Workflows gelten — Basis-URLs, Postfächer, Grenzwerte. Verwaltet im Studio unter
@@ -533,13 +569,6 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
 - **Echtes Multi-User-/Rechte-System**: das optionale Login (`UIFLOW_STUDIO_PASSWORD`) ist ein
   einzelnes geteiltes Passwort ohne einzelne Konten, Rollen oder Berechtigungen — bewusst minimal
   gehalten, kein Ersatz für echtes RBAC.
-- **Deklarierte Workflow-Variablen** (UiPaths Variablen-Panel): Installationsweite globale Variablen
-  gibt es inzwischen (siehe oben), die *workflow-eigenen* entstehen aber weiterhin stillschweigend beim
-  ersten `assign` — nirgends steht, welche ein Workflow verwendet, und es gibt keine Startwerte oder
-  Typen. Nebenwirkung: ein Tippfehler verhält sich je nach Weg unterschiedlich — `{var.tippfehler}` wird
-  stumm zu einem leeren String, derselbe Name in einem Ausdruck bricht mit einem Fehler ab. Eine
-  Deklarationsliste würde beides prüfbar machen und dem Eigenschaften-Panel erlauben, Variablennamen zur
-  Auswahl anzubieten statt sie tippen zu lassen.
 - **Framework-Vorlage nach Vorbild des UiPath REFramework**: Die Kernschleife gibt es bereits —
   `_run_queue_driven` ist das "Process Transaction"-Muster, mit Retry samt Backoff, Status je Item und
   Job-Logs. Was fehlt, ist der Rahmen darum herum, den man heute in jedem Projekt neu baut:

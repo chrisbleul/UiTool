@@ -128,7 +128,7 @@ class WorkflowEngine:
         global_variables: Optional[dict[str, Any]] = None,
         sub_workflows: Optional[dict[str, Workflow]] = None,
     ) -> None:
-        self.variables = dict(variables) if variables else {}
+        self.variables = self._seed_declared_variables(workflow, dict(variables) if variables else {})
         # Installation-wide values, kept apart from the run's own variables so
         # they survive a sub-workflow's isolated scope and can't be overwritten
         # by an `assign`. The engine is handed them rather than reading the
@@ -152,6 +152,19 @@ class WorkflowEngine:
         logger.info("Running workflow '%s' on backend=%s", workflow.name, workflow.backend)
         self._run_steps(workflow.steps, on_breakpoint, should_stop)
         logger.info("Workflow '%s' completed successfully", workflow.name)
+
+    @staticmethod
+    def _seed_declared_variables(workflow: Workflow, provided: dict[str, Any]) -> dict[str, Any]:
+        """Starts a run's variables from `workflow.variables`' declared
+        defaults (skipping any declared with no default - a bare name reserves
+        itself for the picker in the Studio's properties panel but still only
+        gets a value on first `assign`, same as an undeclared one), then lets
+        `provided` (an explicit run's own `variables`, or a sub-workflow's
+        `arguments`) override them - an explicit input always wins over a
+        declared default, the same as a function parameter's default."""
+        seeded = {name: default for name, default in workflow.variables.items() if default is not None}
+        seeded.update(provided)
+        return seeded
 
     def _run_steps(
         self,
@@ -434,9 +447,11 @@ class WorkflowEngine:
         self._log("[%d] run_workflow '%s' (%d step(s), arguments: %s)", index, name, len(sub.steps), arguments)
 
         caller_variables = self.variables
-        # Arguments only - except the global namespace, which is installation-wide
-        # and therefore visible everywhere without being threaded through.
-        self.variables = {**arguments, "global": self._globals}
+        # Arguments (plus the sub-workflow's own declared defaults) only -
+        # except the global namespace, which is installation-wide and
+        # therefore visible everywhere without being threaded through.
+        self.variables = self._seed_declared_variables(sub, arguments)
+        self.variables["global"] = self._globals
         self._workflow_stack.append(name)
         try:
             # The path prefix carries the sub-workflow's name because its steps
