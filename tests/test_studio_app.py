@@ -139,6 +139,46 @@ def test_inspect_web_endpoint_reports_a_value_error_as_a_400(client, monkeypatch
     assert "Ungültiger Selector" in res.get_json()["error"]
 
 
+def test_inspect_desktop_endpoint_reports_match_count(client, monkeypatch):
+    captured = {}
+
+    def fake_inspect(**kwargs):
+        captured.update(kwargs)
+        return {"count": 1, "matches": [{"control_type": "Button", "title": "OK", "auto_id": "btnOK"}]}
+
+    monkeypatch.setattr("uiflow.studio.picker.inspect_desktop_selector", fake_inspect)
+
+    res = client.post(
+        "/api/inspect/desktop",
+        json={"focus_title": "Editor", "selector": {"control_type": "Button", "title": ""}},
+    )
+
+    assert res.status_code == 200
+    data = res.get_json()
+    assert data["ok"] is True
+    assert data["count"] == 1
+    assert captured == {"focus_title": "Editor", "focus_path": None, "control_type": "Button"}
+
+
+def test_inspect_desktop_endpoint_requires_a_focus_title_or_path(client):
+    res = client.post("/api/inspect/desktop", json={"selector": {"control_type": "Button"}})
+
+    assert res.status_code == 400
+    assert res.get_json()["ok"] is False
+
+
+def test_inspect_desktop_endpoint_reports_a_value_error_as_a_400(client, monkeypatch):
+    def raise_value_error(**kwargs):
+        raise ValueError("Anwendung nicht erreichbar")
+
+    monkeypatch.setattr("uiflow.studio.picker.inspect_desktop_selector", raise_value_error)
+
+    res = client.post("/api/inspect/desktop", json={"focus_title": "Editor", "selector": {}})
+
+    assert res.status_code == 400
+    assert "Anwendung nicht erreichbar" in res.get_json()["error"]
+
+
 def test_repository_endpoints_add_list_and_delete_an_element(client):
     res = client.post(
         "/api/repository",

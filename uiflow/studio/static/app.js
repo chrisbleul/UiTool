@@ -1034,15 +1034,18 @@ function renderProperties() {
       });
       body.appendChild(pickBtn);
 
-      if (hasSelectorField) {
-        const inspectBtn = document.createElement("button");
-        inspectBtn.type = "button";
-        inspectBtn.className = "btn";
-        inspectBtn.textContent = "Selector prüfen";
-        inspectBtn.title = "Prüft, wie viele Elemente dieser Selector auf der Seite trifft";
-        inspectBtn.addEventListener("click", () => inspectWebSelector(step));
-        body.appendChild(inspectBtn);
-      }
+      const inspectBtn = document.createElement("button");
+      inspectBtn.type = "button";
+      inspectBtn.className = "btn";
+      inspectBtn.textContent = "Selector prüfen";
+      inspectBtn.title = hasSelectorField
+        ? "Prüft, wie viele Elemente dieser Selector auf der Seite trifft"
+        : "Prüft, wie viele Elemente dieser Selector in der Zielanwendung trifft";
+      inspectBtn.addEventListener("click", () => {
+        if (hasSelectorField) inspectWebSelector(step);
+        else inspectDesktopSelector(step);
+      });
+      body.appendChild(inspectBtn);
     }
   }
 }
@@ -1391,6 +1394,51 @@ async function inspectWebSelector(step) {
     // More than one match is flagged, not just reported: an ambiguous
     // selector is the classic reason a bot ends up clicking the wrong element.
     toast(`${data.count} Treffer für "${selector}" - mehrdeutig${preview}.`, "error");
+  }
+}
+
+// Desktop counterpart to inspectWebSelector: checks the control_type/title/
+// auto_id already in the field against the scope application's current
+// element tree instead of waiting for a click.
+async function inspectDesktopSelector(step) {
+  const selector = {};
+  for (const key of ["control_type", "title", "auto_id"]) {
+    if (step.params[key]) selector[key] = step.params[key];
+  }
+  if (Object.keys(selector).length === 0) {
+    toast("Bitte zuerst Control-Felder eintragen.", "error");
+    return;
+  }
+  const scope = findDesktopScope();
+  if (!scope) {
+    toast("Kein Scope (launch/connect-Schritt) im Workflow gefunden.", "error");
+    return;
+  }
+  let data;
+  try {
+    const res = await fetch("/api/inspect/desktop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...scope, selector }),
+    });
+    data = await res.json();
+  } catch (err) {
+    toast("Prüfung fehlgeschlagen: " + err, "error");
+    return;
+  }
+  if (!data.ok) {
+    toast("Prüfung fehlgeschlagen: " + data.error, "error");
+    return;
+  }
+  const first = data.matches[0];
+  const preview = first ? ` (z.B. ${first.control_type}${first.title ? ` "${first.title}"` : ""})` : "";
+  const describe = Object.entries(selector).map(([k, v]) => `${k}=${v}`).join(", ");
+  if (data.count === 0) {
+    toast(`Kein Element gefunden für ${describe}.`, "error");
+  } else if (data.count === 1) {
+    toast(`1 Treffer für ${describe}${preview}.`, "success");
+  } else {
+    toast(`${data.count} Treffer für ${describe} - mehrdeutig${preview}.`, "error");
   }
 }
 

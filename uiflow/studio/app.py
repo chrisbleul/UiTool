@@ -336,6 +336,24 @@ def create_app() -> Flask:
         except Exception as exc:  # noqa: BLE001 - surface any picker failure to the UI
             return jsonify({"ok": False, "error": str(exc)}), 500
 
+    @app.post("/api/inspect/desktop")
+    def inspect_desktop() -> Response:
+        data = request.get_json(force=True) or {}
+        focus_title = data.get("focus_title")
+        focus_path = data.get("focus_path")
+        selector = {k: v for k, v in (data.get("selector") or {}).items() if v not in (None, "")}
+        if not focus_title and not focus_path:
+            return jsonify({"ok": False, "error": "focus_title or focus_path required"}), 400
+        from .picker import inspect_desktop_selector
+
+        try:
+            result = inspect_desktop_selector(focus_title=focus_title, focus_path=focus_path, **selector)
+            return jsonify({"ok": True, **result})
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001 - surface any picker failure to the UI
+            return jsonify({"ok": False, "error": str(exc)}), 500
+
     @app.post("/api/pick/desktop")
     def pick_desktop() -> Response:
         data = request.get_json(silent=True) or {}
