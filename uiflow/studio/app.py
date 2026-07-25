@@ -11,13 +11,18 @@ from typing import Any
 
 from flask import Flask, Response, jsonify, redirect, request, send_from_directory, session
 
+from .. import models
 from ..models import Workflow
 from ..orchestrator import db
-from .schema import ACTION_SCHEMAS
+from .schema import ACTION_SCHEMAS, activity_catalog
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-WORKFLOWS_DIR = PROJECT_ROOT / "workflows"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+# `global` and `item` are placeholder namespaces, not variable names - a global
+# called either would be unreachable as {global.item} resolves against the
+# namespace, not the value (see engine.py's _NAMESPACE_KEYS).
+_RESERVED_GLOBAL_NAMES = ("global", "item", "var")
 
 # One entry per in-flight recording session (unaffected by the orchestrator -
 # a recording is a live interactive picking session tied to one browser tab,
@@ -26,16 +31,16 @@ _recordings: dict[str, Any] = {}
 
 
 def _safe_workflow_path(name: str) -> Path:
-    filename = Path(name).name  # discard any directory components
-    if not filename.endswith(".yaml"):
-        filename += ".yaml"
-    return WORKFLOWS_DIR / filename
+    # models.workflow_path is the single resolver, shared with the engine's
+    # `run_workflow` action - otherwise the Studio could save a sub-workflow
+    # into a different directory than the one a run resolves names against.
+    return models.workflow_path(name)
 
 
 def create_app() -> Flask:
     app = Flask(__name__, static_folder=None)
     app.json.sort_keys = False  # preserve schema.py's action order (e.g. "navigate" before "click")
-    WORKFLOWS_DIR.mkdir(exist_ok=True)
+    models.WORKFLOWS_DIR.mkdir(parents=True, exist_ok=True)
     db.init_db()
 
     # Login is entirely opt-in: this Studio is a local single-user MVP tool by
@@ -87,9 +92,16 @@ def create_app() -> Flask:
     def schema() -> Response:
         return jsonify(ACTION_SCHEMAS)
 
+    @app.get("/api/activities")
+    def activities() -> Response:
+        """Palette metadata (label/category/description/keywords) for the
+        builder's activity catalog - kept apart from /api/schema, which stays
+        the plain action -> fields mapping the property forms are built from."""
+        return jsonify(activity_catalog())
+
     @app.get("/api/workflows")
     def list_workflows() -> Response:
-        names = sorted(p.stem for p in WORKFLOWS_DIR.glob("*.yaml"))
+        names = sorted(p.stem for p in models.WORKFLOWS_DIR.glob("*.yaml"))
         return jsonify(names)
 
     @app.get("/api/workflows/<name>")
@@ -107,6 +119,12 @@ def create_app() -> Flask:
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         path = _safe_workflow_path(name)
+        # Saving the workflow you have open is meant to overwrite, so that stays
+        # the default. Writing under a *different* name (rename, duplicate, "save
+        # as") is not - it would destroy an unrelated workflow with no warning -
+        # so those callers pass ?overwrite=false and handle the 409.
+        if request.args.get("overwrite", "true").lower() in ("false", "0") and path.exists():
+            return jsonify({"error": f"Workflow '{path.stem}' existiert bereits"}), 409
         workflow.save(path)
         return jsonify({"saved": path.name})
 
@@ -162,6 +180,7 @@ def create_app() -> Flask:
                     payload = {
                         "index": controls["paused_step_index"],
                         "action": controls["paused_step_action"],
+                        "path": controls["paused_step_path"],
                         "variables": variables,
                     }
                     yield f"event: paused\ndata: {json.dumps(payload)}\n\n"
@@ -386,6 +405,37 @@ def create_app() -> Flask:
         except Exception as exc:  # noqa: BLE001 - surface any keyring/backend error to the UI
             return jsonify({"error": str(exc)}), 500
         db.delete_credential_name(name)
+        return jsonify({"deleted": name})
+
+    @app.get("/api/globals")
+    def list_globals() -> Response:
+        return jsonify(db.list_global_variables())
+
+    @app.post("/api/globals")
+    def set_global_route() -> Response:
+        data = request.get_json(force=True) or {}
+        name = (data.get("name") or "").strip()
+        if not name:
+            return jsonify({"error": "name required"}), 400
+        if name in _RESERVED_GLOBAL_NAMES:
+            return jsonify({"error": f"'{name}' ist ein reservierter Name"}), 400
+        # The value arrives as text from the form; parse it as JSON when it looks
+        # like JSON so a number stays a number and a list stays a list, and fall
+        # back to the plain string otherwise (the common case).
+        raw = data.get("value", "")
+        if isinstance(raw, str):
+            try:
+                value: Any = json.loads(raw)
+            except (TypeError, ValueError):
+                value = raw
+        else:
+            value = raw
+        db.set_global_variable(name, value)
+        return jsonify({"saved": name, "value": value})
+
+    @app.delete("/api/globals/<name>")
+    def delete_global_route(name: str) -> Response:
+        db.delete_global_variable(name)
         return jsonify({"deleted": name})
 
     @app.get("/api/schedules")

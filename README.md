@@ -24,14 +24,17 @@ uiflow/
   cli.py               `uiflow run ...` / `uiflow inspect-desktop ...` / `uiflow studio` /
                       `uiflow worker` / `uiflow scheduler`
   orchestrator/
-    db.py                Persistenter Job-/Log-/Queue-/Credential-Namen-/Zeitplan-Store (SQLite, WAL-Modus)
+    db.py                Persistenter Job-/Log-/Queue-/Credential-Namen-/Zeitplan-Store und
+                         globale Variablen (SQLite, WAL-Modus)
     worker.py             Job-Ausführung (run_worker_loop) + Cron-Zeitpläne (run_scheduler_loop)
   studio/
-    schema.py           Beschreibt pro Backend, welche Actions es gibt und welche Formularfelder sie brauchen
-    app.py              Flask-App: REST-API (Schema/Workflows/Jobs/Queues/Credentials/Schedules/Pick)
-                        + SSE-Log-Streaming + optionales Login
+    schema.py           Beschreibt pro Backend, welche Actions es gibt und welche Formularfelder sie
+                        brauchen, plus die Katalog-Metadaten (Label/Kategorie/Beschreibung/Synonyme)
+    app.py              Flask-App: REST-API (Schema/Aktivitäten/Workflows/Jobs/Queues/Credentials/
+                        Globals/Schedules/Pick) + SSE-Log-Streaming + optionales Login
     picker.py            "Element wählen": Klick-zu-Selektor-Erkennung für Web (Playwright) und Desktop (pynput + UI Automation)
-    static/              Low-Code-Builder-Frontend (HTML/CSS/Vanilla JS, kein Build-Step)
+    static/              Builder-Frontend (HTML/CSS/Vanilla JS, kein Build-Step); static/vendor/
+                         enthält SortableJS (MIT) für das Drag & Drop des Sequenz-Designers
 workflows/             Beispiel-Workflows (werden auch vom Studio gelesen/geschrieben)
 orchestrator.db         SQLite-Datei (wird beim ersten Start angelegt, nicht eingecheckt)
 tests/                 Unit-Tests für Modell + Engine + Orchestrator-DB + Studio-API (Backends/externe
@@ -74,7 +77,9 @@ python -m uiflow.cli inspect-desktop "Editor" --depth 3
 
 ## Low-Code Builder (uiflow studio)
 
-Lokale Web-App zum Bauen von Workflows per Formular statt YAML von Hand:
+Lokale Web-App zum Bauen von Workflows statt YAML von Hand. Der Builder ist ein
+**Sequenz-Designer** im Stil von UiPath Studio: links ein durchsuchbarer Aktivitäten-Katalog,
+in der Mitte der Ablauf als Karten, rechts die Eigenschaften der ausgewählten Aktivität.
 
 ```powershell
 python -m uiflow.cli studio
@@ -82,8 +87,18 @@ python -m uiflow.cli studio
 
 Öffnet `http://127.0.0.1:8787` im Browser. Dort:
 - Workflow-Name + Backend (Web/Desktop) wählen
-- Schritte per "+ Schritt hinzufügen" ergänzen, Action aus Dropdown wählen, Parameter im Formular ausfüllen
-- Schritte per Drag & Drop (Griff "⠿" links) oder ↑/↓ umsortieren, per ✕ löschen
+- **Aktivitäten-Katalog** (links): alle Aktivitäten des gewählten Backends, nach Kategorie gruppiert
+  (Anwendung, UI-Interaktion, Warten, Ablaufsteuerung, Variablen, Dateien & Dokumente, Integration).
+  Das Suchfeld filtert über Name, Beschreibung und Synonyme — "schleife" findet `for_each`, "wenn"
+  findet `if`. Eine Aktivität wird per **Drag & Drop** in den Ablauf gezogen; ein Klick hängt sie
+  stattdessen ans Ende an (gleiche Wirkung, auch per Tastatur erreichbar).
+- **Drag & Drop über Container-Grenzen**: eine Karte lässt sich am Griff "⠿" an jede Position ziehen —
+  auch in einen `Dann`-Zweig hinein, aus einem Schleifenkörper heraus oder von einem `try` in ein
+  `catch`. Eine Container-Aktivität kann nicht in ihren eigenen Zweig gezogen werden.
+- **Eigenschaften-Panel** (rechts): zeigt die Parameter der ausgewählten Aktivität. Die Karten im
+  Ablauf bleiben dadurch kompakt (Name + wichtigster Parameter als Zusammenfassung), sodass auch ein
+  langer Workflow als Ganzes lesbar bleibt.
+- Karten per ✕ löschen
 - Der kleine Kreis links neben der Schritt-Nummer setzt/entfernt einen **Haltepunkt** auf diesem Schritt
   (rot = aktiv). Beim Ausführen pausiert der Workflow direkt davor; ein "Weiter"-Button erscheint im
   Log-Panel, um fortzufahren. Haltepunkte werden mit in die YAML gespeichert (`breakpoint: true`).
@@ -110,9 +125,10 @@ python -m uiflow.cli studio
     laufend mit einem roten Rahmen markiert (wie UiPaths "Auf Bildschirm anzeigen"), bevor geklickt wird.
 - **↶ Rückgängig** (oder Strg+Z) macht die letzte Änderung rückgängig — Schritt hinzugefügt/gelöscht/
   verschoben, Haltepunkt umgeschaltet, Feld bearbeitet, Backend gewechselt, Selektor übernommen.
-- **Anwendungs-Scope & Sequenz**: Ist der erste Schritt eines Desktop-Workflows `launch` oder `connect`,
-  wird er visuell als übergeordneter Scope dargestellt, alle weiteren Schritte erscheinen eingerückt
-  darunter als "Sequenz" — analog zu UiPaths "Use Application/Browser"-Aktivität.
+- **Anwendungs-Scope**: Ist der erste Schritt eines Desktop-Workflows `launch` oder `connect`, gilt er
+  als Scope des Workflows — analog zu UiPaths "Use Application/Browser"-Aktivität. Er ist als erste
+  Karte fixiert: nicht verschiebbar, und es lässt sich nichts darüber ablegen, weil alle folgenden
+  Schritte sich auf ihn beziehen.
 - **🔴 Aufnahme starten** (im Scope-Bereich, sobald ein `launch`/`connect`-Schritt existiert): zeichnet
   echte Klicks und Texteingaben in der Zielanwendung live als Workflow-Schritte auf. Text wird gepuffert
   und beim nächsten Klick oder mit Tab/Enter als `type`-Schritt übernommen; Klicks außerhalb der
@@ -160,8 +176,11 @@ GET  /api/queues/<name>/items       Items auflisten (Filter: ?status=...)
 Referenziert ein Job beim Einreihen eine Queue (`queue_name`), verarbeitet der Worker sie im
 "Process Transaction"-Muster: ein Workflow-Lauf pro Item, bis die Queue leer ist oder gestoppt wird.
 Fehlgeschlagene Items werden automatisch bis `max_retries` erneut versucht, bevor sie als `failed`
-markiert werden. Innerhalb der Step-Parameter stehen Platzhalter `{item.<feld>}` zur Verfügung, die
-pro Item aus dessen `payload` ersetzt werden:
+markiert werden — jeweils erst nach einer exponentiell wachsenden Wartezeit (5s, 10s, 20s, ...,
+gedeckelt auf 60s), damit ein Retry auch tatsächlich eine Chance hat, dass sich eine vorübergehende
+Störung legt. Ein einzelnes fehlgeschlagenes Item bricht den Job nicht ab, der Job endet danach aber
+im Status `error` statt `success`. Innerhalb der Step-Parameter stehen Platzhalter `{item.<feld>}`
+zur Verfügung, die pro Item aus dessen `payload` ersetzt werden:
 
 ```yaml
 name: Rechnung buchen
@@ -202,9 +221,9 @@ Jeder Step kann zusätzlich `save_as: <name>` tragen — der Rückgabewert der A
 Diese Aktionen sind **backend-unabhängig** (funktionieren in `web`- und `desktop`-Workflows gleich),
 weil sie nicht an eine UI-Interaktion gebunden sind, sondern die `variables` der laufenden
 Workflow-Instanz lesen/verändern oder einen externen Dienst ansprechen (siehe `uiflow/engine.py`).
-Im Studio-Builder werden `then`/`else`/`cases`/`default`/Schleifenkörper/`try`/`catch` als **echte,
-verschachtelte Schritt-Listen** bearbeitet (eigene Aktions-Auswahl, Felder, Hinzufügen/Verschieben/
-Löschen je Ebene) — kein rohes JSON mehr.
+Im Studio-Builder sind `then`/`else`/`cases`/`default`/Schleifenkörper/`try`/`catch` **echte
+Ablagezonen**: Aktivitäten werden direkt hineingezogen, und Karten lassen sich zwischen Zweigen
+verschieben.
 
 ### Variablen & Kontrollfluss
 
@@ -254,6 +273,14 @@ steps:
       - action: screenshot
         path: "fehler.png"
     error_var: fehlermeldung        # optional - Exception-Text als Variable
+
+  - action: run_workflow
+    workflow: "Rechnung buchen"     # Name einer YAML-Datei in workflows/
+    arguments:                       # was der Unterprozess sieht (Werte im Kontext des Aufrufers)
+      rechnungsnummer: "{item.nr}"
+      betrag: "{var.summe}"
+    outputs:                         # Variable im Unterprozess -> Variable hier
+      belegnummer: letzter_beleg
 ```
 
 `condition`/`expression`-Auswertung läuft über ein eingeschränktes `eval()` (kein `__import__`, `open`,
@@ -263,6 +290,33 @@ geschrieben und ausgeführt, wie ein lokales Skript, nicht von nicht vertrauensw
 `try`/`catch` fängt Step-Fehler innerhalb seines eigenen `steps`-Blocks ab (nicht nur einzelne Schritte,
 sondern beliebig verschachtelte Sub-Blöcke); ein per Stop-Button angefordertes Abbrechen wird davon
 absichtlich **nicht** abgefangen.
+
+#### Unterprozesse (`run_workflow`)
+
+`run_workflow` führt eine andere Workflow-Datei als Baustein aus — für Schrittfolgen, die in mehreren
+Automatisierungen vorkommen, und um einen langen Ablauf in benannte Teile zu zerlegen. Vier Eigenschaften
+sind bewusst so gewählt:
+
+- **Variablen fließen nicht automatisch.** Der Unterprozess startet mit genau dem, was `arguments`
+  übergibt, und zurück kommt nur, was `outputs` benennt. Besteht ein Argumentwert ausschließlich aus
+  einem Platzhalter (`"{var.kunden}"`), wird der Wert **mit seinem Typ** übergeben — eine Liste bleibt
+  eine Liste. Steht der Platzhalter dagegen in einem längeren Text (`"https://x/{var.pfad}"`), wird
+  wie überall sonst textuell ersetzt. Würde er die Variablen des Aufrufers teilen,
+  hinge er still an Namen, die er nie deklariert hat — genau die Kopplung, die Wiederverwendung
+  vermeiden soll. Schlägt der Unterprozess fehl, werden **keine** `outputs` übernommen.
+- **Dasselbe Backend, dieselbe Anwendung.** Der Unterprozess läuft auf der bereits geöffneten
+  Browser-/Anwendungssitzung des Aufrufers, nicht auf einer zweiten. Deklariert er ein anderes `backend`,
+  bricht der Schritt mit einer klaren Meldung ab, statt Desktop-Aufrufe gegen einen Browser zu schicken.
+- **Zyklen werden abgelehnt.** Ruft A den Prozess B auf, der wieder A aufruft, endet der Schritt mit
+  `Sub-workflow cycle: A -> B -> A`.
+- **Auflösung zur Laufzeit.** Der Name wird beim Ausführen in `workflows/` nachgeschlagen — dieselbe
+  Datei, die der Builder speichert und in der Auswahlliste anbietet. Das heißt auch: wird ein
+  Unterprozess bearbeitet, während ein Job schon in der Warteschlange steht, läuft der Job mit der
+  neuen Fassung (der Job-Snapshot in `orchestrator.db` enthält nur den aufrufenden Workflow).
+
+Ein Haltepunkt *innerhalb* eines Unterprozesses hält den Lauf korrekt an und zeigt dessen Variablen,
+markiert aber keine Karte auf der Zeichenfläche — die zeigt den aufrufenden Workflow, in dem dieser
+Schritt gar nicht vorkommt.
 
 ### Excel, HTTP, PDF/OCR
 
@@ -328,8 +382,46 @@ steps:
     folder: INBOX
     limit: 10
     unseen_only: true
+    mark_as_read: false             # Standard: Lesen lässt die Mails ungelesen (IMAP BODY.PEEK)
     save_as: eingang                # -> Liste von {subject, from, date, body}
 ```
+
+## Globale Variablen
+
+Werte, die für *alle* Workflows gelten — Basis-URLs, Postfächer, Grenzwerte. Verwaltet im Studio unter
+**Orchestrator → Globale Variablen**; gespeichert in `orchestrator.db` (Tabelle `global_variables`) als
+JSON, damit eine Zahl eine Zahl und eine Liste eine Liste bleibt.
+
+Genutzt werden sie auf zwei Wegen — genau wie Workflow-Variablen:
+
+```yaml
+steps:
+  - action: navigate
+    url: "{global.basis_url}/anmelden"     # in Parametern: eigener Namensraum
+
+  - action: if
+    condition: "betrag > max_betrag"        # in Ausdrücken: direkt unter ihrem Namen
+    then:
+      - action: click
+        selector: "#freigabe-anfordern"
+```
+
+Vier Punkte dazu:
+
+- **Sie gelten auch in Unterprozessen**, ohne als Argument übergeben zu werden. Ein Unterprozess ist
+  gegen die Variablen seines Aufrufers abgeschottet (siehe `run_workflow`), aber nicht gegen die
+  globalen — sonst müsste man Konfiguration durch jede Aufrufkette schleifen.
+- **Eine gleichnamige Workflow-Variable hat in Ausdrücken Vorrang.** Ein Lauf kann einen globalen Wert
+  damit lokal überschreiben, ohne ihn für andere zu ändern; `{global.name}` liest weiterhin den globalen.
+- **Ein Unterprozess kann einen globalen Wert nicht für seinen Aufrufer verändern** — ein `assign` legt
+  eine gewöhnliche Workflow-Variable an, nicht den globalen Eintrag.
+- **Sie werden pro Lauf gelesen**, nicht beim Einreihen. Eine Änderung wirkt also auf den nächsten Lauf,
+  ohne dass etwas neu eingereiht werden muss — und gilt gleichermaßen für `uiflow run` von der
+  Kommandozeile wie für einen Job über den Worker.
+
+`global`, `item` und `var` sind als Namen reserviert, weil sie die Platzhalter-Namensräume benennen.
+**Keine Geheimnisse hier ablegen** — dafür gibt es Anmeldedaten, deren Werte gar nicht erst in dieser
+Datenbank landen:
 
 ## Anmeldedaten (Credentials)
 
@@ -390,8 +482,83 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
   umschließenden `try`): aktuell fängt nur ein expliziter `try`/`catch`-Block Fehler ab; ein Step ohne
   `try` drumherum bricht den Workflow beim ersten Fehler weiterhin ab (Queue-Items haben ihr eigenes,
   davon unabhängiges Retry via `max_retries`).
-- **Visueller Flow-Canvas** statt Formular-Liste (Drag&Drop wie UiPath Studio/n8n) — aktuell ist
-  der Builder bewusst eine (jetzt auch verschachtelbare) Schritt-Liste mit Formularen, kein
-  Node-Canvas, siehe `uiflow studio`.
+- **Unterprozesse beim Einreihen auflösen**: `run_workflow` gibt es inzwischen (siehe oben), es löst
+  den Namen aber erst zur Laufzeit auf. `create_job` legt sonst den kompletten Workflow als JSON in der
+  Job-Zeile ab, damit ein Job exakt das ausführt, was beim Einreihen galt — für Unterprozesse gilt diese
+  Zusage derzeit nicht. Sie ließe sich wiederherstellen, indem referenzierte Unterprozesse beim Einreihen
+  mit in den Snapshot aufgenommen werden.
+- **Deklarierte Workflow-Variablen** (UiPaths Variablen-Panel): Installationsweite globale Variablen
+  gibt es inzwischen (siehe oben), die *workflow-eigenen* entstehen aber weiterhin stillschweigend beim
+  ersten `assign` — nirgends steht, welche ein Workflow verwendet, und es gibt keine Startwerte oder
+  Typen. Nebenwirkung: ein Tippfehler verhält sich je nach Weg unterschiedlich — `{var.tippfehler}` wird
+  stumm zu einem leeren String, derselbe Name in einem Ausdruck bricht mit einem Fehler ab. Eine
+  Deklarationsliste würde beides prüfbar machen und dem Eigenschaften-Panel erlauben, Variablennamen zur
+  Auswahl anzubieten statt sie tippen zu lassen.
+- **Framework-Vorlage nach Vorbild des UiPath REFramework**: Die Kernschleife gibt es bereits —
+  `_run_queue_driven` ist das "Process Transaction"-Muster, mit Retry samt Backoff, Status je Item und
+  Job-Logs. Was fehlt, ist der Rahmen darum herum, den man heute in jedem Projekt neu baut:
+  - **Zustände**: Initialisierung (Konfiguration lesen, Anwendungen öffnen), Transaktion holen,
+    Transaktion verarbeiten, Abschluss (Anwendungen schließen, Abschlussbericht) als vorgegebenes
+    Gerüst statt als handgebauter Ablauf.
+  - **Konfiguration**: eine Einstellungsdatei bzw. ein Konfigurationsblatt, aus dem der Prozess seine
+    Parameter zieht, statt sie in die Schritte zu schreiben.
+  - **Fachlicher vs. technischer Fehler**: der wichtigste Punkt, weil er die bestehende Retry-Logik
+    betrifft. `complete_queue_item` behandelt heute *jeden* Fehler gleich und versucht es bis
+    `max_retries` erneut. Eine ungültige Rechnung wird dadurch dreimal ungültig verarbeitet, obwohl
+    schon der erste Versuch abschließend war — ein fachlicher Fehler darf nie wiederholt werden, nur
+    ein technischer. Dafür müsste die Engine beide Arten unterscheiden können und die Queue die
+    Unterscheidung mitführen.
+  - **Aufräumen zwischen Fehlversuchen**: Zielanwendung nach einem Fehler schließen und neu öffnen,
+    statt den nächsten Versuch auf einem kaputten Bildschirmzustand starten zu lassen.
+
+  Sinnvollerweise als Vorlage, die aus den vorhandenen Bausteinen erzeugt wird — keine zweite Engine
+  neben der bestehenden.
+- **Flowchart-Ansicht** (frei platzierte Knoten mit Verbindungspfeilen, wie UiPaths Flowchart oder
+  n8n). Der Builder ist ein Sequenz-Designer — er bildet den Ablauf als verschachtelte Kartenliste ab,
+  passend zum sequenziellen YAML-Format. Eine Flowchart-Ansicht bräuchte ein eigenes Format mit Knoten,
+  Kanten und Koordinaten und ist deshalb bewusst noch nicht gebaut.
+- **UI Explorer (Oberflächen analysieren)**: Zum Erkunden einer Zielanwendung gibt es heute zwei
+  Teilstücke — `uiflow inspect-desktop "Fenstertitel" --depth 4` druckt den UI-Automation-Baum als Text
+  in die Konsole, und der Picker markiert während der Aufnahme das Element unter dem Mauszeiger. Was
+  fehlt, ist das Werkzeug dazwischen: den Baum interaktiv durchklicken, alle Eigenschaften eines Elements
+  sehen und vor allem **einen Selektor ausprobieren, bevor er in einem Workflow landet**. Drei Lücken:
+  - **Wie viele Treffer?** Ein mehrdeutiger Selektor ist die klassische Ursache dafür, dass ein Bot das
+    falsche Element anklickt — und genau das zeigt heute nichts an. Ein Explorer sollte einen Selektor
+    gegen die laufende Anwendung prüfen und melden, wie viele Elemente passen und welche.
+  - **Web fehlt komplett**: `inspect-desktop` hat kein Gegenstück für den Browser. Playwright kann einen
+    Selektor auswerten und die Treffer hervorheben — die Grundlage dafür ist also schon im Projekt.
+  - **Zwei Element-Modelle**: pywinauto-Eigenschaften auf der einen, DOM plus Playwright-Selektor auf der
+    anderen Seite. Der Explorer bräuchte eine gemeinsame Darstellung (Name, Typ, Eigenschaften, Kinder) —
+    die erzeugt `picker.py` im Kern bereits, bisher nur nicht als durchsuchbaren Baum.
+
+  Zusammen mit dem nächsten Punkt ergibt das den natürlichen Arbeitsablauf: im Explorer suchen und prüfen,
+  von dort als benanntes Element ins Repository speichern, in Aktivitäten wiederverwenden.
+- **Object Repository (wiederverwendbare Selektoren)**: Heute trägt jede Aktivität ihren Selektor
+  inline — bei Web das Feld `selector`, bei Desktop das Tripel `control_type`/`title`/`auto_id`.
+  "Element auf dem Bildschirm wählen" schreibt genau dorthin. Ein Element, das an zehn Stellen
+  angesprochen wird, steht damit zehnmal im Workflow: ändert die Zielanwendung ihre Oberfläche, müssen
+  alle zehn Stellen gefunden und einzeln nachgezogen werden — der Hauptgrund, warum RPA-Automatisierungen
+  im Betrieb brechen.
+  Gewünscht ist stattdessen ein zentraler Speicher benannter UI-Elemente ("Anmelden-Knopf",
+  "Rechnungsnummer-Feld"): einmal während der Entwicklung aufnehmen, danach in beliebigen Aktivitäten
+  per Name referenzieren, und bei einer UI-Änderung an genau einer Stelle korrigieren.
+  Drei Punkte, die den Zuschnitt bestimmen und deshalb vor der Umsetzung geklärt sein wollen:
+  - **Auflösung in der Engine**: `substitute_variables` ersetzt heute `{var.x}`/`{item.x}` rein
+    textuell in den Step-Parametern. Für ein Repository reicht das nicht, weil ein Desktop-Element auf
+    *drei* Felder abbildet, nicht auf einen String. Die Engine müsste eine Element-Referenz vor dem
+    Dispatch ans Backend zu den passenden Parametern auflösen — ein eigener Schritt in `_run_backend_step`,
+    kein zusätzliches Platzhalter-Muster.
+  - **Zuordnung zur Anwendung**: ein Selektor gilt nur innerhalb seiner Anwendung. Der bestehende
+    Scope-Begriff (`launch`/`connect` als erster Schritt) benennt diese Anwendung bereits — er ist der
+    naheliegende Schlüssel, unter dem Elemente gruppiert werden, analog zu UiPaths Aufteilung in
+    Anwendung → Screen → Element.
+  - **Ablage**: anders als Anmeldedaten sind Selektoren kein Geheimnis und gehören versioniert neben die
+    Workflows (eine Datei in `workflows/`), nicht in `orchestrator.db` — sonst lässt sich eine Änderung
+    an der Oberfläche nicht mit dem Workflow zusammen reviewen und zurückrollen.
+
+  Im Studio wären das zwei Ergänzungen: `picker.py` bekommt neben "Felder füllen" ein "als Element
+  speichern", und im Eigenschaften-Panel wird aus dem freien Selektor-Feld eine Auswahl über das
+  Repository plus "neu aufnehmen".
 - **Selectors robuster machen** (Fallback-Strategien, Bild-basierte Erkennung wie UiPath es
-  für Legacy-Apps anbietet).
+  für Legacy-Apps anbietet). Greift ineinander mit dem Object Repository: sind die Selektoren erst
+  zentral, ist eine Fallback-Strategie eine Eigenschaft des Elements statt jeder einzelnen Aktivität.

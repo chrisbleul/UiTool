@@ -101,9 +101,30 @@
         <button id="btn-run" class="btn btn-primary">Ausführen</button>
       </div>
 
-      <div class="builder-canvas">
-        <section id="steps" class="steps"></section>
-        <button id="btn-add-step" class="btn btn-add">+ Schritt hinzufügen</button>
+      <div class="builder-layout">
+        <!-- left: searchable activity catalog, dragged into the canvas -->
+        <aside class="activity-catalog" id="activity-catalog">
+          <div class="catalog-head">
+            <label class="catalog-search-label" for="catalog-search">Aktivitäten</label>
+            <input id="catalog-search" type="search" placeholder="Suchen (z.B. klick, schleife)" autocomplete="off">
+          </div>
+          <div id="catalog-list" class="catalog-list"></div>
+        </aside>
+
+        <!-- middle: the sequence itself -->
+        <div class="builder-canvas">
+          <div id="record-controls-host"></div>
+          <section id="steps" class="steps"></section>
+          <button id="btn-add-step" class="btn btn-add">+ Schritt hinzufügen</button>
+        </div>
+
+        <!-- right: properties of the selected activity -->
+        <aside class="properties-panel" id="properties-panel">
+          <div class="properties-head">
+            <span id="properties-title">Eigenschaften</span>
+          </div>
+          <div id="properties-body" class="properties-body"></div>
+        </aside>
       </div>
     </section>
 
@@ -111,7 +132,7 @@
       <div class="view-header">
         <div>
           <h1>Orchestrator</h1>
-          <p class="view-sub">Workflows, Queues, Anmeldedaten und Zeitpläne verwalten.</p>
+          <p class="view-sub">Workflows, Queues, Anmeldedaten, globale Variablen und Zeitpläne verwalten.</p>
         </div>
       </div>
 
@@ -119,6 +140,7 @@
         <button class="tab-btn active" data-tab="workflows" role="tab">Workflows</button>
         <button class="tab-btn" data-tab="queues" role="tab">Queues</button>
         <button class="tab-btn" data-tab="credentials" role="tab">Anmeldedaten</button>
+        <button class="tab-btn" data-tab="globals" role="tab">Globale Variablen</button>
         <button class="tab-btn" data-tab="schedules" role="tab">Zeitplan</button>
       </div>
 
@@ -149,6 +171,22 @@
           Im Workflow nutzbar über einen <code>get_credential</code>-Schritt, danach als <code>{var.name}</code>.
         </p>
         <div id="credentials-list" class="queues-list"></div>
+      </div>
+
+      <div class="tab-panel" data-tab-panel="globals">
+        <div class="excel-import-row">
+          <input id="global-name" type="text" placeholder="Name (z.B. basis_url)">
+          <input id="global-value" type="text" placeholder="Wert (Text, Zahl oder JSON)">
+          <button id="btn-add-global" class="btn">Speichern</button>
+        </div>
+        <p class="panel-hint">
+          Werte, die für <em>alle</em> Workflows gelten — Basis-URLs, Postfächer, Grenzwerte. Nutzbar in
+          Parametern als <code>{global.name}</code> und in Ausdrücken direkt unter ihrem Namen. Sie gelten
+          auch in Unterprozessen, ohne als Argument übergeben zu werden. Eine gleichnamige Workflow-Variable
+          hat in Ausdrücken Vorrang. <strong>Keine Geheimnisse hier ablegen</strong> — dafür gibt es
+          Anmeldedaten, deren Werte gar nicht erst in dieser Datenbank landen.
+        </p>
+        <div id="globals-list" class="queues-list"></div>
       </div>
 
       <div class="tab-panel" data-tab-panel="schedules">
@@ -204,6 +242,10 @@
   <pre id="run-detail-logs"></pre>
 </aside>
 
+<!-- Names of the saved workflows, offered as suggestions by every
+     "workflow"-typed field (see run_workflow in schema.py). -->
+<datalist id="workflow-names"></datalist>
+
 <div id="toast-host" class="toast-host" aria-live="polite"></div>
 
 <div id="confirm-overlay" class="modal-overlay hidden">
@@ -216,6 +258,7 @@
   </div>
 </div>
 
+<script src="/static/vendor/sortable.min.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

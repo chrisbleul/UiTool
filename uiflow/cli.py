@@ -28,11 +28,16 @@ def _make_backend(name: str, headless: bool, browser_channel: str | None = None)
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    from .orchestrator import db
+
     workflow = Workflow.load(args.workflow)
     backend = _make_backend(workflow.backend, headless=args.headless, browser_channel=workflow.browser_channel)
     engine = WorkflowEngine(backend)
+    # The same global variables a job run would see, so running a workflow
+    # straight from the CLI isn't subtly different from queuing it.
+    db.init_db()
     try:
-        engine.run(workflow, on_breakpoint=_cli_breakpoint)
+        engine.run(workflow, on_breakpoint=_cli_breakpoint, global_variables=db.get_global_variables())
         return 0
     except StepError as exc:
         logging.error(str(exc))

@@ -16,11 +16,16 @@ import json
 import sqlite3
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 DB_PATH = Path(__file__).resolve().parent.parent.parent / "orchestrator.db"
+
+# Retry backoff bounds (see retry_delay_seconds). Kept small: a queue-driven job
+# waits these out in-process, so the ceiling is what a single job can idle for.
+RETRY_BACKOFF_BASE_SECONDS = 5.0
+RETRY_BACKOFF_MAX_SECONDS = 60.0
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -51,7 +56,8 @@ CREATE TABLE IF NOT EXISTS job_controls (
     resume_requested INTEGER NOT NULL DEFAULT 0,
     paused_step_index INTEGER,
     paused_step_action TEXT,
-    paused_variables_json TEXT
+    paused_variables_json TEXT,
+    paused_step_path TEXT
 );
 
 CREATE TABLE IF NOT EXISTS queues (
@@ -73,6 +79,8 @@ CREATE TABLE IF NOT EXISTS queue_items (
     reference TEXT,
     locked_by TEXT,
     locked_at TEXT,
+    -- Earliest time a retried item may be claimed again (see retry_delay_seconds).
+    retry_after TEXT,
     created_at TEXT NOT NULL,
     started_at TEXT,
     finished_at TEXT
@@ -86,6 +94,17 @@ CREATE INDEX IF NOT EXISTS idx_queue_items_queue_id ON queue_items(queue_id, sta
 CREATE TABLE IF NOT EXISTS credentials (
     name TEXT PRIMARY KEY,
     created_at TEXT NOT NULL
+);
+
+-- Non-secret values shared by every workflow on this installation (base URLs,
+-- mailboxes, thresholds). The sibling of the credentials table above: secrets
+-- go there and never touch this database, everything else lives here so it is
+-- edited in one place instead of in each workflow. Values are stored as JSON so
+-- a number stays a number and a list stays a list.
+CREATE TABLE IF NOT EXISTS global_variables (
+    name TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS schedules (
@@ -124,13 +143,18 @@ def init_db() -> None:
         try:
             with connect() as conn:
                 conn.executescript(_SCHEMA)
-                # Additive migration for DBs created before this column existed -
+                # Additive migrations for DBs created before these columns existed -
                 # CREATE TABLE IF NOT EXISTS above doesn't alter an already-existing
-                # table, so older orchestrator.db files need this to pick it up.
-                try:
-                    conn.execute("ALTER TABLE job_controls ADD COLUMN paused_variables_json TEXT")
-                except sqlite3.OperationalError:
-                    pass  # column already exists
+                # table, so older orchestrator.db files need these to pick them up.
+                for table, column, coltype in (
+                    ("job_controls", "paused_variables_json", "TEXT"),
+                    ("job_controls", "paused_step_path", "TEXT"),
+                    ("queue_items", "retry_after", "TEXT"),
+                ):
+                    try:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+                    except sqlite3.OperationalError:
+                        pass  # column already exists
             return
         except sqlite3.OperationalError as exc:
             last_error = exc
@@ -256,13 +280,17 @@ def wait_and_clear_resume(job_id: str) -> bool:
 
 
 def set_paused(
-    job_id: str, index: int | None, action: str | None, variables: dict[str, Any] | None = None
+    job_id: str,
+    index: int | None,
+    action: str | None,
+    variables: dict[str, Any] | None = None,
+    path: str | None = None,
 ) -> None:
     with connect() as conn:
         conn.execute(
-            "UPDATE job_controls SET paused_step_index=?, paused_step_action=?, paused_variables_json=? "
-            "WHERE job_id=?",
-            (index, action, json.dumps(variables) if variables is not None else None, job_id),
+            "UPDATE job_controls SET paused_step_index=?, paused_step_action=?, paused_variables_json=?, "
+            "paused_step_path=? WHERE job_id=?",
+            (index, action, json.dumps(variables) if variables is not None else None, path, job_id),
         )
 
 
@@ -355,10 +383,16 @@ def list_queue_items(queue_id: int, status: str | None = None, limit: int = 200)
 
 def claim_next_queue_item(queue_id: int, locked_by: str) -> dict[str, Any] | None:
     with connect() as conn:
+        # retry_after gates items that failed and are waiting out their backoff.
+        # Comparing the timestamps as strings is safe because every one of them
+        # is written by _now()/isoformat(): zero-padded fields in a fixed order,
+        # always the same UTC offset, and the optional ".microseconds" sorts
+        # below the "+" of the offset - so string order is chronological order.
         row = conn.execute(
             "SELECT id FROM queue_items WHERE queue_id=? AND status='new' "
+            "AND (retry_after IS NULL OR retry_after <= ?) "
             "ORDER BY priority DESC, id LIMIT 1",
-            (queue_id,),
+            (queue_id, _now()),
         ).fetchone()
         if row is None:
             return None
@@ -374,33 +408,77 @@ def claim_next_queue_item(queue_id: int, locked_by: str) -> dict[str, Any] | Non
         return dict(item)
 
 
+def retry_delay_seconds(retry_count: int) -> float:
+    """Exponential backoff before a failed item may be retried. Without it a
+    deterministically failing item is re-claimed as fast as the worker can loop,
+    burning through every retry in milliseconds - which defeats the point, since
+    retries exist for *transient* faults (a slow page, a flaky network) that need
+    time to clear. Capped so a queue-driven job never stalls for long."""
+    return min(RETRY_BACKOFF_BASE_SECONDS * (2 ** max(retry_count - 1, 0)), RETRY_BACKOFF_MAX_SECONDS)
+
+
 def complete_queue_item(
     item_id: int, success: bool, output: dict[str, Any] | None = None, error_message: str | None = None
-) -> None:
+) -> str:
+    """Marks an item done, returning its resulting status ('success', 'new' if
+    it will be retried, or 'failed' once the retries are used up)."""
     with connect() as conn:
         if success:
             conn.execute(
                 "UPDATE queue_items SET status='success', output=?, finished_at=? WHERE id=?",
                 (json.dumps(output or {}), _now(), item_id),
             )
-            return
+            return "success"
         row = conn.execute(
             "SELECT retry_count, max_retries FROM queue_items WHERE id=?", (item_id,)
         ).fetchone()
         retry_count = (row["retry_count"] if row else 0) + 1
         max_retries = row["max_retries"] if row else 0
         next_status = "new" if retry_count <= max_retries else "failed"
+        retry_after = None
+        if next_status == "new":
+            delay = retry_delay_seconds(retry_count)
+            retry_after = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
         conn.execute(
             "UPDATE queue_items SET status=?, retry_count=?, error_message=?, "
-            "locked_by=NULL, locked_at=NULL, finished_at=? WHERE id=?",
+            "locked_by=NULL, locked_at=NULL, retry_after=?, finished_at=? WHERE id=?",
             (
                 next_status,
                 retry_count,
                 error_message,
+                retry_after,
                 _now() if next_status == "failed" else None,
                 item_id,
             ),
         )
+        return next_status
+
+
+def release_queue_item(item_id: int) -> None:
+    """Hands a claimed item back unprocessed - used when a run is stopped
+    mid-item, where nothing has been learned about the item itself and it must
+    therefore not consume a retry (nor carry the backoff of an earlier one)."""
+    with connect() as conn:
+        conn.execute(
+            "UPDATE queue_items SET status='new', locked_by=NULL, locked_at=NULL, started_at=NULL, "
+            "retry_after=NULL WHERE id=? AND status='in_progress'",
+            (item_id,),
+        )
+
+
+def seconds_until_next_retry(queue_id: int) -> float | None:
+    """How long until the earliest backed-off item in this queue is claimable,
+    or None if the queue holds no such item (i.e. it really is exhausted)."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT MIN(retry_after) AS next_at FROM queue_items "
+            "WHERE queue_id=? AND status='new' AND retry_after IS NOT NULL",
+            (queue_id,),
+        ).fetchone()
+    if row is None or row["next_at"] is None:
+        return None
+    delta = (datetime.fromisoformat(row["next_at"]) - datetime.now(timezone.utc)).total_seconds()
+    return max(delta, 0.0)
 
 
 # --- credential names (secret values live in the OS keyring, not here) -----
@@ -424,6 +502,35 @@ def list_credential_names() -> list[str]:
 def delete_credential_name(name: str) -> None:
     with connect() as conn:
         conn.execute("DELETE FROM credentials WHERE name=?", (name,))
+
+
+# --- global variables (see the global_variables table comment) --------------
+
+
+def set_global_variable(name: str, value: Any) -> None:
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO global_variables (name, value_json, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+            (name, json.dumps(value), _now()),
+        )
+
+
+def list_global_variables() -> list[dict[str, Any]]:
+    """Name + decoded value per entry, for the Studio's management view."""
+    with connect() as conn:
+        rows = conn.execute("SELECT * FROM global_variables ORDER BY name").fetchall()
+        return [{"name": r["name"], "value": json.loads(r["value_json"]), "updated_at": r["updated_at"]} for r in rows]
+
+
+def get_global_variables() -> dict[str, Any]:
+    """The flat name -> value mapping a run is seeded with."""
+    return {entry["name"]: entry["value"] for entry in list_global_variables()}
+
+
+def delete_global_variable(name: str) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM global_variables WHERE name=?", (name,))
 
 
 # --- schedules ---------------------------------------------------------------

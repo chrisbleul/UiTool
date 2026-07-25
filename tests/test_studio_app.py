@@ -12,7 +12,8 @@ def isolated_db(tmp_path, monkeypatch):
 
 @pytest.fixture
 def client(isolated_db, monkeypatch, tmp_path):
-    monkeypatch.setattr("uiflow.studio.app.WORKFLOWS_DIR", tmp_path / "workflows")
+    # one resolver for both the Studio and the engine's run_workflow action
+    monkeypatch.setattr("uiflow.models.WORKFLOWS_DIR", tmp_path / "workflows")
     monkeypatch.delenv("UIFLOW_STUDIO_PASSWORD", raising=False)
     app = create_app()
     app.config.update(TESTING=True)
@@ -21,7 +22,8 @@ def client(isolated_db, monkeypatch, tmp_path):
 
 @pytest.fixture
 def protected_client(isolated_db, monkeypatch, tmp_path):
-    monkeypatch.setattr("uiflow.studio.app.WORKFLOWS_DIR", tmp_path / "workflows")
+    # one resolver for both the Studio and the engine's run_workflow action
+    monkeypatch.setattr("uiflow.models.WORKFLOWS_DIR", tmp_path / "workflows")
     monkeypatch.setenv("UIFLOW_STUDIO_PASSWORD", "hunter2")
     app = create_app()
     app.config.update(TESTING=True)
@@ -78,6 +80,36 @@ def test_login_page_itself_is_reachable_without_auth(protected_client):
 def test_static_assets_are_reachable_without_auth(protected_client):
     res = protected_client.get("/static/style.css")
     assert res.status_code == 200
+
+
+def _workflow(name: str, url: str) -> dict:
+    return {"name": name, "backend": "web", "steps": [{"action": "navigate", "url": url}]}
+
+
+def test_saving_over_an_existing_workflow_is_refused_when_overwrite_is_false(client):
+    client.post("/api/workflows/report", json=_workflow("report", "https://original"))
+
+    res = client.post("/api/workflows/report?overwrite=false", json=_workflow("report", "https://other"))
+
+    assert res.status_code == 409
+    # the original must still be intact - a refused save may not have written
+    assert client.get("/api/workflows/report").get_json()["steps"][0]["url"] == "https://original"
+
+
+def test_saving_over_an_existing_workflow_is_allowed_by_default(client):
+    client.post("/api/workflows/report", json=_workflow("report", "https://original"))
+
+    res = client.post("/api/workflows/report", json=_workflow("report", "https://updated"))
+
+    assert res.status_code == 200
+    assert client.get("/api/workflows/report").get_json()["steps"][0]["url"] == "https://updated"
+
+
+def test_overwrite_false_still_creates_a_workflow_that_does_not_exist(client):
+    res = client.post("/api/workflows/fresh?overwrite=false", json=_workflow("fresh", "https://x"))
+
+    assert res.status_code == 200
+    assert client.get("/api/workflows/fresh").status_code == 200
 
 
 class _FakeKeyring:
@@ -149,3 +181,81 @@ def test_toggle_and_delete_schedule_via_api(client):
     res = client.delete(f"/api/schedules/{schedule_id}")
     assert res.status_code == 200
     assert client.get("/api/schedules").get_json() == []
+
+
+def test_activities_endpoint_lists_every_action_with_catalog_metadata(client):
+    from uiflow.studio.schema import ACTION_SCHEMAS
+
+    payload = client.get("/api/activities").get_json()
+
+    assert payload["categories"], "the palette needs an explicit category order"
+    for backend, actions in ACTION_SCHEMAS.items():
+        entries = payload["activities"][backend]
+        assert {e["name"] for e in entries} == set(actions)
+        for entry in entries:
+            assert entry["label"] and entry["category"], entry
+
+
+def test_every_action_has_a_catalog_entry():
+    """A new action added to ACTION_SCHEMAS without ACTION_META would still show
+    up in the palette, but as a bare action name in "Weitere" - catch that here
+    rather than in the UI."""
+    from uiflow.studio.schema import ACTION_META, ACTION_SCHEMAS, CATEGORY_ORDER
+
+    known = {name for actions in ACTION_SCHEMAS.values() for name in actions}
+    assert known - set(ACTION_META) == set()
+    assert {meta["category"] for meta in ACTION_META.values()} <= set(CATEGORY_ORDER)
+
+
+def test_catalog_primary_fields_exist_on_every_backend(client):
+    """`primary` drives an activity card's one-line summary, so at least one of
+    its candidates has to exist for each backend that offers the action -
+    otherwise the card silently falls back to an arbitrary parameter."""
+    from uiflow.studio.schema import ACTION_META, ACTION_SCHEMAS
+
+    for backend, actions in ACTION_SCHEMAS.items():
+        for name, fields in actions.items():
+            candidates = ACTION_META.get(name, {}).get("primary") or []
+            if not candidates:
+                continue
+            available = {f["name"] for f in fields}
+            assert available & set(candidates), f"{backend}/{name}: none of {candidates} in {sorted(available)}"
+
+
+def test_globals_endpoint_stores_and_lists_values(client):
+    assert client.post("/api/globals", json={"name": "basis_url", "value": "https://x"}).status_code == 200
+
+    [entry] = client.get("/api/globals").get_json()
+    assert entry["name"] == "basis_url"
+    assert entry["value"] == "https://x"
+
+
+def test_globals_endpoint_parses_json_values_but_keeps_plain_text(client):
+    client.post("/api/globals", json={"name": "max_betrag", "value": "5000"})
+    client.post("/api/globals", json={"name": "empfaenger", "value": '["a@x.de", "b@x.de"]'})
+    client.post("/api/globals", json={"name": "basis_url", "value": "https://erp.example.com"})
+
+    values = {e["name"]: e["value"] for e in client.get("/api/globals").get_json()}
+    assert values == {
+        "max_betrag": 5000,
+        "empfaenger": ["a@x.de", "b@x.de"],
+        "basis_url": "https://erp.example.com",  # not valid JSON, so kept as text
+    }
+
+
+def test_globals_endpoint_requires_a_name(client):
+    assert client.post("/api/globals", json={"name": "", "value": "x"}).status_code == 400
+
+
+def test_globals_endpoint_refuses_a_reserved_namespace_name(client):
+    """`{global.global}` would resolve against the namespace rather than the
+    value, so such an entry could never be read back."""
+    for name in ("global", "item", "var"):
+        assert client.post("/api/globals", json={"name": name, "value": "x"}).status_code == 400
+
+
+def test_delete_global_endpoint(client):
+    client.post("/api/globals", json={"name": "x", "value": "1"})
+
+    assert client.delete("/api/globals/x").status_code == 200
+    assert client.get("/api/globals").get_json() == []
