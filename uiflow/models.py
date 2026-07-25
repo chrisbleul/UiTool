@@ -14,12 +14,24 @@ VALID_BACKENDS = ("web", "desktop")
 WORKFLOWS_DIR = Path(__file__).resolve().parent.parent / "workflows"
 
 
+VALID_ON_ERROR = ("continue", "retry")
+
+
 @dataclass
 class Step:
     action: str
     params: dict[str, Any] = field(default_factory=dict)
     breakpoint: bool = False
     save_as: str | None = None
+    # Per-step error policy, independent of any enclosing `try`/`catch` (see
+    # engine.py's _run_step_with_policy): None means the existing default -
+    # a failure aborts the workflow. "continue" logs the failure and moves on
+    # to the next step; "retry" re-attempts the same step up to `retry_count`
+    # times, waiting `retry_delay` seconds between attempts, before falling
+    # back to aborting.
+    on_error: str | None = None
+    retry_count: int = 3
+    retry_delay: float = 2.0
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Step":
@@ -30,10 +42,28 @@ class Step:
             raise ValueError(f"Step is missing required 'action' key: {data}") from exc
         breakpoint_flag = bool(data.pop("breakpoint", False))
         save_as = data.pop("save_as", None) or None
-        return cls(action=action, params=data, breakpoint=breakpoint_flag, save_as=save_as)
+        on_error = data.pop("on_error", None) or None
+        if on_error is not None and on_error not in VALID_ON_ERROR:
+            raise ValueError(f"Unknown on_error '{on_error}', expected one of {VALID_ON_ERROR}")
+        retry_count = int(data.pop("retry_count", 3))
+        retry_delay = float(data.pop("retry_delay", 2.0))
+        return cls(
+            action=action,
+            params=data,
+            breakpoint=breakpoint_flag,
+            save_as=save_as,
+            on_error=on_error,
+            retry_count=retry_count,
+            retry_delay=retry_delay,
+        )
 
 
 VALID_BROWSER_CHANNELS = (None, "chrome", "msedge")
+
+# `{global.x}`/`{item.x}`/`{var.x}` reserve these as namespace names (see
+# engine.py's _PLACEHOLDER_RE) - a declared workflow variable can't reuse one
+# without colliding with that namespace itself.
+RESERVED_VARIABLE_NAMES = ("global", "item", "var")
 
 
 @dataclass
@@ -45,6 +75,14 @@ class Workflow:
     # Chromium build; "chrome"/"msedge" instead drive the locally installed
     # Google Chrome / Microsoft Edge (must already be installed on the machine).
     browser_channel: str | None = None
+    # Declared workflow-own variables (UiPath's "Variables" panel): name ->
+    # default value, seeded into the run before its first step (see
+    # WorkflowEngine.run/_run_sub_workflow). A variable still doesn't need to
+    # be declared to be used - it's created implicitly on first `assign`,
+    # exactly as before - this only gives a name a starting value (and, via
+    # that value's own JSON type, an implicit type) instead of starting out
+    # absent until the first `assign` sets it.
+    variables: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_raw(cls, raw: dict[str, Any]) -> "Workflow":
@@ -54,8 +92,20 @@ class Workflow:
         browser_channel = raw.get("browser_channel") or None
         if browser_channel not in VALID_BROWSER_CHANNELS:
             raise ValueError(f"Unknown browser_channel '{browser_channel}', expected one of {VALID_BROWSER_CHANNELS}")
+        variables = raw.get("variables") or {}
+        if not isinstance(variables, dict):
+            raise ValueError("'variables' must be a mapping of name -> default value")
+        reserved = [name for name in variables if name in RESERVED_VARIABLE_NAMES]
+        if reserved:
+            raise ValueError(f"'{reserved[0]}' is a reserved name and can't be declared as a variable")
         steps = [Step.from_dict(s) for s in raw.get("steps", [])]
-        return cls(name=raw.get("name", "workflow"), backend=backend, steps=steps, browser_channel=browser_channel)
+        return cls(
+            name=raw.get("name", "workflow"),
+            backend=backend,
+            steps=steps,
+            browser_channel=browser_channel,
+            variables=variables,
+        )
 
     @classmethod
     def load(cls, path: str | Path) -> "Workflow":
@@ -72,10 +122,17 @@ class Workflow:
                 entry["breakpoint"] = True
             if s.save_as:
                 entry["save_as"] = s.save_as
+            if s.on_error:
+                entry["on_error"] = s.on_error
+                if s.on_error == "retry":
+                    entry["retry_count"] = s.retry_count
+                    entry["retry_delay"] = s.retry_delay
             steps.append(entry)
         result: dict[str, Any] = {"name": self.name, "backend": self.backend, "steps": steps}
         if self.browser_channel:
             result["browser_channel"] = self.browser_channel
+        if self.variables:
+            result["variables"] = self.variables
         return result
 
     def save(self, path: str | Path) -> None:
@@ -100,3 +157,76 @@ def load_workflow_by_name(name: str) -> Workflow:
     if not path.exists():
         raise FileNotFoundError(f"No workflow named '{name}' in {WORKFLOWS_DIR}")
     return Workflow.load(path)
+
+
+def parse_steps(raw: Any) -> list[Step]:
+    """Parses a nested branch (if.then, for_each.steps, try.catch, a switch
+    case, ...) into Step objects. A branch stays a raw list-of-dicts inside its
+    parent step's `params` until something actually needs to look inside it -
+    the engine to execute it, resolve_sub_workflows below to walk it without
+    executing it - so this one parser is shared rather than duplicated."""
+    if not isinstance(raw, list):
+        return []
+    return [Step.from_dict(dict(item)) for item in raw]
+
+
+_LIST_BRANCH_FIELDS = ("then", "else", "steps", "catch", "default")
+
+
+def _nested_branches(step: Step) -> list[list[Step]]:
+    branches = []
+    for field_name in _LIST_BRANCH_FIELDS:
+        value = step.params.get(field_name)
+        if isinstance(value, list):
+            branches.append(parse_steps(value))
+    cases = step.params.get("cases")
+    if isinstance(cases, dict):
+        for value in cases.values():
+            if isinstance(value, list):
+                branches.append(parse_steps(value))
+    return branches
+
+
+def resolve_sub_workflows(workflow: Workflow) -> dict[str, dict[str, Any]]:
+    """Recursively resolves every literal `run_workflow` reference in
+    `workflow` - and, transitively, inside each resolved sub-workflow - to its
+    current file contents, keyed by name.
+
+    Used at job-enqueue time (see orchestrator/db.create_job) so a queued job
+    keeps running exactly the sub-workflow that existed when it was queued,
+    even if the referenced file is edited or deleted before a worker picks the
+    job up - the same guarantee the job's own workflow snapshot already gives
+    its top-level steps.
+
+    A `workflow:` value that isn't a literal name (e.g. "{var.ziel}", only
+    known from run-time data) can't be pinned this way and is skipped, same as
+    a cycle or a missing file - all three keep resolving at run time exactly
+    as before (engine.py raises a clear StepError for a cycle or a missing
+    file once the workflow actually runs; this walk just must not itself loop
+    forever or abort on either).
+    """
+    resolved: dict[str, dict[str, Any]] = {}
+
+    def visit(steps: list[Step], stack: list[str]) -> None:
+        for step in steps:
+            if step.action == "run_workflow":
+                name = step.params.get("workflow")
+                if (
+                    isinstance(name, str)
+                    and name
+                    and "{" not in name
+                    and name not in stack
+                    and name not in resolved
+                ):
+                    try:
+                        sub = load_workflow_by_name(name)
+                    except Exception:  # noqa: BLE001 - a missing/broken file surfaces at run time instead
+                        sub = None
+                    if sub is not None:
+                        resolved[name] = sub.to_dict()
+                        visit(sub.steps, [*stack, name])
+            for branch in _nested_branches(step):
+                visit(branch, stack)
+
+    visit(workflow.steps, [workflow.name])
+    return resolved

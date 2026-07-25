@@ -15,7 +15,10 @@ identical for both backends."""
 # switch statement's {value: [steps]} map, rendered as editable key + nested
 # step list per case), hotkey (text input + "record" button that captures a
 # key combo from the browser and fills it in), workflow (text input backed by a
-# datalist of the workflows that exist, for referencing a sub-workflow by name).
+# datalist of the workflows that exist, for referencing a sub-workflow by name),
+# variable (text input backed by a datalist of the current workflow's declared
+# variables - see the "Variablen" button in the builder toolbar - for a field
+# that *writes* to a named variable, so picking an existing name avoids typos).
 
 _CONTROL_FLOW_AND_VARIABLES: dict[str, list[dict]] = {
     "if": [
@@ -29,12 +32,12 @@ _CONTROL_FLOW_AND_VARIABLES: dict[str, list[dict]] = {
         {"name": "default", "label": "Standard-Fall", "type": "steps", "required": False},
     ],
     "assign": [
-        {"name": "variable", "label": "Variable", "type": "text", "required": True},
+        {"name": "variable", "label": "Variable", "type": "variable", "required": True},
         {"name": "value", "label": "Wert (Text, erlaubt {var.x}/{item.x})", "type": "text", "required": False},
         {"name": "expression", "label": "oder: Ausdruck (Python, z.B. a + b)", "type": "text", "required": False},
     ],
     "increment": [
-        {"name": "variable", "label": "Variable", "type": "text", "required": True},
+        {"name": "variable", "label": "Variable", "type": "variable", "required": True},
         {"name": "by", "label": "Um wie viel", "type": "number", "required": False},
     ],
     "read_excel": [
@@ -55,7 +58,7 @@ _CONTROL_FLOW_AND_VARIABLES: dict[str, list[dict]] = {
     "try": [
         {"name": "steps", "label": "Versuchen", "type": "steps", "required": False},
         {"name": "catch", "label": "Bei Fehler", "type": "steps", "required": False},
-        {"name": "error_var", "label": "Fehlermeldung speichern als (optional)", "type": "text", "required": False},
+        {"name": "error_var", "label": "Fehlermeldung speichern als (optional)", "type": "variable", "required": False},
     ],
     "run_workflow": [
         {"name": "workflow", "label": "Workflow", "type": "workflow", "required": True},
@@ -188,6 +191,35 @@ ACTION_SCHEMAS: dict[str, dict[str, list[dict]]] = {
             {"name": "title", "label": "Title", "type": "text", "required": False},
             {"name": "auto_id", "label": "Auto ID", "type": "text", "required": False},
             {"name": "double", "label": "Double click", "type": "checkbox", "required": False},
+            {
+                "name": "button",
+                "label": "Maustaste",
+                "type": "select",
+                "options": ["left", "right", "middle"],
+                "required": False,
+            },
+            {"name": "timeout", "label": "Timeout (s)", "type": "number", "required": False},
+        ],
+        "drag": [
+            {"name": "control_type", "label": "Control type", "type": "text", "required": False},
+            {"name": "title", "label": "Title", "type": "text", "required": False},
+            {"name": "auto_id", "label": "Auto ID", "type": "text", "required": False},
+            {"name": "to_x", "label": "Ziel X (Bildschirm-Pixel)", "type": "number", "required": True},
+            {"name": "to_y", "label": "Ziel Y (Bildschirm-Pixel)", "type": "number", "required": True},
+            {
+                "name": "button",
+                "label": "Maustaste",
+                "type": "select",
+                "options": ["left", "right", "middle"],
+                "required": False,
+            },
+            {"name": "timeout", "label": "Timeout (s)", "type": "number", "required": False},
+        ],
+        "scroll": [
+            {"name": "control_type", "label": "Control type", "type": "text", "required": False},
+            {"name": "title", "label": "Title", "type": "text", "required": False},
+            {"name": "auto_id", "label": "Auto ID", "type": "text", "required": False},
+            {"name": "amount", "label": "Menge (positiv = hoch, negativ = runter)", "type": "number", "required": False},
             {"name": "timeout", "label": "Timeout (s)", "type": "number", "required": False},
         ],
         "type": [
@@ -269,8 +301,22 @@ ACTION_META: dict[str, dict] = {
         "label": "Klicken",
         "category": "UI-Interaktion",
         "description": "Klickt das angegebene Element an.",
-        "keywords": ["maus", "button", "schaltfläche", "drücken"],
+        "keywords": ["maus", "button", "schaltfläche", "drücken", "rechtsklick"],
         "primary": ["selector", "title", "auto_id"],
+    },
+    "drag": {
+        "label": "Ziehen (Drag & Drop)",
+        "category": "UI-Interaktion",
+        "description": "Zieht das angegebene Element per Maus an eine Bildschirmposition.",
+        "keywords": ["drag", "ziehen", "verschieben", "drop"],
+        "primary": ["title", "auto_id"],
+    },
+    "scroll": {
+        "label": "Scrollen",
+        "category": "UI-Interaktion",
+        "description": "Bewegt das Mausrad über dem angegebenen Element.",
+        "keywords": ["scrollen", "mausrad", "wheel", "runter", "hoch"],
+        "primary": ["title", "auto_id"],
     },
     "type": {
         "label": "Text eingeben",

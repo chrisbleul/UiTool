@@ -86,6 +86,24 @@ def _workflow(name: str, url: str) -> dict:
     return {"name": name, "backend": "web", "steps": [{"action": "navigate", "url": url}]}
 
 
+def test_api_run_snapshots_referenced_sub_workflows_into_the_job(client):
+    client.post(
+        "/api/workflows/teilprozess",
+        json={"name": "teilprozess", "backend": "web", "steps": [{"action": "navigate", "url": "sub"}]},
+    )
+    haupt = {
+        "name": "haupt",
+        "backend": "web",
+        "steps": [{"action": "run_workflow", "workflow": "teilprozess"}],
+    }
+
+    res = client.post("/api/run", json=haupt)
+    job_id = res.get_json()["job_id"]
+
+    detail = client.get(f"/api/jobs/{job_id}").get_json()
+    assert detail["sub_workflows"]["teilprozess"]["steps"] == [{"action": "navigate", "url": "sub"}]
+
+
 def test_saving_over_an_existing_workflow_is_refused_when_overwrite_is_false(client):
     client.post("/api/workflows/report", json=_workflow("report", "https://original"))
 

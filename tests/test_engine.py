@@ -499,6 +499,113 @@ def test_try_lets_workflow_cancelled_propagate_through_catch():
         WorkflowEngine(backend).run(workflow, should_stop=lambda: True)
 
 
+def test_on_error_retry_succeeds_after_transient_failures():
+    class FlakyBackend:
+        def __init__(self):
+            self.attempts = 0
+            self.calls = []
+
+        def click(self, selector):
+            self.attempts += 1
+            if self.attempts < 3:
+                raise RuntimeError("not ready yet")
+            self.calls.append(("click", selector))
+
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[Step("click", {"selector": "#go"}, on_error="retry", retry_count=3, retry_delay=0.01)],
+    )
+    backend = FlakyBackend()
+
+    WorkflowEngine(backend).run(workflow)
+
+    assert backend.attempts == 3
+    assert backend.calls == [("click", "#go")]
+
+
+def test_on_error_retry_gives_up_after_retry_count_and_raises():
+    class AlwaysFailingBackend:
+        def __init__(self):
+            self.attempts = 0
+
+        def click(self, selector):
+            self.attempts += 1
+            raise RuntimeError("boom")
+
+    backend = AlwaysFailingBackend()
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[Step("click", {"selector": "#go"}, on_error="retry", retry_count=2, retry_delay=0)],
+    )
+
+    with pytest.raises(StepError):
+        WorkflowEngine(backend).run(workflow)
+
+    assert backend.attempts == 3  # the original attempt plus 2 retries
+
+
+def test_on_error_continue_swallows_failure_and_runs_next_step():
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[
+            Step("does_not_exist", {}, on_error="continue"),
+            Step("navigate", {"url": "after"}),
+        ],
+    )
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow)
+
+    assert backend.calls == [("navigate", "after")]
+
+
+def test_on_error_retry_stops_immediately_when_stop_is_requested_during_wait():
+    calls = {"n": 0}
+
+    def should_stop():
+        calls["n"] += 1
+        return calls["n"] > 1  # let the first attempt run, then cancel during its retry wait
+
+    class AlwaysFailingBackend:
+        def click(self, selector):
+            raise RuntimeError("boom")
+
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[Step("click", {"selector": "#go"}, on_error="retry", retry_count=5, retry_delay=5.0)],
+    )
+
+    with pytest.raises(WorkflowCancelled):
+        WorkflowEngine(AlwaysFailingBackend()).run(workflow, should_stop=should_stop)
+
+
+def test_on_error_continue_does_not_swallow_workflow_cancelled_from_nested_steps():
+    calls = {"n": 0}
+
+    def should_stop():
+        calls["n"] += 1
+        return calls["n"] > 1  # cancel once the for_each's own body starts iterating
+
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[
+            Step(
+                "for_each",
+                {"items": "[1, 2]", "steps": [{"action": "navigate", "url": "a"}]},
+                on_error="continue",
+            )
+        ],
+    )
+
+    with pytest.raises(WorkflowCancelled):
+        WorkflowEngine(RecordingBackend()).run(workflow, should_stop=should_stop)
+
+
 def test_http_request_stores_result_via_save_as(monkeypatch):
     monkeypatch.setattr(
         "uiflow.http_client.send_http_request",
@@ -836,10 +943,10 @@ def workflows_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
-def write_workflow(directory, name, steps, backend="web"):
-    Workflow(name=name, backend=backend, steps=[Step.from_dict(s) for s in steps]).save(
-        directory / f"{name}.yaml"
-    )
+def write_workflow(directory, name, steps, backend="web", variables=None):
+    Workflow(
+        name=name, backend=backend, steps=[Step.from_dict(s) for s in steps], variables=variables or {}
+    ).save(directory / f"{name}.yaml")
 
 
 def test_run_workflow_executes_the_referenced_workflow(workflows_dir):
@@ -1039,6 +1146,120 @@ def test_a_sub_workflow_can_itself_call_another(workflows_dir):
     WorkflowEngine(backend).run(workflow)
 
     assert backend.calls == [("navigate", "mitte"), ("navigate", "innen")]
+
+
+def test_sub_workflows_snapshot_is_used_instead_of_the_live_file(workflows_dir):
+    # No file for "teilprozess" is written at all - a run relying on the live
+    # file would fail with FileNotFoundError; the snapshot must be enough.
+    workflow = Workflow(name="haupt", backend="web", steps=[Step("run_workflow", {"workflow": "teilprozess"})])
+    snapshot = Workflow(name="teilprozess", backend="web", steps=[Step("navigate", {"url": "aus dem snapshot"})])
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow, sub_workflows={"teilprozess": snapshot})
+
+    assert backend.calls == [("navigate", "aus dem snapshot")]
+
+
+def test_sub_workflows_snapshot_wins_over_a_changed_file(workflows_dir):
+    write_workflow(workflows_dir, "teilprozess", [{"action": "navigate", "url": "aktuelle datei"}])
+    snapshot = Workflow(
+        name="teilprozess", backend="web", steps=[Step("navigate", {"url": "stand beim einreihen"})]
+    )
+    workflow = Workflow(name="haupt", backend="web", steps=[Step("run_workflow", {"workflow": "teilprozess"})])
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow, sub_workflows={"teilprozess": snapshot})
+
+    assert backend.calls == [("navigate", "stand beim einreihen")]
+
+
+def test_a_name_missing_from_the_snapshot_still_falls_back_to_the_live_file(workflows_dir):
+    write_workflow(workflows_dir, "teilprozess", [{"action": "navigate", "url": "von der platte"}])
+    workflow = Workflow(name="haupt", backend="web", steps=[Step("run_workflow", {"workflow": "teilprozess"})])
+    backend = RecordingBackend()
+
+    # An irrelevant snapshot entry (e.g. an older job queued before this
+    # sub-workflow existed) must not break resolution - it just falls through.
+    unrelated = Workflow(name="andere", backend="web", steps=[])
+    WorkflowEngine(backend).run(workflow, sub_workflows={"andere": unrelated})
+
+    assert backend.calls == [("navigate", "von der platte")]
+
+
+# --- declared workflow variables ---------------------------------------------
+
+
+def test_declared_variable_default_is_seeded_before_the_first_step():
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[Step("navigate", {"url": "{var.basis}"})],
+        variables={"basis": "https://x"},
+    )
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow)
+
+    assert backend.calls == [("navigate", "https://x")]
+
+
+def test_declared_variable_without_a_default_stays_unset_until_assigned():
+    workflow = Workflow(
+        name="t", backend="web", steps=[Step("navigate", {"url": "a"})], variables={"zaehler": None}
+    )
+    engine = WorkflowEngine(RecordingBackend())
+
+    engine.run(workflow)
+
+    assert "zaehler" not in engine.variables
+
+
+def test_an_explicit_run_variable_overrides_the_declared_default():
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[Step("navigate", {"url": "{var.basis}"})],
+        variables={"basis": "https://default"},
+    )
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow, variables={"basis": "https://override"})
+
+    assert backend.calls == [("navigate", "https://override")]
+
+
+def test_sub_workflow_own_declared_default_is_seeded_when_entering_it(workflows_dir):
+    write_workflow(
+        workflows_dir,
+        "teilprozess",
+        [{"action": "navigate", "url": "{var.zaehler}"}],
+        variables={"zaehler": 0},
+    )
+    workflow = Workflow(name="haupt", backend="web", steps=[Step("run_workflow", {"workflow": "teilprozess"})])
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow)
+
+    assert backend.calls == [("navigate", "0")]
+
+
+def test_sub_workflow_argument_overrides_its_own_declared_default(workflows_dir):
+    write_workflow(
+        workflows_dir,
+        "teilprozess",
+        [{"action": "navigate", "url": "{var.zaehler}"}],
+        variables={"zaehler": 0},
+    )
+    workflow = Workflow(
+        name="haupt",
+        backend="web",
+        steps=[Step("run_workflow", {"workflow": "teilprozess", "arguments": {"zaehler": 5}})],
+    )
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow)
+
+    assert backend.calls == [("navigate", "5")]
 
 
 def test_a_whole_placeholder_argument_keeps_its_type(workflows_dir):

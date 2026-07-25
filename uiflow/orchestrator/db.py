@@ -32,6 +32,14 @@ CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     workflow_json TEXT NOT NULL,
+    -- {name: workflow_dict} for every run_workflow reference this job's
+    -- workflow had at enqueue time (see models.resolve_sub_workflows) - so a
+    -- queued job keeps running the sub-workflow that existed when it was
+    -- queued, not whatever the file happens to contain once a worker gets to
+    -- it. '{}' (not referencing any sub-workflow, or none could be resolved)
+    -- falls back to a live file lookup at run time, same as before this
+    -- column existed.
+    sub_workflows_json TEXT NOT NULL DEFAULT '{}',
     queue_name TEXT,
     status TEXT NOT NULL DEFAULT 'queued',
     worker_id TEXT,
@@ -150,6 +158,7 @@ def init_db() -> None:
                     ("job_controls", "paused_variables_json", "TEXT"),
                     ("job_controls", "paused_step_path", "TEXT"),
                     ("queue_items", "retry_after", "TEXT"),
+                    ("jobs", "sub_workflows_json", "TEXT"),
                 ):
                     try:
                         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
@@ -165,13 +174,18 @@ def init_db() -> None:
 # --- jobs -----------------------------------------------------------------
 
 
-def create_job(name: str, workflow: dict[str, Any], queue_name: str | None = None) -> str:
+def create_job(
+    name: str,
+    workflow: dict[str, Any],
+    queue_name: str | None = None,
+    sub_workflows: dict[str, Any] | None = None,
+) -> str:
     job_id = uuid.uuid4().hex
     with connect() as conn:
         conn.execute(
-            "INSERT INTO jobs (id, name, workflow_json, queue_name, status, created_at) "
-            "VALUES (?, ?, ?, ?, 'queued', ?)",
-            (job_id, name, json.dumps(workflow), queue_name, _now()),
+            "INSERT INTO jobs (id, name, workflow_json, sub_workflows_json, queue_name, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 'queued', ?)",
+            (job_id, name, json.dumps(workflow), json.dumps(sub_workflows or {}), queue_name, _now()),
         )
         conn.execute("INSERT INTO job_controls (job_id) VALUES (?)", (job_id,))
     return job_id

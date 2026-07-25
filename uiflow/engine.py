@@ -3,9 +3,10 @@ from __future__ import annotations
 import builtins
 import logging
 import re
+import time
 from typing import Any, Callable, Optional
 
-from .models import Step, Workflow, load_workflow_by_name
+from .models import Step, Workflow, load_workflow_by_name, parse_steps
 
 logger = logging.getLogger("uiflow")
 
@@ -99,6 +100,13 @@ class WorkflowEngine:
     identify a step in the Studio's statically rendered canvas - so breakpoints
     additionally report a `path`, the step's structural address in the workflow
     definition (see _run_steps).
+
+    Every step also carries its own `on_error` policy (see
+    _run_step_with_policy), independent of any enclosing `try`/`catch`:
+    "retry" re-attempts the step in place, "continue" logs the failure and
+    moves on. Neither needs a `try` block around the step, unlike the
+    engine-level `try` action, which only catches failures inside its own
+    `steps`.
     """
 
     def __init__(self, backend: object):
@@ -109,6 +117,7 @@ class WorkflowEngine:
         # (see _log/_redact_secrets) can mask them instead of writing secrets
         # to the job log / console in plain text.
         self._secrets: set[str] = set()
+        self._sub_workflows: dict[str, Workflow] = {}
 
     def run(
         self,
@@ -117,8 +126,9 @@ class WorkflowEngine:
         should_stop: Optional[ShouldStop] = None,
         variables: Optional[dict[str, Any]] = None,
         global_variables: Optional[dict[str, Any]] = None,
+        sub_workflows: Optional[dict[str, Workflow]] = None,
     ) -> None:
-        self.variables = dict(variables) if variables else {}
+        self.variables = self._seed_declared_variables(workflow, dict(variables) if variables else {})
         # Installation-wide values, kept apart from the run's own variables so
         # they survive a sub-workflow's isolated scope and can't be overwritten
         # by an `assign`. The engine is handed them rather than reading the
@@ -128,12 +138,33 @@ class WorkflowEngine:
         self._secrets = set()
         self._counter = 0
         self._backend_name = workflow.backend
+        # A snapshot of every `run_workflow` reference this workflow (and its
+        # own sub-workflows) had at enqueue time - see models.resolve_sub_workflows
+        # and orchestrator/db.create_job. `_run_sub_workflow` prefers this over
+        # reading the file fresh, so a queued job keeps running exactly what it
+        # was queued with even if the file changes before a worker gets to it.
+        # Not reset when entering a sub-workflow: it's a whole-run snapshot, not
+        # a per-scope value.
+        self._sub_workflows = dict(sub_workflows) if sub_workflows else {}
         # Names of the workflows currently on the call stack, so `run_workflow`
         # can refuse a cycle instead of recursing until Python's stack gives out.
         self._workflow_stack = [workflow.name]
         logger.info("Running workflow '%s' on backend=%s", workflow.name, workflow.backend)
         self._run_steps(workflow.steps, on_breakpoint, should_stop)
         logger.info("Workflow '%s' completed successfully", workflow.name)
+
+    @staticmethod
+    def _seed_declared_variables(workflow: Workflow, provided: dict[str, Any]) -> dict[str, Any]:
+        """Starts a run's variables from `workflow.variables`' declared
+        defaults (skipping any declared with no default - a bare name reserves
+        itself for the picker in the Studio's properties panel but still only
+        gets a value on first `assign`, same as an undeclared one), then lets
+        `provided` (an explicit run's own `variables`, or a sub-workflow's
+        `arguments`) override them - an explicit input always wins over a
+        declared default, the same as a function parameter's default."""
+        seeded = {name: default for name, default in workflow.variables.items() if default is not None}
+        seeded.update(provided)
+        return seeded
 
     def _run_steps(
         self,
@@ -162,44 +193,97 @@ class WorkflowEngine:
                     logger.info("Workflow abgebrochen vor Schritt %d", index)
                     raise WorkflowCancelled(index)
 
-            if step.action == "if":
-                self._run_if(step, index, path, on_breakpoint, should_stop)
-            elif step.action == "switch":
-                self._run_switch(step, index, path, on_breakpoint, should_stop)
-            elif step.action == "for_each":
-                self._run_for_each(step, index, path, on_breakpoint, should_stop)
-            elif step.action == "try":
-                self._run_try(step, index, path, on_breakpoint, should_stop)
-            elif step.action == "run_workflow":
-                self._run_sub_workflow(step, index, path, on_breakpoint, should_stop)
-            elif step.action == "assign":
-                self._run_assign(step, index)
-            elif step.action == "increment":
-                self._run_increment(step, index)
-            elif step.action == "read_excel":
-                self._run_read_excel(step, index)
-            elif step.action == "write_excel":
-                self._run_write_excel(step, index)
-            elif step.action == "http_request":
-                self._run_http_request(step, index)
-            elif step.action == "get_credential":
-                self._run_get_credential(step, index)
-            elif step.action == "send_email":
-                self._run_send_email(step, index)
-            elif step.action == "read_emails":
-                self._run_read_emails(step, index)
-            elif step.action == "read_pdf":
-                self._run_read_pdf(step, index)
-            elif step.action == "ocr_image":
-                self._run_ocr_image(step, index)
-            else:
-                self._run_backend_step(step, index)
+            self._run_step_with_policy(step, index, path, on_breakpoint, should_stop)
+
+    def _run_step_with_policy(
+        self,
+        step: Step,
+        index: int,
+        path: str,
+        on_breakpoint: Optional[OnBreakpoint],
+        should_stop: Optional[ShouldStop],
+    ) -> None:
+        """Applies the step's own `on_error` policy around its dispatch -
+        independent of whether it sits inside a `try`/`catch` block. Without
+        `on_error`, a failure propagates exactly as before (aborting the
+        workflow unless an enclosing `try` catches it)."""
+        attempts = step.retry_count + 1 if step.on_error == "retry" else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                self._dispatch_step(step, index, path, on_breakpoint, should_stop)
+                return
+            except WorkflowCancelled:
+                raise  # a user-requested stop must propagate, never be retried or swallowed
+            except (StepError, ValueError) as exc:
+                if step.on_error == "retry" and attempt < attempts:
+                    self._log(
+                        "[%d] %s failed (Versuch %d/%d), erneuter Versuch in %.1fs -> %s",
+                        index, step.action, attempt, attempts, step.retry_delay, exc,
+                    )
+                    self._sleep_unless_stopped(step.retry_delay, index, should_stop)
+                    continue
+                if step.on_error == "continue":
+                    self._log("[%d] %s fehlgeschlagen, fahre fort (on_error=continue) -> %s", index, step.action, exc)
+                    return
+                raise
+
+    def _sleep_unless_stopped(self, seconds: float, index: int, should_stop: Optional[ShouldStop]) -> None:
+        """Waits out a retry delay in short slices so a stop request lands
+        promptly instead of only after the full delay has elapsed."""
+        remaining = seconds
+        slice_seconds = 0.2
+        while remaining > 0:
+            if should_stop is not None and should_stop():
+                logger.info("Workflow abgebrochen vor Schritt %d (während Retry-Wartezeit)", index)
+                raise WorkflowCancelled(index)
+            nap = min(slice_seconds, remaining)
+            time.sleep(nap)
+            remaining -= nap
+
+    def _dispatch_step(
+        self,
+        step: Step,
+        index: int,
+        path: str,
+        on_breakpoint: Optional[OnBreakpoint],
+        should_stop: Optional[ShouldStop],
+    ) -> None:
+        if step.action == "if":
+            self._run_if(step, index, path, on_breakpoint, should_stop)
+        elif step.action == "switch":
+            self._run_switch(step, index, path, on_breakpoint, should_stop)
+        elif step.action == "for_each":
+            self._run_for_each(step, index, path, on_breakpoint, should_stop)
+        elif step.action == "try":
+            self._run_try(step, index, path, on_breakpoint, should_stop)
+        elif step.action == "run_workflow":
+            self._run_sub_workflow(step, index, path, on_breakpoint, should_stop)
+        elif step.action == "assign":
+            self._run_assign(step, index)
+        elif step.action == "increment":
+            self._run_increment(step, index)
+        elif step.action == "read_excel":
+            self._run_read_excel(step, index)
+        elif step.action == "write_excel":
+            self._run_write_excel(step, index)
+        elif step.action == "http_request":
+            self._run_http_request(step, index)
+        elif step.action == "get_credential":
+            self._run_get_credential(step, index)
+        elif step.action == "send_email":
+            self._run_send_email(step, index)
+        elif step.action == "read_emails":
+            self._run_read_emails(step, index)
+        elif step.action == "read_pdf":
+            self._run_read_pdf(step, index)
+        elif step.action == "ocr_image":
+            self._run_ocr_image(step, index)
+        else:
+            self._run_backend_step(step, index)
 
     @staticmethod
     def _sub_steps(raw: Any) -> list[Step]:
-        if not isinstance(raw, list):
-            return []
-        return [Step.from_dict(dict(item)) for item in raw]
+        return parse_steps(raw)
 
     def _run_if(
         self,
@@ -336,10 +420,12 @@ class WorkflowEngine:
             chain = " -> ".join([*self._workflow_stack, name])
             raise StepError(index, step, ValueError(f"Sub-workflow cycle: {chain}"))
 
-        try:
-            sub = load_workflow_by_name(name)
-        except Exception as exc:  # noqa: BLE001 - wrap a missing/broken file with step context
-            raise StepError(index, step, exc) from exc
+        sub = self._sub_workflows.get(name)
+        if sub is None:
+            try:
+                sub = load_workflow_by_name(name)
+            except Exception as exc:  # noqa: BLE001 - wrap a missing/broken file with step context
+                raise StepError(index, step, exc) from exc
         if sub.backend != self._backend_name:
             raise StepError(
                 index,
@@ -361,9 +447,11 @@ class WorkflowEngine:
         self._log("[%d] run_workflow '%s' (%d step(s), arguments: %s)", index, name, len(sub.steps), arguments)
 
         caller_variables = self.variables
-        # Arguments only - except the global namespace, which is installation-wide
-        # and therefore visible everywhere without being threaded through.
-        self.variables = {**arguments, "global": self._globals}
+        # Arguments (plus the sub-workflow's own declared defaults) only -
+        # except the global namespace, which is installation-wide and
+        # therefore visible everywhere without being threaded through.
+        self.variables = self._seed_declared_variables(sub, arguments)
+        self.variables["global"] = self._globals
         self._workflow_stack.append(name)
         try:
             # The path prefix carries the sub-workflow's name because its steps

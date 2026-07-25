@@ -12,7 +12,7 @@ from typing import Any
 from flask import Flask, Response, jsonify, redirect, request, send_from_directory, session
 
 from .. import models
-from ..models import Workflow
+from ..models import Workflow, resolve_sub_workflows
 from ..orchestrator import db
 from .schema import ACTION_SCHEMAS, activity_catalog
 
@@ -143,7 +143,12 @@ def create_app() -> Flask:
             workflow = Workflow.from_raw(data)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
-        job_id = db.create_job(workflow.name, workflow.to_dict(), queue_name=data.get("queue_name"))
+        job_id = db.create_job(
+            workflow.name,
+            workflow.to_dict(),
+            queue_name=data.get("queue_name"),
+            sub_workflows=resolve_sub_workflows(workflow),
+        )
         return jsonify({"job_id": job_id})
 
     @app.post("/api/run/<job_id>/continue")
@@ -207,6 +212,7 @@ def create_app() -> Flask:
         jobs = db.list_jobs(status=status, limit=100)
         for job in jobs:
             job.pop("workflow_json", None)  # keep the list view light
+            job.pop("sub_workflows_json", None)
         return jsonify(jobs)
 
     @app.get("/api/jobs/<job_id>")
@@ -215,6 +221,7 @@ def create_app() -> Flask:
         if job is None:
             return jsonify({"error": "not found"}), 404
         job["workflow"] = json.loads(job.pop("workflow_json"))
+        job["sub_workflows"] = json.loads(job.pop("sub_workflows_json", None) or "{}")
         return jsonify(job)
 
     @app.get("/api/jobs/<job_id>/logs")

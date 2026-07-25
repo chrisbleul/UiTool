@@ -130,10 +130,26 @@ python -m uiflow.cli studio
   Karte fixiert: nicht verschiebbar, und es lässt sich nichts darüber ablegen, weil alle folgenden
   Schritte sich auf ihn beziehen.
 - **🔴 Aufnahme starten** (im Scope-Bereich, sobald ein `launch`/`connect`-Schritt existiert): zeichnet
-  echte Klicks und Texteingaben in der Zielanwendung live als Workflow-Schritte auf. Text wird gepuffert
-  und beim nächsten Klick oder mit Tab/Enter als `type`-Schritt übernommen; Klicks außerhalb der
-  Scope-Anwendung werden ignoriert. **⏹ Aufnahme stoppen** beendet die Sitzung (verbleibender
-  Text wird noch als letzter Schritt übernommen).
+  echte Interaktionen in der Zielanwendung live als Workflow-Schritte auf:
+  - **Klicks** werden als `click` übernommen; ein **Rechtsklick** trägt zusätzlich `button: right`
+    (Mittelklick entsprechend `middle`).
+  - **Ziehen** (Maustaste gedrückt halten und über eine kurze Distanz bewegen, z.B. eine Zeile per
+    Drag & Drop verschieben) wird als `drag` mit der Zielposition (`to_x`/`to_y`) aufgezeichnet, nicht
+    als Klick — kleine Zitterbewegungen unterhalb weniger Pixel zählen weiterhin als Klick.
+  - **Scrollen** wird als `scroll` aufgezeichnet; mehrere Mausrad-Bewegungen über demselben Element
+    hintereinander werden zu einem einzigen `scroll`-Schritt zusammengefasst (wie Text: erst ein
+    Elementwechsel oder eine andere Aktion committet ihn), statt einen Schritt pro Rad-Kerbe zu erzeugen.
+  - **Tastenkombinationen** mit gehaltenem Strg oder Alt (z.B. Strg+S) werden als `send_hotkey` erfasst,
+    nicht als Text. Reines Umschalttaste-Tippen (Großbuchstaben, Sonderzeichen) bleibt normaler Text —
+    Umschalttaste allein löst keine Tastenkombination aus.
+  - Text wird weiterhin gepuffert und beim nächsten Klick, einem `send_hotkey` oder mit Tab/Enter als
+    `type`-Schritt übernommen.
+  - **Scope über mehrere Fenster**: Interaktionen zählen nicht nur im ursprünglich verbundenen Fenster,
+    sondern auch in Fenstern, die von diesem *besessen* werden (Windows' eigene Owner-Beziehung, z.B.
+    ein modaler "Speichern unter"-Dialog) — selbst wenn ein solches Fenster technisch unter einer
+    anderen Prozess-ID läuft. Interaktionen außerhalb dieses Scopes werden ignoriert.
+  - **⏹ Aufnahme stoppen** beendet die Sitzung (verbleibender Text bzw. eine noch offene Scroll-Serie
+    wird noch als letzter Schritt übernommen).
 
 `--port`/`--host`/`--no-browser` stehen als Flags zur Verfügung. `uiflow run` (CLI ohne Studio)
 unterstützt Haltepunkte ebenfalls: die Ausführung stoppt im Terminal mit "Weiter mit Enter...".
@@ -210,8 +226,13 @@ Web-Actions (siehe `uiflow/backends/web.py`): `navigate`, `click`, `type`, `get_
 `wait_for_selector`, `wait`, `screenshot`.
 
 Desktop-Actions (siehe `uiflow/backends/desktop.py`): `launch`, `connect`, `wait_for_element`, `click`,
-`type`, `get_text`, `send_hotkey`, `wait`, `screenshot`.
+`drag`, `scroll`, `type`, `get_text`, `send_hotkey`, `wait`, `screenshot`.
 Desktop-Selektoren sind beliebige `pywinauto` `child_window(**kwargs)`-Argumente, z.B. `control_type`, `title`, `auto_id`, `class_name`.
+`click` nimmt optional `button` (`left`/`right`/`middle`, Standard `left`) für Rechts-/Mittelklick.
+`drag` zieht das aufgelöste Element per gedrückter Maustaste zu einer absoluten Bildschirmposition
+(`to_x`/`to_y`) — das Ziel ist bewusst ein Punkt statt eines zweiten Selektors, weil eine Ablagestelle
+oft kein eigenes Element ist (leere Listenfläche, Lücke zwischen Zeilen). `scroll` bewegt das Mausrad
+über der Mitte des Elements; `amount` folgt der Windows-Konvention (positiv = hoch, negativ = runter).
 
 Jeder Step kann zusätzlich `save_as: <name>` tragen — der Rückgabewert der Aktion (z.B. der von
 `get_text` gelesene Text) landet dann in einer Variable, die spätere Steps als `{var.name}` verwenden können.
@@ -291,6 +312,36 @@ geschrieben und ausgeführt, wie ein lokales Skript, nicht von nicht vertrauensw
 sondern beliebig verschachtelte Sub-Blöcke); ein per Stop-Button angefordertes Abbrechen wird davon
 absichtlich **nicht** abgefangen.
 
+#### Fehlerbehandlung pro Step (`on_error`)
+
+Jeder einzelne Step kann zusätzlich `on_error` tragen — unabhängig davon, ob er in einem `try`/`catch`
+steckt:
+
+```yaml
+steps:
+  - action: click
+    selector: "#lade-daten"
+    on_error: retry            # oder: continue
+    retry_count: 5              # Standard: 3 - nur bei on_error: retry relevant
+    retry_delay: 3               # Sekunden zwischen Versuchen, Standard: 2 - nur bei on_error: retry relevant
+
+  - action: click
+    selector: "#optionaler-hinweis-schließen"
+    on_error: continue           # Fehler wird geloggt, der Workflow läuft trotzdem weiter
+```
+
+Ohne `on_error` bricht ein Step den Workflow beim ersten Fehler weiterhin ab (wie bisher), sofern kein
+umschließendes `try` ihn abfängt. `retry` wiederholt genau diesen Step an Ort und Stelle bis zu
+`retry_count`-mal, mit `retry_delay` Sekunden Wartezeit dazwischen — schlägt auch der letzte Versuch fehl,
+bricht der Step wie ohne `on_error` ab. `continue` protokolliert den Fehler und macht beim nächsten Step
+weiter, ohne den Rest des Workflows abzubrechen. Ein per Stop-Button angefordertes Abbrechen wird von
+keiner der beiden Optionen abgefangen — auch nicht während der Wartezeit zwischen zwei Retry-Versuchen,
+die dafür in kurzen Schritten geprüft wird, statt sie ungeprüft durchzuschlafen. Ist der Step selbst ein
+Container (`if`, `for_each`, `try`, ...), wiederholt bzw. überspringt `on_error` den gesamten Container —
+bei `for_each` also den kompletten Schleifendurchlauf, nicht nur das zuletzt fehlgeschlagene Element
+(dafür bleibt weiterhin das eigene, unabhängige `max_retries` der Queue-Items zuständig, siehe
+"Orchestrator" unten).
+
 #### Unterprozesse (`run_workflow`)
 
 `run_workflow` führt eine andere Workflow-Datei als Baustein aus — für Schrittfolgen, die in mehreren
@@ -309,10 +360,17 @@ sind bewusst so gewählt:
   bricht der Schritt mit einer klaren Meldung ab, statt Desktop-Aufrufe gegen einen Browser zu schicken.
 - **Zyklen werden abgelehnt.** Ruft A den Prozess B auf, der wieder A aufruft, endet der Schritt mit
   `Sub-workflow cycle: A -> B -> A`.
-- **Auflösung zur Laufzeit.** Der Name wird beim Ausführen in `workflows/` nachgeschlagen — dieselbe
-  Datei, die der Builder speichert und in der Auswahlliste anbietet. Das heißt auch: wird ein
-  Unterprozess bearbeitet, während ein Job schon in der Warteschlange steht, läuft der Job mit der
-  neuen Fassung (der Job-Snapshot in `orchestrator.db` enthält nur den aufrufenden Workflow).
+- **Beim Einreihen aufgelöst und mit eingereiht.** `uiflow run` von der Kommandozeile löst den Namen
+  direkt in `workflows/` auf — dieselbe Datei, die der Builder speichert und in der Auswahlliste anbietet.
+  Ein **Job** dagegen bettet jeden referenzierten Unterprozess (rekursiv, falls dieser selbst weitere
+  aufruft) beim Einreihen als Snapshot mit in die Job-Zeile ein (`sub_workflows_json`, siehe
+  `models.resolve_sub_workflows`) — genau wie der aufrufende Workflow selbst schon als Snapshot vorliegt.
+  Ein Job führt damit exakt die Unterprozess-Fassung aus, die beim Einreihen galt, selbst wenn die Datei
+  danach bearbeitet oder gelöscht wird, bevor ein Worker sie abholt. Ein `workflow`-Wert, der kein
+  wörtlicher Name ist (z.B. `"{var.ziel}"`, erst zur Laufzeit aus Job-/Item-Daten bekannt), lässt sich so
+  nicht vorab festlegen und bleibt wie zuvor eine Live-Auflösung zum Ausführungszeitpunkt — ebenso ein
+  zyklischer oder fehlender Verweis, der ohnehin erst beim tatsächlichen Lauf mit einer klaren
+  Fehlermeldung abbricht.
 
 Ein Haltepunkt *innerhalb* eines Unterprozesses hält den Lauf korrekt an und zeigt dessen Variablen,
 markiert aber keine Karte auf der Zeichenfläche — die zeigt den aufrufenden Workflow, in dem dieser
@@ -385,6 +443,42 @@ steps:
     mark_as_read: false             # Standard: Lesen lässt die Mails ungelesen (IMAP BODY.PEEK)
     save_as: eingang                # -> Liste von {subject, from, date, body}
 ```
+
+## Deklarierte Workflow-Variablen
+
+Bislang entstand jede Workflow-eigene Variable stillschweigend beim ersten `assign` — nirgends stand,
+welche ein Workflow überhaupt verwendet, und `{var.tippfehler}` wurde stumm zu einem leeren String,
+während derselbe Tippfehler in einer `condition`/`expression` mit einem Fehler abbrach. Der Button
+**Variablen** im Builder öffnet ein Panel, in dem sich Variablen des *aktuell geöffneten* Workflows mit
+Namen und optionalem Startwert deklarieren lassen — analog zu UiPaths Variablen-Panel:
+
+```yaml
+name: Rechnung buchen
+backend: web
+variables:
+  zaehler: 0          # Startwert - eine Zahl bleibt eine Zahl, eine Liste eine Liste (wie bei Anmeldedaten/globalen Variablen: JSON statt Text)
+  kunden: []
+  status:             # ohne Startwert (Name nur reserviert) - entsteht wie bisher erst beim ersten assign
+steps:
+  - action: increment
+    variable: zaehler
+```
+
+Drei Punkte dazu:
+
+- **Der Startwert steht ab dem allerersten Schritt.** Anders als bei einem `assign` mitten im Ablauf ist
+  `{var.zaehler}` schon vor dem ersten Schritt `0`, nicht erst danach — nützlich für einen Zähler, der
+  vor der ersten `increment` gelesen wird, oder eine Liste, die per `for_each` durchlaufen wird, bevor
+  irgendein Schritt sie befüllt.
+- **Ein Name ohne Startwert reserviert nur den Namen** (erscheint im Eigenschaften-Panel als Vorschlag),
+  ändert aber nichts am bisherigen Verhalten — die Variable entsteht weiterhin erst beim ersten `assign`.
+- **Eine gleichnamige Variable in `arguments` beim Aufruf eines Unterprozesses gewinnt** über dessen
+  eigenen Startwert, genau wie ein Funktionsargument einen Default überschreibt — der Unterprozess bringt
+  seinen Startwert nur mit, wenn der Aufrufer ihn nicht selbst setzt.
+
+Die Felder `Variable` (`assign`, `increment`) und `Fehlermeldung speichern als` (`try`) bieten die
+deklarierten Namen im Eigenschaften-Panel als Vorschlag an, ersetzen freies Tippen aber nicht — eine neue
+Variable entsteht weiterhin einfach durch Eintippen eines neuen Namens.
 
 ## Globale Variablen
 
@@ -475,25 +569,6 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
 - **Echtes Multi-User-/Rechte-System**: das optionale Login (`UIFLOW_STUDIO_PASSWORD`) ist ein
   einzelnes geteiltes Passwort ohne einzelne Konten, Rollen oder Berechtigungen — bewusst minimal
   gehalten, kein Ersatz für echtes RBAC.
-- **Recorder-Feinschliff**: der Aufnahme-Modus (`uiflow/studio/recorder.py`) deckt Klick + Texteingabe
-  ab; Drag, Rechtsklick, Scroll, Tastenkombinationen und Mehrfach-Fenster-Scopes werden noch nicht
-  erfasst.
-- **Fehlerbehandlung pro einzelnem Step** (Retry/Continue direkt an einem Step, unabhängig von einem
-  umschließenden `try`): aktuell fängt nur ein expliziter `try`/`catch`-Block Fehler ab; ein Step ohne
-  `try` drumherum bricht den Workflow beim ersten Fehler weiterhin ab (Queue-Items haben ihr eigenes,
-  davon unabhängiges Retry via `max_retries`).
-- **Unterprozesse beim Einreihen auflösen**: `run_workflow` gibt es inzwischen (siehe oben), es löst
-  den Namen aber erst zur Laufzeit auf. `create_job` legt sonst den kompletten Workflow als JSON in der
-  Job-Zeile ab, damit ein Job exakt das ausführt, was beim Einreihen galt — für Unterprozesse gilt diese
-  Zusage derzeit nicht. Sie ließe sich wiederherstellen, indem referenzierte Unterprozesse beim Einreihen
-  mit in den Snapshot aufgenommen werden.
-- **Deklarierte Workflow-Variablen** (UiPaths Variablen-Panel): Installationsweite globale Variablen
-  gibt es inzwischen (siehe oben), die *workflow-eigenen* entstehen aber weiterhin stillschweigend beim
-  ersten `assign` — nirgends steht, welche ein Workflow verwendet, und es gibt keine Startwerte oder
-  Typen. Nebenwirkung: ein Tippfehler verhält sich je nach Weg unterschiedlich — `{var.tippfehler}` wird
-  stumm zu einem leeren String, derselbe Name in einem Ausdruck bricht mit einem Fehler ab. Eine
-  Deklarationsliste würde beides prüfbar machen und dem Eigenschaften-Panel erlauben, Variablennamen zur
-  Auswahl anzubieten statt sie tippen zu lassen.
 - **Framework-Vorlage nach Vorbild des UiPath REFramework**: Die Kernschleife gibt es bereits —
   `_run_queue_driven` ist das "Process Transaction"-Muster, mit Retry samt Backoff, Status je Item und
   Job-Logs. Was fehlt, ist der Rahmen darum herum, den man heute in jedem Projekt neu baut:

@@ -114,12 +114,30 @@ class DesktopBackend:
             raise TimeoutError(f"Element still present after {timeout}s: {selector}")
         self._resolve(timeout=timeout, **selector)
 
-    def click(self, timeout: int = 10, double: bool = False, **selector: Any) -> None:
+    def click(self, timeout: int = 10, double: bool = False, button: str = "left", **selector: Any) -> None:
         control = self._resolve(timeout=timeout, **selector)
         if double:
-            control.double_click_input()
+            control.double_click_input(button=button)
         else:
-            control.click_input()
+            control.click_input(button=button)
+
+    def drag(self, to_x: int, to_y: int, timeout: int = 10, button: str = "left", **selector: Any) -> None:
+        """Presses `button` on the resolved element, moves to the absolute
+        screen point (to_x, to_y) and releases - e.g. reordering a list by
+        dragging a row, or a drag-and-drop upload target. The destination is a
+        screen point rather than a second selector: a drop point often has no
+        distinct element of its own (empty list space, a gap between rows)."""
+        control = self._resolve(timeout=timeout, **selector)
+        control.drag_mouse_input(dst=(to_x, to_y), button=button)
+
+    def scroll(self, amount: int = -3, timeout: int = 10, **selector: Any) -> None:
+        """Spins the mouse wheel over the resolved element's centre. `amount`
+        follows the Windows convention: positive scrolls up, negative down."""
+        from pywinauto.mouse import scroll as mouse_scroll
+
+        control = self._resolve(timeout=timeout, **selector)
+        point = control.rectangle().mid_point()
+        mouse_scroll(coords=(point.x, point.y), wheel_dist=amount)
 
     def type(self, text: str, timeout: int = 10, **selector: Any) -> None:
         control = self._resolve(timeout=timeout, **selector)

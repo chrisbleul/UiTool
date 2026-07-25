@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from uiflow.orchestrator import db
@@ -20,6 +22,25 @@ def test_create_and_claim_job():
 
     # a second worker racing for the same job must not also claim it
     assert db.claim_next_job("worker-2") is None
+
+
+def test_create_job_stores_and_returns_sub_workflows_snapshot():
+    sub = {"name": "teilprozess", "backend": "web", "steps": [{"action": "navigate", "url": "sub"}]}
+    job_id = db.create_job(
+        "demo", {"name": "demo", "backend": "web", "steps": []}, sub_workflows={"teilprozess": sub}
+    )
+
+    job = db.get_job(job_id)
+
+    assert json.loads(job["sub_workflows_json"]) == {"teilprozess": sub}
+
+
+def test_create_job_defaults_sub_workflows_to_empty_dict():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+
+    job = db.get_job(job_id)
+
+    assert json.loads(job["sub_workflows_json"]) == {}
 
 
 def test_finish_job_sets_status_and_timestamp():
@@ -424,6 +445,42 @@ def test_schedule_is_not_due_right_after_being_marked_ran():
     }
 
     assert _schedule_is_due(schedule) is False
+
+
+def test_run_scheduler_loop_snapshots_referenced_sub_workflows(monkeypatch, tmp_path):
+    import threading
+
+    from uiflow.models import Step, Workflow
+    from uiflow.orchestrator import worker
+
+    workflows_dir = tmp_path / "workflows"
+    workflows_dir.mkdir()
+    monkeypatch.setattr("uiflow.models.WORKFLOWS_DIR", workflows_dir)
+    Workflow(name="teilprozess", backend="web", steps=[Step("navigate", {"url": "sub"})]).save(
+        workflows_dir / "teilprozess.yaml"
+    )
+
+    schedule_id = db.create_schedule(
+        "nightly",
+        "* * * * *",
+        {"name": "demo", "backend": "web", "steps": [{"action": "run_workflow", "workflow": "teilprozess"}]},
+    )
+    with db.connect() as conn:
+        conn.execute("UPDATE schedules SET created_at=? WHERE id=?", ("2000-01-01T00:00:00+00:00", schedule_id))
+
+    stop_event = threading.Event()
+    original_mark_ran = db.mark_schedule_ran
+
+    def mark_ran_and_stop(sid):
+        original_mark_ran(sid)
+        stop_event.set()
+
+    monkeypatch.setattr(db, "mark_schedule_ran", mark_ran_and_stop)
+
+    worker.run_scheduler_loop(poll_interval=0, stop_event=stop_event)
+
+    [job] = db.list_jobs()
+    assert json.loads(job["sub_workflows_json"])["teilprozess"]["steps"] == [{"action": "navigate", "url": "sub"}]
 
 
 def test_run_scheduler_loop_enqueues_a_job_for_a_due_schedule(monkeypatch):
