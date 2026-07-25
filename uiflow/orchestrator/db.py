@@ -432,10 +432,20 @@ def retry_delay_seconds(retry_count: int) -> float:
 
 
 def complete_queue_item(
-    item_id: int, success: bool, output: dict[str, Any] | None = None, error_message: str | None = None
+    item_id: int,
+    success: bool,
+    output: dict[str, Any] | None = None,
+    error_message: str | None = None,
+    permanent: bool = False,
 ) -> str:
     """Marks an item done, returning its resulting status ('success', 'new' if
-    it will be retried, or 'failed' once the retries are used up)."""
+    it will be retried, or 'failed' once the retries are used up).
+
+    `permanent=True` (a business error - see engine.py's BusinessError/`fail`
+    action) marks the item 'failed' immediately: no retry consumed, no backoff
+    scheduled. A failure that would be the identical failure on a second
+    attempt (an invalid invoice doesn't become valid by retrying) must not eat
+    into `max_retries` the way a transient/technical one should."""
     with connect() as conn:
         if success:
             conn.execute(
@@ -443,6 +453,13 @@ def complete_queue_item(
                 (json.dumps(output or {}), _now(), item_id),
             )
             return "success"
+        if permanent:
+            conn.execute(
+                "UPDATE queue_items SET status='failed', error_message=?, "
+                "locked_by=NULL, locked_at=NULL, retry_after=NULL, finished_at=? WHERE id=?",
+                (error_message, _now(), item_id),
+            )
+            return "failed"
         row = conn.execute(
             "SELECT retry_count, max_retries FROM queue_items WHERE id=?", (item_id,)
         ).fetchone()

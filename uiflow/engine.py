@@ -84,6 +84,17 @@ class WorkflowCancelled(RuntimeError):
         self.index = index
 
 
+class BusinessError(RuntimeError):
+    """Raised by a `fail` step with type: business - signals that this failure
+    is final and must never be retried (an invalid invoice is still invalid on
+    a second attempt), as opposed to a technical error (a timeout, a crashed
+    app), which a queue-driven job's normal retry-with-backoff should keep
+    retrying. Deliberately not wrapped in StepError like other step failures:
+    it needs to propagate distinctly through orchestrator/worker.py's
+    _run_queue_driven so an item can be marked failed immediately - without
+    consuming a retry - instead of being treated like any other exception."""
+
+
 class WorkflowEngine:
     """Runs a Workflow by dispatching each Step to a same-named method on the
     backend - except a handful of action names the engine handles itself
@@ -279,6 +290,8 @@ class WorkflowEngine:
             self._run_read_pdf(step, index)
         elif step.action == "ocr_image":
             self._run_ocr_image(step, index)
+        elif step.action == "fail":
+            self._run_fail(step, index)
         else:
             self._run_backend_step(step, index)
 
@@ -370,7 +383,7 @@ class WorkflowEngine:
             self._run_steps(try_body, on_breakpoint, should_stop, f"{path}.steps")
         except WorkflowCancelled:
             raise  # a user-requested stop must propagate, not be swallowed as a "handled" error
-        except (StepError, ValueError) as exc:
+        except (StepError, ValueError, BusinessError) as exc:
             message = str(exc)
             self._log("[%d] try: caught error -> %s", index, message)
             if error_var:
@@ -498,6 +511,18 @@ class WorkflowEngine:
             new_value = int(new_value)
         self._log("[%d] increment %s -> %s", index, name, new_value)
         self.variables[name] = new_value
+
+    def _run_fail(self, step: Step, index: int) -> None:
+        message = substitute_variables(step.params.get("message", ""), self.variables)
+        error_type = step.params.get("type", "technical")
+        if error_type not in ("business", "technical"):
+            raise StepError(
+                index, step, ValueError(f"Unknown fail type '{error_type}', expected 'business' or 'technical'")
+            )
+        self._log("[%d] fail (%s): %s", index, error_type, message)
+        if error_type == "business":
+            raise BusinessError(message)
+        raise StepError(index, step, RuntimeError(message))
 
     def _run_read_excel(self, step: Step, index: int) -> None:
         path = step.params.get("path")

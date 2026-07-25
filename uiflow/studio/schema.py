@@ -60,6 +60,16 @@ _CONTROL_FLOW_AND_VARIABLES: dict[str, list[dict]] = {
         {"name": "catch", "label": "Bei Fehler", "type": "steps", "required": False},
         {"name": "error_var", "label": "Fehlermeldung speichern als (optional)", "type": "variable", "required": False},
     ],
+    "fail": [
+        {"name": "message", "label": "Meldung", "type": "text", "required": True},
+        {
+            "name": "type",
+            "label": "Art (fachlich wird nie wiederholt, technisch wie gewohnt)",
+            "type": "select",
+            "options": ["technical", "business"],
+            "required": False,
+        },
+    ],
     "run_workflow": [
         {"name": "workflow", "label": "Workflow", "type": "workflow", "required": True},
         {
@@ -394,6 +404,13 @@ ACTION_META: dict[str, dict] = {
         "description": "Fängt Fehler der enthaltenen Schritte ab und behandelt sie.",
         "keywords": ["fehler", "catch", "exception", "absichern"],
         "primary": ["error_var"],
+    },
+    "fail": {
+        "label": "Fehler auslösen",
+        "category": "Ablaufsteuerung",
+        "description": "Bricht mit einer Meldung ab - fachlich wird nie wiederholt, technisch wie ein normaler Fehler.",
+        "keywords": ["fehler", "abbrechen", "fachlich", "technisch", "business", "invalid"],
+        "primary": ["message"],
     },
     "run_workflow": {
         "label": "Unterprozess ausführen",

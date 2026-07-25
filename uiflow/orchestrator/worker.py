@@ -29,7 +29,7 @@ from datetime import datetime
 from typing import Any
 
 from . import db
-from ..engine import StepError, WorkflowCancelled, WorkflowEngine
+from ..engine import BusinessError, StepError, WorkflowCancelled, WorkflowEngine
 from ..models import Workflow, resolve_sub_workflows
 
 logger = logging.getLogger("uiflow")
@@ -213,6 +213,12 @@ def _run_queue_driven(
             db.release_queue_item(item["id"])
             logger.info("[item %d] released after stop request", item["id"])
             return len(attempted), failed
+        except BusinessError as exc:
+            # A deliberate `fail type: business` - never retried, since it
+            # would be the identical failure again (see db.complete_queue_item).
+            db.complete_queue_item(item["id"], False, error_message=str(exc), permanent=True)
+            failed += 1
+            logger.error("[item %d] failed permanently (business error): %s", item["id"], exc)
         except Exception as exc:  # noqa: BLE001 - one bad item must not abort the whole queue
             status = db.complete_queue_item(item["id"], False, error_message=str(exc))
             if status == "failed":

@@ -130,6 +130,21 @@ def test_queue_item_retries_before_failing(no_retry_backoff):
     assert after_second_failure["status"] == "failed"  # retry_count(2) > max_retries(1)
 
 
+def test_complete_queue_item_permanent_fails_immediately_without_a_retry(no_retry_backoff):
+    queue_id = db.create_queue("invoices")
+    db.add_queue_items(queue_id, [{"payload": {"n": 1}, "max_retries": 3}])
+    item = db.claim_next_queue_item(queue_id, "job-1")
+
+    status = db.complete_queue_item(item["id"], False, error_message="ungültig", permanent=True)
+
+    assert status == "failed"
+    [stored] = db.list_queue_items(queue_id)
+    assert stored["status"] == "failed"
+    assert stored["retry_count"] == 0  # no retry was consumed
+    assert stored["error_message"] == "ungültig"
+    assert db.claim_next_queue_item(queue_id, "job-2") is None  # not reclaimable
+
+
 def test_failed_item_is_not_immediately_reclaimable():
     queue_id = db.create_queue("invoices")
     db.add_queue_items(queue_id, [{"payload": {"n": 1}, "max_retries": 3}])
@@ -288,6 +303,37 @@ def test_queue_job_reports_error_when_an_item_fails_permanently(monkeypatch):
     assert "1 of 2" in job["error_message"]
     by_status = {i["status"] for i in db.list_queue_items(queue_id)}
     assert by_status == {"success", "failed"}  # the good item was still processed
+
+
+def test_business_error_marks_an_item_failed_immediately_without_consuming_a_retry():
+    from uiflow.orchestrator import worker
+
+    queue_id = db.create_queue("invoices")
+    db.add_queue_items(queue_id, [{"payload": {"betrag": -5}, "max_retries": 3}])
+    job_id = db.create_job(
+        "invoices",
+        {
+            "name": "invoices",
+            "backend": "web",
+            "steps": [
+                {
+                    "action": "if",
+                    "condition": "item['betrag'] < 0",
+                    "then": [{"action": "fail", "message": "Ungültiger Betrag", "type": "business"}],
+                }
+            ],
+        },
+        queue_name="invoices",
+    )
+
+    worker._run_job(db.claim_next_job("test-worker"))
+
+    job = db.get_job(job_id)
+    assert job["status"] == "error"
+    [item] = db.list_queue_items(queue_id)
+    assert item["status"] == "failed"
+    assert item["retry_count"] == 0  # a business error must not consume a retry
+    assert "Ungültiger Betrag" in item["error_message"]
 
 
 def test_queue_job_reports_success_when_a_retry_eventually_succeeds(monkeypatch, no_retry_backoff):

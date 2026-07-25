@@ -348,6 +348,56 @@ bei `for_each` also den kompletten Schleifendurchlauf, nicht nur das zuletzt feh
 (dafür bleibt weiterhin das eigene, unabhängige `max_retries` der Queue-Items zuständig, siehe
 "Orchestrator" unten).
 
+#### Fachlicher vs. technischer Fehler (`fail`)
+
+`complete_queue_item` (siehe "Orchestrator" unten) behandelte bisher jeden Fehler eines Queue-Items
+gleich und versuchte ihn bis `max_retries` erneut — eine ungültige Rechnung wurde dadurch mehrfach
+ungültig verarbeitet, obwohl schon der erste Versuch abschließend war. `fail` löst einen Fehler
+ausdrücklich als einen von zwei Typen aus:
+
+```yaml
+steps:
+  - action: fail
+    message: "Rechnung {item.rechnungsnummer}: Betrag außerhalb des zulässigen Bereichs"
+    type: business       # wird bei einem Queue-Item NIE wiederholt
+
+  - action: fail
+    message: "Zielseite nicht erreichbar"
+    type: technical       # Standard - verhält sich wie jeder andere Step-Fehler
+```
+
+`type: business` markiert das Queue-Item sofort als `failed`, ohne einen Versuch von `max_retries` zu
+verbrauchen und ohne Backoff-Wartezeit — genau richtig für einen Fehler, der beim nächsten Versuch
+identisch wäre. `type: technical` (auch der Standard, wenn `type` weggelassen wird) verhält sich wie
+ein gewöhnlicher Step-Fehler: bei einem Queue-Item zählt er normal gegen `max_retries`. Ein `try` fängt
+beide Arten gleichermaßen ab (unverändert gegenüber jedem anderen Fehler); `on_error` an genau diesem
+`fail`-Step dagegen nicht — "wiederholen" oder "fortsetzen" an einem bewusst ausgelösten Fehler
+anzubringen wäre widersprüchlich.
+
+#### REFramework-Vorlage
+
+Ein Vorbild ist UiPaths REFramework: Initialisierung, Transaktion holen, Transaktion verarbeiten,
+Abschluss, mit fachlicher/technischer Fehlerunterscheidung. Drei der vier Bausteine gibt es hier
+bereits, aus vorhandenen Teilen zusammengesetzt statt als zweite Engine:
+
+- **"Transaktion holen"** übernimmt der Orchestrator selbst (`claim_next_queue_item`) — kein
+  Workflow-Schritt dafür nötig.
+- **Aufräumen zwischen Versuchen** passiert automatisch: ein Queue-Item bekommt bei jedem Versuch
+  (erster Versuch wie Retry gleichermaßen) eine frische Backend-Instanz — `_run_workflow_once` öffnet
+  sie vor dem Lauf und schließt sie danach, ganz gleich ob der Lauf erfolgreich war, fehlgeschlagen ist
+  oder gerade dabei fehlgeschlagen ist. Der nächste Versuch startet also nie auf einem vom vorigen
+  Versuch kaputt hinterlassenen Bildschirmzustand.
+- **Konfiguration statt Werte in den Schritten**: dafür gibt es bereits **Globale Variablen** (Basis-URL,
+  Postfach, Schwellwerte — installationsweit) und **Deklarierte Workflow-Variablen** (Startwerte, die zu
+  genau diesem Workflow gehören) — siehe beide Abschnitte unten.
+- **Fachlich vs. technisch**: siehe `fail` oben.
+
+`workflows/beispiel_reframework.yaml` zeigt das komponiert an einem Rechnungs-Beispiel: Anmeldung,
+fachliche Prüfung *vor* jeder Automatisierung (schlägt sie fehl, startet die eigentliche Automatisierung
+gar nicht erst), die Automatisierung selbst in `try`/`catch` (nimmt bei einem Fehler einen Screenshot auf
+und löst ihn danach ausdrücklich erneut als `type: technical` aus, damit die Queue ihn trotz `try`/`catch`
+weiterhin als Fehlversuch sieht und normal wiederholt).
+
 #### Unterprozesse (`run_workflow`)
 
 `run_workflow` führt eine andere Workflow-Datei als Baustein aus — für Schrittfolgen, die in mehreren
@@ -650,25 +700,12 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
 - **Echtes Multi-User-/Rechte-System**: das optionale Login (`UIFLOW_STUDIO_PASSWORD`) ist ein
   einzelnes geteiltes Passwort ohne einzelne Konten, Rollen oder Berechtigungen — bewusst minimal
   gehalten, kein Ersatz für echtes RBAC.
-- **Framework-Vorlage nach Vorbild des UiPath REFramework**: Die Kernschleife gibt es bereits —
-  `_run_queue_driven` ist das "Process Transaction"-Muster, mit Retry samt Backoff, Status je Item und
-  Job-Logs. Was fehlt, ist der Rahmen darum herum, den man heute in jedem Projekt neu baut:
-  - **Zustände**: Initialisierung (Konfiguration lesen, Anwendungen öffnen), Transaktion holen,
-    Transaktion verarbeiten, Abschluss (Anwendungen schließen, Abschlussbericht) als vorgegebenes
-    Gerüst statt als handgebauter Ablauf.
-  - **Konfiguration**: eine Einstellungsdatei bzw. ein Konfigurationsblatt, aus dem der Prozess seine
-    Parameter zieht, statt sie in die Schritte zu schreiben.
-  - **Fachlicher vs. technischer Fehler**: der wichtigste Punkt, weil er die bestehende Retry-Logik
-    betrifft. `complete_queue_item` behandelt heute *jeden* Fehler gleich und versucht es bis
-    `max_retries` erneut. Eine ungültige Rechnung wird dadurch dreimal ungültig verarbeitet, obwohl
-    schon der erste Versuch abschließend war — ein fachlicher Fehler darf nie wiederholt werden, nur
-    ein technischer. Dafür müsste die Engine beide Arten unterscheiden können und die Queue die
-    Unterscheidung mitführen.
-  - **Aufräumen zwischen Fehlversuchen**: Zielanwendung nach einem Fehler schließen und neu öffnen,
-    statt den nächsten Versuch auf einem kaputten Bildschirmzustand starten zu lassen.
-
-  Sinnvollerweise als Vorlage, die aus den vorhandenen Bausteinen erzeugt wird — keine zweite Engine
-  neben der bestehenden.
+- **REFramework-Vorlage im Studio erzeugen**: Die Bausteine (fachlich/technischer Fehler via `fail`,
+  Konfiguration via globale/deklarierte Variablen, "Transaktion holen" via Orchestrator, Aufräumen
+  zwischen Versuchen via frischer Backend-Instanz pro Item) gibt es inzwischen alle — siehe
+  "REFramework-Vorlage" oben und `workflows/beispiel_reframework.yaml`. Was fehlt, ist ein Komfort im
+  Studio selbst: ein Button "Neu aus REFramework-Vorlage" (analog zu "+ Neuer Workflow"), der einen neuen
+  Workflow direkt mit diesem Gerüst vorausfüllt, statt dass man die Beispieldatei von Hand kopiert.
 - **Flowchart-Ansicht** (frei platzierte Knoten mit Verbindungspfeilen, wie UiPaths Flowchart oder
   n8n). Der Builder ist ein Sequenz-Designer — er bildet den Ablauf als verschachtelte Kartenliste ab,
   passend zum sequenziellen YAML-Format. Eine Flowchart-Ansicht bräuchte ein eigenes Format mit Knoten,

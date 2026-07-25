@@ -2,7 +2,7 @@ import logging
 
 import pytest
 
-from uiflow.engine import StepError, WorkflowCancelled, WorkflowEngine, substitute_variables
+from uiflow.engine import BusinessError, StepError, WorkflowCancelled, WorkflowEngine, substitute_variables
 from uiflow.models import Step, Workflow
 
 
@@ -1584,3 +1584,134 @@ def test_element_reference_uses_the_first_candidate_when_backend_cannot_check_ex
     WorkflowEngine(backend).run(workflow)
 
     assert backend.calls == [("click", "#alt-1")]
+
+
+# --- fail (business vs. technical errors) ------------------------------------
+
+
+def test_fail_with_type_business_raises_business_error_not_step_error():
+    workflow = Workflow(
+        name="t", backend="web", steps=[Step("fail", {"message": "Ungültige Rechnung", "type": "business"})]
+    )
+
+    with pytest.raises(BusinessError) as excinfo:
+        WorkflowEngine(RecordingBackend()).run(workflow)
+
+    assert "Ungültige Rechnung" in str(excinfo.value)
+
+
+def test_fail_with_type_technical_raises_a_normal_step_error():
+    workflow = Workflow(
+        name="t", backend="web", steps=[Step("fail", {"message": "Timeout", "type": "technical"})]
+    )
+
+    with pytest.raises(StepError) as excinfo:
+        WorkflowEngine(RecordingBackend()).run(workflow)
+
+    assert "Timeout" in str(excinfo.value)
+
+
+def test_fail_defaults_to_technical_when_type_is_omitted():
+    workflow = Workflow(name="t", backend="web", steps=[Step("fail", {"message": "x"})])
+
+    with pytest.raises(StepError):
+        WorkflowEngine(RecordingBackend()).run(workflow)
+
+
+def test_fail_rejects_an_unknown_type():
+    workflow = Workflow(name="t", backend="web", steps=[Step("fail", {"message": "x", "type": "oops"})])
+
+    with pytest.raises(StepError):
+        WorkflowEngine(RecordingBackend()).run(workflow)
+
+
+def test_fail_message_substitutes_variables():
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[Step("fail", {"message": "Betrag {var.betrag} ungültig", "type": "business"})],
+    )
+
+    with pytest.raises(BusinessError) as excinfo:
+        WorkflowEngine(RecordingBackend()).run(workflow, variables={"betrag": -5})
+
+    assert "Betrag -5 ungültig" in str(excinfo.value)
+
+
+def test_try_catches_a_business_fail_like_any_other_error():
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[
+            Step(
+                "try",
+                {
+                    "steps": [{"action": "fail", "message": "ungültig", "type": "business"}],
+                    "catch": [{"action": "navigate", "url": "recovered"}],
+                    "error_var": "err",
+                },
+            )
+        ],
+    )
+    backend = RecordingBackend()
+    engine = WorkflowEngine(backend)
+
+    engine.run(workflow)
+
+    assert backend.calls == [("navigate", "recovered")]
+    assert "ungültig" in engine.variables["err"]
+
+
+def _load_shipped_workflow(name: str) -> Workflow:
+    """Loads a workflow shipped in the repo's own workflows/ directory - by
+    path relative to this test file, not the current working directory, so
+    the test doesn't depend on where pytest happens to be invoked from."""
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parent.parent
+    return Workflow.load(repo_root / "workflows" / name)
+
+
+def test_shipped_reframework_example_validates_business_rules_before_the_try_block():
+    workflow = _load_shipped_workflow("beispiel_reframework.yaml")
+    backend = RecordingBackend()
+
+    with pytest.raises(BusinessError):
+        WorkflowEngine(backend).run(
+            workflow,
+            variables={"item": {"betrag": -5, "rechnungsnummer": "R1"}},
+            global_variables={"basis_url": "https://erp.example.com"},
+        )
+
+    # the business check ran before the automation - the try block never started
+    assert backend.calls == [("navigate", "https://erp.example.com/anmelden")]
+
+
+def test_shipped_reframework_example_re_raises_a_technical_failure_after_the_catch_block():
+    class _FailingBackend:
+        def __init__(self):
+            self.calls = []
+
+        def navigate(self, url):
+            self.calls.append(("navigate", url))
+            if "rechnung" in url:
+                raise RuntimeError("Seite nicht erreichbar")
+
+        def screenshot(self, path):
+            self.calls.append(("screenshot", path))
+
+    workflow = _load_shipped_workflow("beispiel_reframework.yaml")
+    backend = _FailingBackend()
+
+    with pytest.raises(StepError) as excinfo:
+        WorkflowEngine(backend).run(
+            workflow,
+            variables={"item": {"betrag": 500, "rechnungsnummer": "R1"}},
+            global_variables={"basis_url": "https://erp.example.com"},
+        )
+
+    # the catch block ran (screenshot taken) before the error was re-raised as
+    # technical - a queue-driven job must still see this as a normal, retryable
+    # failure, not a silently swallowed one.
+    assert ("screenshot", "fehler_R1.png") in backend.calls
+    assert "Seite nicht erreichbar" in str(excinfo.value)
