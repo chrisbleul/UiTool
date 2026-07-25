@@ -88,11 +88,34 @@ def cmd_studio(args: argparse.Namespace) -> int:
 
 
 def cmd_worker(args: argparse.Namespace) -> int:
-    """Run a standalone worker that claims and executes queued jobs from the orchestrator DB."""
+    """Run a standalone worker that claims and executes queued jobs - either
+    directly against the local orchestrator.db (default), or, with
+    --remote-url, against a Studio server on a different machine over HTTP
+    (see orchestrator/remote_store.py) - a worker with no filesystem access to
+    that machine's orchestrator.db at all."""
     from .orchestrator.worker import run_worker_loop
 
-    print(f"uiflow worker '{args.worker_id or '(auto)'}' polling for jobs (Ctrl+C to stop)")
-    run_worker_loop(worker_id=args.worker_id, poll_interval=args.poll_interval)
+    store = None
+    if args.remote_url:
+        import getpass
+
+        from .orchestrator.remote_store import RemoteStore, RemoteStoreError
+
+        password = args.remote_password or getpass.getpass(f"Passwort für {args.remote_url}: ")
+        store = RemoteStore(args.remote_url)
+        try:
+            store.login(password, username=args.remote_username)
+        except RemoteStoreError as exc:
+            print(f"Anmeldung an {args.remote_url} fehlgeschlagen: {exc}")
+            return 1
+        print(f"uiflow worker '{args.worker_id or '(auto)'}' polling {args.remote_url} for jobs (Ctrl+C to stop)")
+    else:
+        print(f"uiflow worker '{args.worker_id or '(auto)'}' polling for jobs (Ctrl+C to stop)")
+
+    kwargs: dict = {"worker_id": args.worker_id, "poll_interval": args.poll_interval}
+    if store is not None:
+        kwargs["store"] = store
+    run_worker_loop(**kwargs)
     return 0
 
 
@@ -178,6 +201,18 @@ def build_parser() -> argparse.ArgumentParser:
     worker_p = sub.add_parser("worker", help="Run a standalone worker that executes queued orchestrator jobs")
     worker_p.add_argument("--worker-id", default=None, help="Identifier for this worker (default: auto-generated)")
     worker_p.add_argument("--poll-interval", type=float, default=1.0, help="Seconds between queue polls when idle")
+    worker_p.add_argument(
+        "--remote-url",
+        default=None,
+        help="Studio server to poll over HTTP instead of a local orchestrator.db "
+        "(e.g. http://studio-host:8787) - for a worker on a different machine",
+    )
+    worker_p.add_argument(
+        "--remote-username", default=None, help="Only needed if the server uses per-account login (RBAC)"
+    )
+    worker_p.add_argument(
+        "--remote-password", default=None, help="Prompted interactively if omitted (with --remote-url)"
+    )
     worker_p.set_defaults(func=cmd_worker)
 
     scheduler_p = sub.add_parser("scheduler", help="Run a standalone scheduler that enqueues jobs for due cron schedules")

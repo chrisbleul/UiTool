@@ -91,3 +91,98 @@ def test_build_parser_accepts_create_user_command():
     assert args.role == "operator"
     assert args.password == "pw"
     assert args.func is cli.cmd_create_user
+
+
+def test_build_parser_accepts_worker_remote_flags():
+    parser = cli.build_parser()
+
+    args = parser.parse_args(
+        [
+            "worker",
+            "--worker-id",
+            "robot-1",
+            "--remote-url",
+            "http://studio-host:8787",
+            "--remote-username",
+            "robot",
+            "--remote-password",
+            "pw",
+        ]
+    )
+
+    assert args.worker_id == "robot-1"
+    assert args.remote_url == "http://studio-host:8787"
+    assert args.remote_username == "robot"
+    assert args.remote_password == "pw"
+    assert args.func is cli.cmd_worker
+
+
+def _worker_args(worker_id="robot-1", poll_interval=1.0, remote_url=None, remote_username=None, remote_password=None):
+    return argparse.Namespace(
+        worker_id=worker_id,
+        poll_interval=poll_interval,
+        remote_url=remote_url,
+        remote_username=remote_username,
+        remote_password=remote_password,
+    )
+
+
+def test_cmd_worker_runs_locally_without_remote_url(monkeypatch):
+    calls = []
+    monkeypatch.setattr("uiflow.orchestrator.worker.run_worker_loop", lambda **kwargs: calls.append(kwargs))
+
+    code = cli.cmd_worker(_worker_args())
+
+    assert code == 0
+    assert calls == [{"worker_id": "robot-1", "poll_interval": 1.0}]
+
+
+def test_cmd_worker_logs_in_and_passes_a_remote_store_when_remote_url_is_given(monkeypatch):
+    login_calls = []
+    run_calls = []
+
+    def fake_login(self, password, username=None):
+        login_calls.append((password, username))
+
+    monkeypatch.setattr("uiflow.orchestrator.remote_store.RemoteStore.login", fake_login)
+    monkeypatch.setattr("uiflow.orchestrator.worker.run_worker_loop", lambda **kwargs: run_calls.append(kwargs))
+
+    code = cli.cmd_worker(
+        _worker_args(remote_url="http://studio-host:8787", remote_username="robot", remote_password="s3cret")
+    )
+
+    assert code == 0
+    assert login_calls == [("s3cret", "robot")]
+    assert len(run_calls) == 1
+    assert run_calls[0]["worker_id"] == "robot-1"
+    from uiflow.orchestrator.remote_store import RemoteStore
+
+    assert isinstance(run_calls[0]["store"], RemoteStore)
+
+
+def test_cmd_worker_prompts_for_a_password_when_remote_url_is_given_without_one(monkeypatch):
+    monkeypatch.setattr("uiflow.orchestrator.remote_store.RemoteStore.login", lambda self, password, username=None: None)
+    monkeypatch.setattr("uiflow.orchestrator.worker.run_worker_loop", lambda **kwargs: None)
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": "prompted-pw")
+
+    code = cli.cmd_worker(_worker_args(remote_url="http://studio-host:8787"))
+
+    assert code == 0
+
+
+def test_cmd_worker_aborts_when_remote_login_is_rejected(monkeypatch):
+    from uiflow.orchestrator.remote_store import RemoteStoreError
+
+    def fake_login(self, password, username=None):
+        raise RemoteStoreError("nope")
+
+    run_calls = []
+    monkeypatch.setattr("uiflow.orchestrator.remote_store.RemoteStore.login", fake_login)
+    monkeypatch.setattr("uiflow.orchestrator.worker.run_worker_loop", lambda **kwargs: run_calls.append(kwargs))
+
+    code = cli.cmd_worker(
+        _worker_args(remote_url="http://studio-host:8787", remote_username="robot", remote_password="wrong")
+    )
+
+    assert code == 1
+    assert run_calls == []

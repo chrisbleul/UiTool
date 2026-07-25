@@ -260,6 +260,153 @@ def test_api_run_snapshots_referenced_sub_workflows_into_the_job(client):
     assert detail["sub_workflows"]["teilprozess"]["steps"] == [{"action": "navigate", "url": "sub"}]
 
 
+def test_worker_claim_endpoint_claims_the_oldest_queued_job(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+
+    res = client.post("/api/worker/claim", json={"worker_id": "remote-1"})
+
+    assert res.status_code == 200
+    claimed = res.get_json()
+    assert claimed["id"] == job_id
+    assert claimed["status"] == "running"
+    assert claimed["worker_id"] == "remote-1"
+
+
+def test_worker_claim_endpoint_returns_null_when_nothing_queued(client):
+    res = client.post("/api/worker/claim", json={"worker_id": "remote-1"})
+
+    assert res.status_code == 200
+    assert res.get_json() is None
+
+
+def test_worker_add_log_endpoint_persists_a_log_line(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+
+    res = client.post(f"/api/worker/jobs/{job_id}/logs", json={"level": "INFO", "message": "hallo"})
+
+    assert res.status_code == 200
+    logs = client.get(f"/api/jobs/{job_id}/logs").get_json()
+    assert any(log["message"] == "hallo" for log in logs)
+
+
+def test_worker_job_control_endpoint_reports_stop_requested(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+
+    assert client.get(f"/api/worker/jobs/{job_id}/control").get_json() == {"stop_requested": False}
+
+    client.post(f"/api/run/{job_id}/stop")
+
+    assert client.get(f"/api/worker/jobs/{job_id}/control").get_json() == {"stop_requested": True}
+
+
+def test_worker_job_resume_clear_endpoint_consumes_the_resume_flag(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+    db.request_resume(job_id)
+
+    res = client.post(f"/api/worker/jobs/{job_id}/resume_clear")
+    assert res.get_json() == {"resumed": True}
+
+    # a second call finds nothing left to clear - the flag was consumed
+    res = client.post(f"/api/worker/jobs/{job_id}/resume_clear")
+    assert res.get_json() == {"resumed": False}
+
+
+def test_worker_job_pause_endpoint_stores_breakpoint_state(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+
+    res = client.post(
+        f"/api/worker/jobs/{job_id}/pause",
+        json={"index": 1, "action": "click", "variables": {"x": 1}, "path": "1"},
+    )
+
+    assert res.status_code == 200
+    controls = db.get_controls(job_id)
+    assert controls["paused_step_index"] == 1
+    assert controls["paused_step_action"] == "click"
+
+
+def test_worker_job_finish_endpoint_marks_the_job_done(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+
+    res = client.post(f"/api/worker/jobs/{job_id}/finish", json={"status": "error", "error_message": "boom"})
+
+    assert res.status_code == 200
+    detail = client.get(f"/api/jobs/{job_id}").get_json()
+    assert detail["status"] == "error"
+    assert detail["error_message"] == "boom"
+
+
+def test_worker_globals_endpoint_matches_the_studio_globals(client):
+    client.post("/api/globals", json={"name": "basis_url", "value": "https://intern"})
+
+    res = client.get("/api/worker/globals")
+
+    assert res.get_json() == {"basis_url": "https://intern"}
+
+
+def test_worker_queue_by_name_endpoint_returns_the_queue_or_null(client):
+    client.post("/api/queues", json={"name": "rechnungen"})
+
+    found = client.get("/api/worker/queues/by-name?name=rechnungen").get_json()
+    assert found["name"] == "rechnungen"
+
+    missing = client.get("/api/worker/queues/by-name?name=nope").get_json()
+    assert missing is None
+
+
+def test_worker_queue_claim_process_and_release_roundtrip(client):
+    queue_id = client.post("/api/queues", json={"name": "rechnungen"}).get_json()["id"]
+    client.post("/api/queues/rechnungen/items", json={"items": [{"payload": {"betrag": 42}}]})
+
+    item = client.post(f"/api/worker/queues/{queue_id}/claim", json={"locked_by": "job-1"}).get_json()
+    assert item["payload"] == '{"betrag": 42}'
+
+    # nothing else left to claim right now, and nothing awaiting a retry either
+    assert client.post(f"/api/worker/queues/{queue_id}/claim", json={"locked_by": "job-1"}).get_json() is None
+    assert client.get(f"/api/worker/queues/{queue_id}/next_retry_wait").get_json() == {"seconds": None}
+
+    res = client.post(f"/api/worker/queue_items/{item['id']}/complete", json={"success": True, "output": {}})
+    assert res.get_json() == {"status": "success"}
+
+
+def test_worker_queue_item_release_endpoint_hands_it_back_unprocessed(client):
+    queue_id = client.post("/api/queues", json={"name": "rechnungen"}).get_json()["id"]
+    client.post("/api/queues/rechnungen/items", json={"items": [{"payload": {}}]})
+    item = client.post(f"/api/worker/queues/{queue_id}/claim", json={"locked_by": "job-1"}).get_json()
+
+    res = client.post(f"/api/worker/queue_items/{item['id']}/release")
+
+    assert res.status_code == 200
+    items = client.get("/api/queues/rechnungen/items").get_json()
+    assert items[0]["status"] == "new"
+
+
+def test_worker_queue_item_complete_endpoint_marks_a_business_error_permanent(client):
+    queue_id = client.post("/api/queues", json={"name": "rechnungen"}).get_json()["id"]
+    client.post("/api/queues/rechnungen/items", json={"items": [{"payload": {}}]})
+    item = client.post(f"/api/worker/queues/{queue_id}/claim", json={"locked_by": "job-1"}).get_json()
+
+    res = client.post(
+        f"/api/worker/queue_items/{item['id']}/complete",
+        json={"success": False, "error_message": "ungueltig", "permanent": True},
+    )
+
+    assert res.get_json() == {"status": "failed"}
+    items = client.get("/api/queues/rechnungen/items").get_json()
+    assert items[0]["status"] == "failed"
+    assert items[0]["retry_count"] == 0  # a permanent failure must not consume a retry
+
+
+def test_worker_api_requires_at_least_operator_in_multiuser_mode(multiuser_app):
+    viewer = multiuser_app.test_client()
+    _login(viewer, "view1", "viewpass")
+    assert viewer.post("/api/worker/claim", json={"worker_id": "w"}).status_code == 403
+
+    operator = multiuser_app.test_client()
+    _login(operator, "op1", "oppass")
+    assert operator.post("/api/worker/claim", json={"worker_id": "w"}).status_code == 200
+
+
 def test_inspect_web_endpoint_reports_match_count(client, monkeypatch):
     monkeypatch.setattr(
         "uiflow.studio.picker.inspect_web_selector",

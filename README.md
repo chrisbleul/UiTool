@@ -180,9 +180,27 @@ auch von einem eigenständigen Worker-Prozess bedient werden:
 python -m uiflow.cli worker --worker-id robot-1
 ```
 
-Mehrere Worker (auf derselben oder später verteilt auf anderen Maschinen) können parallel gegen
-dieselbe Queue arbeiten — `claim_next_job`/`claim_next_queue_item` beanspruchen Zeilen atomar
+Mehrere Worker (auf derselben oder verteilt auf anderen Maschinen) können parallel gegen dieselbe
+Queue arbeiten — `claim_next_job`/`claim_next_queue_item` beanspruchen Zeilen atomar
 (`UPDATE ... WHERE status='queued'`), sodass zwei Worker nie denselben Job doppelt ausführen.
+
+**Remote-Worker (andere Maschine, kein Datei-Zugriff auf `orchestrator.db`)**: mit `--remote-url`
+spricht `uiflow worker` die Job-Queue über HTTP an (`/api/worker/*` auf dem Studio-Server) statt
+`orchestrator.db` direkt zu öffnen — für einen Worker, der auf einer anderen Maschine läuft und die
+Datei gar nicht sehen kann (z.B. kein gemeinsames Netzlaufwerk):
+
+```powershell
+python -m uiflow.cli worker --remote-url http://studio-host:8787 --worker-id robot-1
+```
+
+Meldet sich genauso an wie jeder andere Client (siehe Login oben): ohne `--remote-username` mit dem
+gemeinsamen `UIFLOW_STUDIO_PASSWORD`, mit `--remote-username` über ein per `uiflow create-user
+robot1 --role operator` angelegtes Konto — kein separater API-Key-Mechanismus, sondern dieselbe
+Session/Rollenprüfung wie im Browser. Ohne `--remote-password` wird das Passwort interaktiv abgefragt.
+Claiming, Logging, Haltepunkte, Queue-Items und Job-Abschluss laufen dabei über dieselben Endpunkte,
+die auch ein lokaler Worker letztlich anspricht (`orchestrator/worker.py` kennt intern nur noch einen
+austauschbaren `store` — lokal `orchestrator/db.py` direkt, remote `orchestrator/remote_store.py` über
+HTTP; die Ausführungslogik selbst ist in beiden Fällen identisch).
 
 **Jobs sind jetzt durable**: Status, Zeitstempel und die komplette Log-Historie überleben einen
 Neustart des Studio-Prozesses und sind über die API abrufbar, nicht nur live per SSE:
@@ -731,10 +749,15 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
 
 ## Was fehlt bis zu einem "echten" Tool (Roadmap)
 
-- **Orchestrator über eine Maschine hinaus**: `uiflow worker`/`uiflow scheduler` können heute schon
-  mehrfach gegen dieselbe `orchestrator.db` laufen, aber nur, wenn alle Prozesse Zugriff auf dieselbe
-  Datei haben (z.B. Netzlaufwerk). Für echte Remote-Worker fehlt noch ein Netzwerk-Layer (Worker
-  registrieren sich per HTTP statt direktem DB-Zugriff).
+- ~~**Orchestrator über eine Maschine hinaus**~~ — erledigt: `uiflow worker --remote-url ...` spricht
+  die Job-Queue über HTTP an (`/api/worker/*`, siehe "Remote-Worker" oben), statt `orchestrator.db`
+  direkt zu öffnen — ein Worker auf einer anderen Maschine ohne jeden Datei-Zugriff auf diese Datenbank
+  funktioniert damit genauso wie einer auf derselben Maschine. `uiflow scheduler` bleibt bewusst
+  serverseitig (er *erzeugt* nur Jobs in derselben Queue, die dann ganz normal von jedem Worker —
+  lokal oder remote — abgeholt werden), ebenso wie Studios eingebetteter Scheduler-Thread. Was bewusst
+  fehlt: kein automatisches Requeuing, wenn ein Remote-Worker mitten in einem Job abstürzt (der Job
+  bleibt `running`, bis er manuell gestoppt oder von Hand erneut eingereiht wird) — dafür bräuchte es
+  ein Heartbeat/Lease-Verfahren, das es heute weder für lokale noch für Remote-Worker gibt.
 - ~~**Echtes Multi-User-/Rechte-System**~~ — erledigt: `uiflow create-user` legt einzelne Konten mit
   Rollen (`viewer`/`operator`/`admin`) an, siehe "Benutzer & Rollen (RBAC)" oben. Was bewusst fehlt: keine
   Gruppen/Teams, keine fein granularen Rechte pro Workflow oder Queue (nur die drei globalen Rollen), kein

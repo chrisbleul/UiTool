@@ -39,6 +39,11 @@ def _required_role(method: str, path: str) -> str:
     ("viewer")."""
     if path.startswith("/api/users") or path.startswith("/api/credentials") or path.startswith("/api/globals"):
         return "admin"
+    if path.startswith("/api/worker/"):
+        # A remote worker executes workflows and reads global variables via
+        # this namespace (see remote_store.RemoteStore) - operational access,
+        # not a plain read, regardless of HTTP method.
+        return "operator"
     if method == "GET":
         return "viewer"
     return "operator"
@@ -285,6 +290,86 @@ def create_app() -> Flask:
         if db.get_job(job_id) is None:
             return jsonify({"error": "not found"}), 404
         return jsonify(db.get_logs(job_id))
+
+    # --- remote worker API (see orchestrator/remote_store.py) ---------------
+    #
+    # Mirrors, one HTTP call each, the exact subset of orchestrator/db.py that
+    # orchestrator/worker.py calls on its `store` parameter - so a worker
+    # process with no filesystem access to orchestrator.db (a different
+    # machine than this Studio server) can still claim jobs/queue items, log,
+    # report breakpoints, and finish work, via RemoteStore instead of direct
+    # imports of this module. Requires "operator" (see _required_role); a
+    # remote worker authenticates the same way any other client does - see
+    # RemoteStore.login - by logging in first and keeping the session cookie.
+
+    @app.post("/api/worker/claim")
+    def worker_claim_job() -> Response:
+        data = request.get_json(force=True)
+        return jsonify(db.claim_next_job(data["worker_id"]))
+
+    @app.post("/api/worker/jobs/<job_id>/logs")
+    def worker_add_log(job_id: str) -> Response:
+        data = request.get_json(force=True)
+        db.add_log(job_id, data["level"], data["message"])
+        return jsonify({"ok": True})
+
+    @app.get("/api/worker/jobs/<job_id>/control")
+    def worker_job_control(job_id: str) -> Response:
+        return jsonify({"stop_requested": db.is_stop_requested(job_id)})
+
+    @app.post("/api/worker/jobs/<job_id>/resume_clear")
+    def worker_job_resume_clear(job_id: str) -> Response:
+        return jsonify({"resumed": db.wait_and_clear_resume(job_id)})
+
+    @app.post("/api/worker/jobs/<job_id>/pause")
+    def worker_job_pause(job_id: str) -> Response:
+        data = request.get_json(force=True)
+        db.set_paused(job_id, data.get("index"), data.get("action"), data.get("variables"), data.get("path"))
+        return jsonify({"ok": True})
+
+    @app.post("/api/worker/jobs/<job_id>/finish")
+    def worker_job_finish(job_id: str) -> Response:
+        data = request.get_json(force=True)
+        db.finish_job(job_id, data["status"], data.get("error_message"))
+        return jsonify({"ok": True})
+
+    @app.get("/api/worker/globals")
+    def worker_globals() -> Response:
+        return jsonify(db.get_global_variables())
+
+    @app.get("/api/worker/queues/by-name")
+    def worker_get_queue_by_name() -> Response:
+        # null (not 404) when missing, like /api/worker/claim's "no job queued" -
+        # this mirrors db.get_queue_by_name's own contract exactly, since
+        # worker.py's _run_queue_driven only checks `queue is None`, never a
+        # status code.
+        return jsonify(db.get_queue_by_name(request.args.get("name", "")))
+
+    @app.post("/api/worker/queues/<int:queue_id>/claim")
+    def worker_claim_queue_item(queue_id: int) -> Response:
+        data = request.get_json(force=True)
+        return jsonify(db.claim_next_queue_item(queue_id, data["locked_by"]))
+
+    @app.get("/api/worker/queues/<int:queue_id>/next_retry_wait")
+    def worker_next_retry_wait(queue_id: int) -> Response:
+        return jsonify({"seconds": db.seconds_until_next_retry(queue_id)})
+
+    @app.post("/api/worker/queue_items/<int:item_id>/complete")
+    def worker_complete_queue_item(item_id: int) -> Response:
+        data = request.get_json(force=True)
+        status = db.complete_queue_item(
+            item_id,
+            data["success"],
+            output=data.get("output"),
+            error_message=data.get("error_message"),
+            permanent=data.get("permanent", False),
+        )
+        return jsonify({"status": status})
+
+    @app.post("/api/worker/queue_items/<int:item_id>/release")
+    def worker_release_queue_item(item_id: int) -> Response:
+        db.release_queue_item(item_id)
+        return jsonify({"ok": True})
 
     @app.post("/api/queues")
     def create_queue() -> Response:
