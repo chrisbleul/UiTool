@@ -27,11 +27,13 @@ uiflow/
     db.py                Persistenter Job-/Log-/Queue-/Credential-Namen-/Zeitplan-Store (SQLite, WAL-Modus)
     worker.py             Job-Ausführung (run_worker_loop) + Cron-Zeitpläne (run_scheduler_loop)
   studio/
-    schema.py           Beschreibt pro Backend, welche Actions es gibt und welche Formularfelder sie brauchen
-    app.py              Flask-App: REST-API (Schema/Workflows/Jobs/Queues/Credentials/Schedules/Pick)
-                        + SSE-Log-Streaming + optionales Login
+    schema.py           Beschreibt pro Backend, welche Actions es gibt und welche Formularfelder sie
+                        brauchen, plus die Katalog-Metadaten (Label/Kategorie/Beschreibung/Synonyme)
+    app.py              Flask-App: REST-API (Schema/Aktivitäten/Workflows/Jobs/Queues/Credentials/
+                        Schedules/Pick) + SSE-Log-Streaming + optionales Login
     picker.py            "Element wählen": Klick-zu-Selektor-Erkennung für Web (Playwright) und Desktop (pynput + UI Automation)
-    static/              Low-Code-Builder-Frontend (HTML/CSS/Vanilla JS, kein Build-Step)
+    static/              Builder-Frontend (HTML/CSS/Vanilla JS, kein Build-Step); static/vendor/
+                         enthält SortableJS (MIT) für das Drag & Drop des Sequenz-Designers
 workflows/             Beispiel-Workflows (werden auch vom Studio gelesen/geschrieben)
 orchestrator.db         SQLite-Datei (wird beim ersten Start angelegt, nicht eingecheckt)
 tests/                 Unit-Tests für Modell + Engine + Orchestrator-DB + Studio-API (Backends/externe
@@ -74,7 +76,9 @@ python -m uiflow.cli inspect-desktop "Editor" --depth 3
 
 ## Low-Code Builder (uiflow studio)
 
-Lokale Web-App zum Bauen von Workflows per Formular statt YAML von Hand:
+Lokale Web-App zum Bauen von Workflows statt YAML von Hand. Der Builder ist ein
+**Sequenz-Designer** im Stil von UiPath Studio: links ein durchsuchbarer Aktivitäten-Katalog,
+in der Mitte der Ablauf als Karten, rechts die Eigenschaften der ausgewählten Aktivität.
 
 ```powershell
 python -m uiflow.cli studio
@@ -82,8 +86,18 @@ python -m uiflow.cli studio
 
 Öffnet `http://127.0.0.1:8787` im Browser. Dort:
 - Workflow-Name + Backend (Web/Desktop) wählen
-- Schritte per "+ Schritt hinzufügen" ergänzen, Action aus Dropdown wählen, Parameter im Formular ausfüllen
-- Schritte per Drag & Drop (Griff "⠿" links) oder ↑/↓ umsortieren, per ✕ löschen
+- **Aktivitäten-Katalog** (links): alle Aktivitäten des gewählten Backends, nach Kategorie gruppiert
+  (Anwendung, UI-Interaktion, Warten, Ablaufsteuerung, Variablen, Dateien & Dokumente, Integration).
+  Das Suchfeld filtert über Name, Beschreibung und Synonyme — "schleife" findet `for_each`, "wenn"
+  findet `if`. Eine Aktivität wird per **Drag & Drop** in den Ablauf gezogen; ein Klick hängt sie
+  stattdessen ans Ende an (gleiche Wirkung, auch per Tastatur erreichbar).
+- **Drag & Drop über Container-Grenzen**: eine Karte lässt sich am Griff "⠿" an jede Position ziehen —
+  auch in einen `Dann`-Zweig hinein, aus einem Schleifenkörper heraus oder von einem `try` in ein
+  `catch`. Eine Container-Aktivität kann nicht in ihren eigenen Zweig gezogen werden.
+- **Eigenschaften-Panel** (rechts): zeigt die Parameter der ausgewählten Aktivität. Die Karten im
+  Ablauf bleiben dadurch kompakt (Name + wichtigster Parameter als Zusammenfassung), sodass auch ein
+  langer Workflow als Ganzes lesbar bleibt.
+- Karten per ✕ löschen
 - Der kleine Kreis links neben der Schritt-Nummer setzt/entfernt einen **Haltepunkt** auf diesem Schritt
   (rot = aktiv). Beim Ausführen pausiert der Workflow direkt davor; ein "Weiter"-Button erscheint im
   Log-Panel, um fortzufahren. Haltepunkte werden mit in die YAML gespeichert (`breakpoint: true`).
@@ -110,9 +124,10 @@ python -m uiflow.cli studio
     laufend mit einem roten Rahmen markiert (wie UiPaths "Auf Bildschirm anzeigen"), bevor geklickt wird.
 - **↶ Rückgängig** (oder Strg+Z) macht die letzte Änderung rückgängig — Schritt hinzugefügt/gelöscht/
   verschoben, Haltepunkt umgeschaltet, Feld bearbeitet, Backend gewechselt, Selektor übernommen.
-- **Anwendungs-Scope & Sequenz**: Ist der erste Schritt eines Desktop-Workflows `launch` oder `connect`,
-  wird er visuell als übergeordneter Scope dargestellt, alle weiteren Schritte erscheinen eingerückt
-  darunter als "Sequenz" — analog zu UiPaths "Use Application/Browser"-Aktivität.
+- **Anwendungs-Scope**: Ist der erste Schritt eines Desktop-Workflows `launch` oder `connect`, gilt er
+  als Scope des Workflows — analog zu UiPaths "Use Application/Browser"-Aktivität. Er ist als erste
+  Karte fixiert: nicht verschiebbar, und es lässt sich nichts darüber ablegen, weil alle folgenden
+  Schritte sich auf ihn beziehen.
 - **🔴 Aufnahme starten** (im Scope-Bereich, sobald ein `launch`/`connect`-Schritt existiert): zeichnet
   echte Klicks und Texteingaben in der Zielanwendung live als Workflow-Schritte auf. Text wird gepuffert
   und beim nächsten Klick oder mit Tab/Enter als `type`-Schritt übernommen; Klicks außerhalb der
@@ -205,9 +220,9 @@ Jeder Step kann zusätzlich `save_as: <name>` tragen — der Rückgabewert der A
 Diese Aktionen sind **backend-unabhängig** (funktionieren in `web`- und `desktop`-Workflows gleich),
 weil sie nicht an eine UI-Interaktion gebunden sind, sondern die `variables` der laufenden
 Workflow-Instanz lesen/verändern oder einen externen Dienst ansprechen (siehe `uiflow/engine.py`).
-Im Studio-Builder werden `then`/`else`/`cases`/`default`/Schleifenkörper/`try`/`catch` als **echte,
-verschachtelte Schritt-Listen** bearbeitet (eigene Aktions-Auswahl, Felder, Hinzufügen/Verschieben/
-Löschen je Ebene) — kein rohes JSON mehr.
+Im Studio-Builder sind `then`/`else`/`cases`/`default`/Schleifenkörper/`try`/`catch` **echte
+Ablagezonen**: Aktivitäten werden direkt hineingezogen, und Karten lassen sich zwischen Zweigen
+verschieben.
 
 ### Variablen & Kontrollfluss
 
@@ -394,8 +409,9 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
   umschließenden `try`): aktuell fängt nur ein expliziter `try`/`catch`-Block Fehler ab; ein Step ohne
   `try` drumherum bricht den Workflow beim ersten Fehler weiterhin ab (Queue-Items haben ihr eigenes,
   davon unabhängiges Retry via `max_retries`).
-- **Visueller Flow-Canvas** statt Formular-Liste (Drag&Drop wie UiPath Studio/n8n) — aktuell ist
-  der Builder bewusst eine (jetzt auch verschachtelbare) Schritt-Liste mit Formularen, kein
-  Node-Canvas, siehe `uiflow studio`.
+- **Flowchart-Ansicht** (frei platzierte Knoten mit Verbindungspfeilen, wie UiPaths Flowchart oder
+  n8n). Der Builder ist ein Sequenz-Designer — er bildet den Ablauf als verschachtelte Kartenliste ab,
+  passend zum sequenziellen YAML-Format. Eine Flowchart-Ansicht bräuchte ein eigenes Format mit Knoten,
+  Kanten und Koordinaten und ist deshalb bewusst noch nicht gebaut.
 - **Selectors robuster machen** (Fallback-Strategien, Bild-basierte Erkennung wie UiPath es
   für Legacy-Apps anbietet).

@@ -13,7 +13,7 @@ from flask import Flask, Response, jsonify, redirect, request, send_from_directo
 
 from ..models import Workflow
 from ..orchestrator import db
-from .schema import ACTION_SCHEMAS
+from .schema import ACTION_SCHEMAS, activity_catalog
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 WORKFLOWS_DIR = PROJECT_ROOT / "workflows"
@@ -86,6 +86,13 @@ def create_app() -> Flask:
     @app.get("/api/schema")
     def schema() -> Response:
         return jsonify(ACTION_SCHEMAS)
+
+    @app.get("/api/activities")
+    def activities() -> Response:
+        """Palette metadata (label/category/description/keywords) for the
+        builder's activity catalog - kept apart from /api/schema, which stays
+        the plain action -> fields mapping the property forms are built from."""
+        return jsonify(activity_catalog())
 
     @app.get("/api/workflows")
     def list_workflows() -> Response:

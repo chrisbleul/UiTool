@@ -3,6 +3,7 @@ let schema = { web: {}, desktop: {} };
 let state = {
   backend: "web",
   steps: [],
+  selected: null, // the model step whose parameters the properties panel shows
 };
 
 let currentJobId = null;
@@ -77,8 +78,8 @@ function confirmDialog(message, confirmLabel = "Löschen") {
 }
 
 function newStepFor(backend) {
-  const firstAction = Object.keys(schema[backend])[0];
-  return { action: firstAction, params: {}, breakpoint: false, save_as: "" };
+  const actions = schema[backend] || {};
+  return makeStep(Object.keys(actions)[0], actions);
 }
 
 // --- undo ---
@@ -110,6 +111,7 @@ function undo() {
   el("wf-browser-channel").value = snap.browserChannel || "";
   updateBrowserChannelVisibility();
   state.steps = snap.steps;
+  state.selected = null;
   renderSteps();
   updateUndoButton();
 }
@@ -149,10 +151,8 @@ async function loadWorkflow(name) {
   state.backend = data.backend;
   el("wf-browser-channel").value = data.browser_channel || "";
   updateBrowserChannelVisibility();
-  state.steps = data.steps.map((s) => {
-    const { action, breakpoint, save_as, ...params } = s;
-    return { action, params, breakpoint: !!breakpoint, save_as: save_as || "" };
-  });
+  state.steps = rawStepsToModel(data.steps, schema[state.backend] || {});
+  state.selected = null;
   undoStack = [];
   updateUndoButton();
   renderSteps();
@@ -176,102 +176,262 @@ function isScopeStep(step, index) {
   return state.backend === "desktop" && index === 0 && ["launch", "connect"].includes(step.action);
 }
 
-// step-list conversions, shared between the top-level workflow and nested
-// control-flow branches (if/switch/for_each/try bodies): the wire format
-// (workflows/*.yaml, engine.py's Step.from_dict) is a flat dict per step
-// ({action, ...params, breakpoint?, save_as?}); the editor works with a
-// {action, params, breakpoint, save_as} "model" shape instead.
-function rawStepToModel(raw) {
-  const { action, breakpoint, save_as, ...params } = raw;
-  return { action, params, breakpoint: !!breakpoint, save_as: save_as || "" };
+// --- model <-> wire format -------------------------------------------------
+//
+// The builder edits a "model" tree in which a control-flow branch is a real
+// array (step.slots[].steps), while the wire format (workflows/*.yaml,
+// engine.py's Step.from_dict) keeps branches inside the step's own params as
+// flat {action, ...params} dicts. Decoding the *whole* tree up front - rather
+// than decoding each branch lazily while rendering it, as this builder used to
+// do - is what turns "drag an activity from one container into another" into a
+// plain array move instead of a re-encode of both parents.
+//
+// A slot is one drop target: either a named branch field ({kind:"field"}, e.g.
+// if.then, try.catch) or one case of a switch ({kind:"case"}, whose caseKey is
+// the user-editable match value).
+
+function slotFieldsFor(action, actions) {
+  return (actions[action] || []).filter((f) => f.type === "steps" || f.type === "cases");
 }
+
+function emptySlotsFor(action, actions) {
+  return slotFieldsFor(action, actions)
+    .filter((field) => field.type === "steps")
+    .map((field) => ({ kind: "field", name: field.name, label: field.label, steps: [] }));
+}
+
+function makeStep(action, actions) {
+  return { action, params: {}, breakpoint: false, save_as: "", slots: emptySlotsFor(action, actions) };
+}
+
+function rawStepToModel(raw, actions) {
+  const { action, breakpoint, save_as, ...params } = raw;
+  const slots = [];
+  for (const field of slotFieldsFor(action, actions)) {
+    if (field.type === "cases") {
+      for (const [key, list] of Object.entries(params[field.name] || {})) {
+        slots.push({ kind: "case", name: field.name, caseKey: key, label: key, steps: rawStepsToModel(list, actions) });
+      }
+    } else {
+      slots.push({
+        kind: "field",
+        name: field.name,
+        label: field.label,
+        steps: rawStepsToModel(params[field.name], actions),
+      });
+    }
+    delete params[field.name];
+  }
+  return { action, params, breakpoint: !!breakpoint, save_as: save_as || "", slots };
+}
+
+function rawStepsToModel(rawList, actions) {
+  return (rawList || []).map((raw) => rawStepToModel(raw, actions));
+}
+
 function modelStepToRaw(model) {
   const entry = { action: model.action, ...model.params };
+  for (const slot of model.slots || []) {
+    if (slot.kind === "case") {
+      // An empty case is still a case the author declared - keep it, unlike an
+      // empty branch field, which is simply absent from the YAML.
+      entry[slot.name] = entry[slot.name] || {};
+      entry[slot.name][slot.caseKey] = modelStepsToRaw(slot.steps);
+    } else if (slot.steps.length) {
+      entry[slot.name] = modelStepsToRaw(slot.steps);
+    }
+  }
   if (model.breakpoint) entry.breakpoint = true;
   if (model.save_as) entry.save_as = model.save_as;
   return entry;
 }
-function rawStepsToModel(rawList) {
-  return (rawList || []).map(rawStepToModel);
-}
+
 function modelStepsToRaw(modelList) {
   return (modelList || []).map(modelStepToRaw);
 }
 
-// `opts.stepsArray`/`opts.onChange` let this same renderer serve both the
-// top-level workflow (stepsArray = state.steps, onChange = renderSteps) and a
-// nested control-flow branch (stepsArray = a locally-decoded model array,
-// onChange = write it back into the parent step's raw params + renderSteps) -
-// see renderNestedStepsField below. `opts.isNested` disables drag-reordering
-// and the scope-aware "can't move above the scope step" logic, neither of
-// which apply inside a branch.
-function renderStepCard(step, index, actions, opts) {
-  const stepsArray = opts.stepsArray || state.steps;
-  const onChange = opts.onChange || renderSteps;
-  const card = document.createElement("div");
-  card.className = "step-card" + (opts.isScope ? " scope-card" : "");
-  // Structural address of this card, matching the `path` the engine reports
-  // when it pauses (see engine.py's _run_steps). The engine's step *number*
-  // counts executed steps and so can't address a card inside a branch - only
-  // the path can, which is why the pause highlight keys off this.
-  const stepPath = opts.pathPrefix ? `${opts.pathPrefix}.${index}` : String(index);
-  card.dataset.stepPath = stepPath;
+// --- activity catalog ------------------------------------------------------
 
-  // --- header: (drag handle,) breakpoint toggle, index, action select, move/delete buttons ---
+let catalog = { categories: [], activities: {} };
+let catalogIndex = new Map(); // "backend/action" -> catalog entry
+
+async function loadCatalog() {
+  catalog = await (await fetch("/api/activities")).json();
+  catalogIndex = new Map();
+  for (const [backend, entries] of Object.entries(catalog.activities || {})) {
+    for (const entry of entries) catalogIndex.set(`${backend}/${entry.name}`, entry);
+  }
+}
+
+function activityMeta(action) {
+  return (
+    catalogIndex.get(`${state.backend}/${action}`) || { name: action, label: action, description: "", category: "Weitere" }
+  );
+}
+
+function matchesQuery(entry, query) {
+  if (!query) return true;
+  const haystack = [entry.name, entry.label, entry.description, entry.category, ...(entry.keywords || [])]
+    .join(" ")
+    .toLowerCase();
+  // every term must appear somewhere, so "excel lesen" narrows rather than widens
+  return query.split(/\s+/).every((term) => haystack.includes(term));
+}
+
+function renderCatalog() {
+  const host = el("catalog-list");
+  host.innerHTML = "";
+  const query = el("catalog-search").value.trim().toLowerCase();
+  const entries = (catalog.activities[state.backend] || []).filter((entry) => matchesQuery(entry, query));
+
+  if (entries.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "catalog-empty";
+    empty.textContent = "Keine Aktivität gefunden.";
+    host.appendChild(empty);
+    return;
+  }
+
+  const known = catalog.categories || [];
+  const categories = [...known, ...new Set(entries.map((e) => e.category))].filter(
+    (name, i, all) => all.indexOf(name) === i
+  );
+
+  for (const category of categories) {
+    const inCategory = entries.filter((entry) => entry.category === category);
+    if (inCategory.length === 0) continue;
+
+    const heading = document.createElement("div");
+    heading.className = "catalog-category";
+    heading.textContent = category;
+    host.appendChild(heading);
+
+    for (const entry of inCategory) {
+      const item = document.createElement("div");
+      item.className = "catalog-item";
+      item.dataset.action = entry.name;
+      item.title = `${entry.description}\n\nZiehen oder klicken zum Anhängen`;
+      item.setAttribute("role", "button");
+      item.tabIndex = 0;
+
+      const label = document.createElement("span");
+      label.className = "catalog-item-label";
+      label.textContent = entry.label;
+
+      const desc = document.createElement("span");
+      desc.className = "catalog-item-desc";
+      desc.textContent = entry.description;
+
+      item.append(label, desc);
+      // Clicking appends to the end of the sequence - the keyboard-reachable
+      // path to the same result as dragging, which a pointer-only affordance
+      // would leave without one.
+      const append = () => appendActivity(entry.name);
+      item.addEventListener("click", append);
+      item.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          append();
+        }
+      });
+      host.appendChild(item);
+    }
+  }
+}
+
+function appendActivity(action) {
+  const actions = schema[state.backend] || {};
+  pushUndo();
+  const step = makeStep(action, actions);
+  state.steps.push(step);
+  state.selected = step;
+  renderSteps();
+}
+
+// --- canvas ----------------------------------------------------------------
+
+// Maps a rendered list element back to the model array it shows, so a drop can
+// be applied as a splice without walking the tree to find out where it landed.
+let listRegistry = new Map();
+let listCounter = 0;
+// Step-list instances are torn down and rebuilt with every render; the catalog
+// is rendered independently of the canvas, so its instance is created once and
+// deliberately kept out of that cycle.
+let sortables = [];
+let catalogSortable = null;
+
+function registerList(element, stepsArray) {
+  const id = `sl-${listCounter++}`;
+  element.dataset.listId = id;
+  listRegistry.set(id, stepsArray);
+  return element;
+}
+
+function destroySortables() {
+  for (const instance of sortables) instance.destroy();
+  sortables = [];
+}
+
+function stepSummary(step) {
+  // `primary` is an ordered list of candidate fields, since the same action can
+  // carry different ones per backend (see ACTION_META in schema.py).
+  for (const name of activityMeta(step.action).primary || []) {
+    const value = step.params[name];
+    if (value !== undefined && value !== "" && value !== null) return String(value);
+  }
+  const first = Object.entries(step.params).find(([, v]) => v !== "" && v !== undefined && v !== null);
+  return first ? `${first[0]}: ${first[1]}` : "";
+}
+
+function selectStep(step) {
+  state.selected = step;
+  for (const card of document.querySelectorAll(".step-card")) card.classList.remove("selected");
+  const active = document.querySelector(`.step-card[data-step-path="${cssEscape(step.__path)}"]`);
+  if (active) active.classList.add("selected");
+  renderProperties();
+}
+
+function cssEscape(value) {
+  return window.CSS && CSS.escape ? CSS.escape(value) : String(value);
+}
+
+function deleteStep(list, index) {
+  pushUndo();
+  const [removed] = list.splice(index, 1);
+  if (removed === state.selected) state.selected = null;
+  renderSteps();
+}
+
+function renderStepCard(step, index, actions, opts) {
+  const card = document.createElement("div");
+  card.className = "step-card" + (opts.isScope ? " scope-card" : "") + (step === state.selected ? " selected" : "");
+  // Structural address, matching the `path` the engine reports when it pauses
+  // (see engine.py's _run_steps) - this is what the breakpoint highlight and
+  // the selection lookup key off.
+  card.dataset.stepPath = opts.path;
+  step.__path = opts.path;
+
   const head = document.createElement("div");
   head.className = "step-card-head";
 
-  if (!opts.isScope && !opts.isNested) {
-    const dragHandle = document.createElement("span");
-    dragHandle.className = "drag-handle";
-    dragHandle.title = "Ziehen zum Umsortieren";
-    dragHandle.innerHTML = ICONS.grip;
-    dragHandle.draggable = true;
-    dragHandle.addEventListener("dragstart", (e) => {
-      e.dataTransfer.effectAllowed = "move";
-      e.dataTransfer.setData("text/plain", String(index));
-      e.dataTransfer.setDragImage(card, 20, 20);
-      requestAnimationFrame(() => card.classList.add("dragging"));
-    });
-    dragHandle.addEventListener("dragend", () => {
-      card.classList.remove("dragging");
-    });
-    head.appendChild(dragHandle);
-
-    card.addEventListener("dragover", (e) => {
-      e.preventDefault();
-      e.dataTransfer.dropEffect = "move";
-      const rect = card.getBoundingClientRect();
-      const before = e.clientY - rect.top < rect.height / 2;
-      card.classList.toggle("drag-over-top", before);
-      card.classList.toggle("drag-over-bottom", !before);
-    });
-    card.addEventListener("dragleave", () => {
-      card.classList.remove("drag-over-top", "drag-over-bottom");
-    });
-    card.addEventListener("drop", (e) => {
-      e.preventDefault();
-      const wasBefore = card.classList.contains("drag-over-top");
-      card.classList.remove("drag-over-top", "drag-over-bottom");
-      const fromIndex = Number(e.dataTransfer.getData("text/plain"));
-      if (Number.isNaN(fromIndex) || fromIndex === index) return;
-      pushUndo();
-      let toIndex = index;
-      const [moved] = stepsArray.splice(fromIndex, 1);
-      if (fromIndex < toIndex) toIndex -= 1;
-      if (!wasBefore) toIndex += 1;
-      stepsArray.splice(toIndex, 0, moved);
-      onChange();
-    });
+  if (!opts.isScope) {
+    const handle = document.createElement("span");
+    handle.className = "drag-handle";
+    handle.title = "Ziehen zum Verschieben";
+    handle.innerHTML = ICONS.grip;
+    head.appendChild(handle);
   }
 
   const bpToggle = document.createElement("button");
+  bpToggle.type = "button";
   bpToggle.className = "bp-toggle" + (step.breakpoint ? " active" : "");
   bpToggle.title = step.breakpoint ? "Haltepunkt entfernen" : "Haltepunkt setzen";
-  bpToggle.addEventListener("click", () => {
+  bpToggle.setAttribute("aria-label", bpToggle.title);
+  bpToggle.addEventListener("click", (e) => {
+    e.stopPropagation();
     pushUndo();
     step.breakpoint = !step.breakpoint;
-    onChange();
+    renderSteps();
   });
   head.appendChild(bpToggle);
 
@@ -280,11 +440,393 @@ function renderStepCard(step, index, actions, opts) {
   idx.textContent = index + 1;
   head.appendChild(idx);
 
+  const title = document.createElement("span");
+  title.className = "step-title";
+  title.textContent = activityMeta(step.action).label;
+  head.appendChild(title);
+
+  if (opts.isScope) {
+    // Says why this card has no handle and no delete button: everything below
+    // it runs against the application it opens.
+    const badge = document.createElement("span");
+    badge.className = "scope-badge";
+    badge.innerHTML = ICONS.monitor + "<span>Anwendungs-Scope</span>";
+    head.appendChild(badge);
+  }
+
+  const summary = document.createElement("span");
+  summary.className = "step-summary";
+  summary.textContent = stepSummary(step);
+  head.appendChild(summary);
+
+  if (!opts.isScope) {
+    const delBtn = document.createElement("button");
+    delBtn.type = "button";
+    delBtn.className = "btn-icon danger step-delete";
+    delBtn.innerHTML = ICONS.trash;
+    delBtn.title = "Aktivität löschen";
+    delBtn.setAttribute("aria-label", "Aktivität löschen");
+    delBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      deleteStep(opts.list, index);
+    });
+    head.appendChild(delBtn);
+  }
+
+  card.appendChild(head);
+  card.addEventListener("click", (e) => {
+    e.stopPropagation();
+    selectStep(step);
+  });
+
+  for (const slot of step.slots || []) {
+    card.appendChild(renderSlot(step, slot, actions, opts.path));
+  }
+
+  if (slotFieldsFor(step.action, actions).some((f) => f.type === "cases")) {
+    const addCase = document.createElement("button");
+    addCase.type = "button";
+    addCase.className = "btn btn-add-case";
+    addCase.textContent = "+ Fall";
+    addCase.addEventListener("click", (e) => {
+      e.stopPropagation();
+      pushUndo();
+      const field = slotFieldsFor(step.action, actions).find((f) => f.type === "cases");
+      const defaultSlotAt = step.slots.findIndex((s) => s.kind === "field" && s.name === "default");
+      const newSlot = { kind: "case", name: field.name, caseKey: "", label: "", steps: [] };
+      // keep the "Standard-Fall" slot last, the way switch reads top to bottom
+      if (defaultSlotAt === -1) step.slots.push(newSlot);
+      else step.slots.splice(defaultSlotAt, 0, newSlot);
+      renderSteps();
+    });
+    card.appendChild(addCase);
+  }
+
+  return card;
+}
+
+function renderSlot(parentStep, slot, actions, parentPath) {
+  const wrap = document.createElement("div");
+  wrap.className = "slot";
+
+  const head = document.createElement("div");
+  head.className = "slot-head";
+
+  if (slot.kind === "case") {
+    const keyInput = document.createElement("input");
+    keyInput.type = "text";
+    keyInput.className = "slot-case-key";
+    keyInput.placeholder = "Wert (z.B. DE)";
+    keyInput.value = slot.caseKey;
+    keyInput.addEventListener("click", (e) => e.stopPropagation());
+    keyInput.addEventListener("focus", () => pushUndo());
+    keyInput.addEventListener("input", () => {
+      slot.caseKey = keyInput.value;
+      slot.label = keyInput.value;
+    });
+    // Re-render on blur rather than per keystroke: the key is part of every
+    // nested step's path, so the paths are only rebuilt once the edit is done.
+    keyInput.addEventListener("change", () => renderSteps());
+
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.className = "btn-icon danger";
+    removeBtn.textContent = "✕";
+    removeBtn.title = "Fall entfernen";
+    removeBtn.setAttribute("aria-label", "Fall entfernen");
+    removeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      pushUndo();
+      parentStep.slots.splice(parentStep.slots.indexOf(slot), 1);
+      renderSteps();
+    });
+
+    head.append(keyInput, removeBtn);
+  } else {
+    const label = document.createElement("span");
+    label.className = "slot-label";
+    label.textContent = slot.label;
+    head.appendChild(label);
+  }
+  wrap.appendChild(head);
+
+  const list = document.createElement("div");
+  list.className = "step-list step-list-nested";
+  registerList(list, slot.steps);
+  const prefix = slot.kind === "case" ? `${parentPath}.${slot.name}.${slot.caseKey}` : `${parentPath}.${slot.name}`;
+  slot.steps.forEach((child, i) => {
+    list.appendChild(renderStepCard(child, i, actions, { path: `${prefix}.${i}`, list: slot.steps }));
+  });
+  wrap.appendChild(list);
+
+  return wrap;
+}
+
+function renderRecordingHost() {
+  const host = el("record-controls-host");
+  host.innerHTML = "";
+  if (state.steps.length && isScopeStep(state.steps[0], 0)) {
+    host.appendChild(renderRecordingControls());
+  }
+}
+
+function renderSteps() {
+  const container = el("steps");
+  container.innerHTML = "";
+  listRegistry = new Map();
+  listCounter = 0;
+  destroySortables();
+
+  const actions = schema[state.backend] || {};
+  renderRecordingHost();
+
+  const list = document.createElement("div");
+  list.className = "step-list step-list-root";
+  registerList(list, state.steps);
+  state.steps.forEach((step, i) => {
+    list.appendChild(
+      renderStepCard(step, i, actions, { path: String(i), list: state.steps, isScope: isScopeStep(step, i) })
+    );
+  });
+  container.appendChild(list);
+
+  initSortables();
+  renderProperties();
+}
+
+// --- drag & drop -----------------------------------------------------------
+
+function rootListElement() {
+  return document.querySelector(".step-list-root");
+}
+
+function hasScopeStep() {
+  return state.steps.length > 0 && isScopeStep(state.steps[0], 0);
+}
+
+function onSortableMove(evt) {
+  // A container may not be dropped into one of its own branches - that would
+  // detach the subtree from the workflow and lose it.
+  if (evt.dragged.contains(evt.to)) return false;
+  // The desktop scope (launch/connect) has to stay the first activity, since
+  // it is what every later step attaches to.
+  if (evt.to === rootListElement() && hasScopeStep()) {
+    if (evt.related && evt.related.classList.contains("scope-card") && !evt.willInsertAfter) return false;
+  }
+  return true;
+}
+
+function onSortableEnd(evt) {
+  const targetList = listRegistry.get(evt.to.dataset.listId);
+  if (!targetList) return;
+
+  if (evt.from === el("catalog-list")) {
+    // Dropped in from the palette: the clone Sortable left behind is thrown
+    // away, the re-render below draws the real card.
+    evt.item.remove();
+    pushUndo();
+    const step = makeStep(evt.item.dataset.action, schema[state.backend] || {});
+    targetList.splice(evt.newIndex, 0, step);
+    state.selected = step;
+    renderSteps();
+    return;
+  }
+
+  const sourceList = listRegistry.get(evt.from.dataset.listId);
+  if (!sourceList) return;
+  if (sourceList === targetList && evt.oldIndex === evt.newIndex) return;
+
+  pushUndo();
+  const [moved] = sourceList.splice(evt.oldIndex, 1);
+  if (moved === undefined) {
+    renderSteps();
+    return;
+  }
+  // newIndex already refers to the post-move DOM position, which matches the
+  // array position after the removal above - so it needs no adjustment.
+  targetList.splice(evt.newIndex, 0, moved);
+  renderSteps();
+}
+
+function initSortables() {
+  const options = {
+    group: { name: "uiflow-activities" },
+    draggable: ".step-card",
+    filter: ".scope-card",
+    handle: ".drag-handle",
+    animation: 150,
+    forceFallback: true,
+    fallbackOnBody: true,
+    ghostClass: "drag-ghost",
+    chosenClass: "drag-chosen",
+    emptyInsertThreshold: 12,
+    onMove: onSortableMove,
+    onEnd: onSortableEnd,
+  };
+  for (const listEl of document.querySelectorAll("#steps .step-list")) {
+    sortables.push(Sortable.create(listEl, options));
+  }
+}
+
+function initCatalogSortable() {
+  if (catalogSortable) catalogSortable.destroy();
+  catalogSortable = Sortable.create(el("catalog-list"), {
+    group: { name: "uiflow-activities", pull: "clone", put: false },
+    sort: false,
+    draggable: ".catalog-item",
+    animation: 150,
+    // Pointer-driven rather than the native HTML5 drag API: that is what makes
+    // the drag work on touch devices and lets ghostClass/chosenClass style the
+    // drag, instead of the browser's own un-styleable drag image.
+    forceFallback: true,
+    fallbackOnBody: true,
+    onMove: onSortableMove,
+    onEnd: onSortableEnd,
+  });
+}
+
+// --- properties panel ------------------------------------------------------
+
+function refreshSelectedSummary() {
+  if (!state.selected) return;
+  const card = document.querySelector(".step-card.selected .step-summary");
+  if (card) card.textContent = stepSummary(state.selected);
+}
+
+function renderField(step, fieldDef) {
+  const wrap = document.createElement("div");
+  wrap.className = "field" + (fieldDef.type === "checkbox" ? " checkbox" : "");
+
+  const label = document.createElement("label");
+  label.textContent = fieldDef.label + (fieldDef.required ? " *" : "");
+
+  let input;
+  let editing = false;
+  if (fieldDef.type === "select") {
+    input = document.createElement("select");
+    const blank = document.createElement("option");
+    blank.value = "";
+    blank.textContent = "(default)";
+    input.appendChild(blank);
+    for (const optValue of fieldDef.options || []) {
+      const opt = document.createElement("option");
+      opt.value = optValue;
+      opt.textContent = optValue;
+      input.appendChild(opt);
+    }
+    input.value = step.params[fieldDef.name] ?? "";
+    input.addEventListener("change", () => pushUndo());
+  } else if (fieldDef.type === "checkbox") {
+    input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = !!step.params[fieldDef.name];
+    input.addEventListener("change", () => pushUndo());
+  } else if (fieldDef.type === "json") {
+    input = document.createElement("textarea");
+    input.rows = 5;
+    input.value = JSON.stringify(step.params[fieldDef.name] ?? {}, null, 2);
+    input.addEventListener("focus", () => {
+      if (!editing) {
+        pushUndo();
+        editing = true;
+      }
+    });
+    input.addEventListener("blur", () => {
+      editing = false;
+    });
+  } else if (fieldDef.type === "hotkey") {
+    input = document.createElement("input");
+    input.type = "text";
+    input.readOnly = true;
+    input.placeholder = "z.B. ctrl+s";
+    input.value = step.params[fieldDef.name] ?? "";
+  } else {
+    input = document.createElement("input");
+    input.type = fieldDef.type === "number" ? "number" : "text";
+    input.value = step.params[fieldDef.name] ?? "";
+    // Snapshot once per edit session (on focus), not once per keystroke.
+    input.addEventListener("focus", () => {
+      if (!editing) {
+        pushUndo();
+        editing = true;
+      }
+    });
+    input.addEventListener("blur", () => {
+      editing = false;
+    });
+  }
+
+  input.addEventListener("input", () => {
+    const raw = fieldDef.type === "checkbox" ? input.checked : input.value;
+    const value = fieldValue(fieldDef, raw);
+    if (fieldDef.type === "json" && value === undefined) {
+      return; // invalid JSON mid-typing - keep the last valid committed value untouched
+    }
+    if (value === undefined || value === false) {
+      delete step.params[fieldDef.name];
+    } else {
+      step.params[fieldDef.name] = value;
+    }
+    // Only the card's summary line depends on a parameter, so patch that in
+    // place - a full re-render here would tear the focused input out mid-edit.
+    refreshSelectedSummary();
+  });
+
+  if (fieldDef.type === "checkbox") {
+    wrap.append(input, label);
+  } else if (fieldDef.type === "hotkey") {
+    const recordBtn = document.createElement("button");
+    recordBtn.type = "button";
+    recordBtn.className = "btn-icon hotkey-record";
+    recordBtn.innerHTML = ICONS.keyboard;
+    recordBtn.title = "Tastenkombination aufnehmen";
+    recordBtn.setAttribute("aria-label", "Tastenkombination aufnehmen");
+    recordBtn.addEventListener("click", () => recordHotkey(input, step, fieldDef.name));
+    const inputRow = document.createElement("div");
+    inputRow.className = "hotkey-row";
+    inputRow.append(input, recordBtn);
+    wrap.append(label, inputRow);
+  } else {
+    wrap.append(label, input);
+  }
+  return wrap;
+}
+
+function renderProperties() {
+  const body = el("properties-body");
+  const title = el("properties-title");
+  body.innerHTML = "";
+
+  const step = state.selected;
+  if (!step) {
+    title.textContent = "Eigenschaften";
+    const hint = document.createElement("p");
+    hint.className = "properties-empty";
+    hint.textContent = "Wähle eine Aktivität im Ablauf aus, um ihre Parameter zu bearbeiten.";
+    body.appendChild(hint);
+    return;
+  }
+
+  const actions = schema[state.backend] || {};
+  const meta = activityMeta(step.action);
+  title.textContent = meta.label;
+
+  if (meta.description) {
+    const desc = document.createElement("p");
+    desc.className = "properties-desc";
+    desc.textContent = meta.description;
+    body.appendChild(desc);
+  }
+
+  const actionWrap = document.createElement("div");
+  actionWrap.className = "field";
+  const actionLabel = document.createElement("label");
+  actionLabel.textContent = "Aktivität";
   const actionSelect = document.createElement("select");
   for (const actionName of Object.keys(actions)) {
     const opt = document.createElement("option");
     opt.value = actionName;
-    opt.textContent = actionName;
+    opt.textContent = activityMeta(actionName).label;
     if (actionName === step.action) opt.selected = true;
     actionSelect.appendChild(opt);
   }
@@ -292,183 +834,19 @@ function renderStepCard(step, index, actions, opts) {
     pushUndo();
     step.action = actionSelect.value;
     step.params = {};
-    onChange();
+    step.slots = emptySlotsFor(step.action, actions);
+    renderSteps();
   });
-  head.appendChild(actionSelect);
+  actionWrap.append(actionLabel, actionSelect);
+  body.appendChild(actionWrap);
 
-  if (!opts.isScope) {
-    const actionsDiv = document.createElement("div");
-    actionsDiv.className = "step-actions";
-
-    const upBtn = document.createElement("button");
-    upBtn.className = "btn-icon";
-    upBtn.textContent = "↑";
-    upBtn.title = "Nach oben";
-    upBtn.setAttribute("aria-label", "Schritt nach oben verschieben");
-    const topOffset = opts.isNested ? 0 : isScopeStep(stepsArray[0], 0) ? 1 : 0;
-    upBtn.disabled = index <= topOffset;
-    upBtn.addEventListener("click", () => {
-      pushUndo();
-      [stepsArray[index - 1], stepsArray[index]] = [stepsArray[index], stepsArray[index - 1]];
-      onChange();
-    });
-
-    const downBtn = document.createElement("button");
-    downBtn.className = "btn-icon";
-    downBtn.textContent = "↓";
-    downBtn.title = "Nach unten";
-    downBtn.setAttribute("aria-label", "Schritt nach unten verschieben");
-    downBtn.disabled = index === stepsArray.length - 1;
-    downBtn.addEventListener("click", () => {
-      pushUndo();
-      [stepsArray[index + 1], stepsArray[index]] = [stepsArray[index], stepsArray[index + 1]];
-      onChange();
-    });
-
-    const delBtn = document.createElement("button");
-    delBtn.className = "btn-icon danger";
-    delBtn.textContent = "✕";
-    delBtn.title = "Löschen";
-    delBtn.setAttribute("aria-label", "Schritt löschen");
-    delBtn.addEventListener("click", () => {
-      pushUndo();
-      stepsArray.splice(index, 1);
-      onChange();
-    });
-
-    actionsDiv.append(upBtn, downBtn, delBtn);
-    head.appendChild(actionsDiv);
-  } else {
-    const delBtn = document.createElement("button");
-    delBtn.className = "btn-icon danger";
-    delBtn.textContent = "✕";
-    delBtn.title = "Scope entfernen";
-    delBtn.setAttribute("aria-label", "Scope entfernen");
-    delBtn.style.marginLeft = "auto";
-    delBtn.addEventListener("click", () => {
-      pushUndo();
-      stepsArray.splice(index, 1);
-      onChange();
-    });
-    head.appendChild(delBtn);
-  }
-  card.appendChild(head);
-
-  // --- dynamic parameter fields ---
-  const fieldsDiv = document.createElement("div");
-  fieldsDiv.className = "fields";
-  const fieldDefs = actions[step.action] || [];
-
-  for (const fieldDef of fieldDefs) {
-    if (fieldDef.type === "steps") {
-      fieldsDiv.appendChild(
-        renderNestedStepsField(step, fieldDef.name, fieldDef.label, actions, opts, stepPath)
-      );
-      continue;
-    }
-    if (fieldDef.type === "cases") {
-      fieldsDiv.appendChild(renderCasesField(step, fieldDef.name, fieldDef.label, actions, opts, stepPath));
-      continue;
-    }
-
-    const wrap = document.createElement("div");
-    wrap.className = "field" + (fieldDef.type === "checkbox" ? " checkbox" : "");
-
-    const label = document.createElement("label");
-    label.textContent = fieldDef.label + (fieldDef.required ? " *" : "");
-
-    let input;
-    let editing = false;
-    if (fieldDef.type === "select") {
-      input = document.createElement("select");
-      const blank = document.createElement("option");
-      blank.value = "";
-      blank.textContent = "(default)";
-      input.appendChild(blank);
-      for (const optValue of fieldDef.options || []) {
-        const opt = document.createElement("option");
-        opt.value = optValue;
-        opt.textContent = optValue;
-        input.appendChild(opt);
-      }
-      input.value = step.params[fieldDef.name] ?? "";
-      input.addEventListener("change", () => pushUndo());
-    } else if (fieldDef.type === "checkbox") {
-      input = document.createElement("input");
-      input.type = "checkbox";
-      input.checked = !!step.params[fieldDef.name];
-      input.addEventListener("change", () => pushUndo());
-    } else if (fieldDef.type === "json") {
-      input = document.createElement("textarea");
-      input.rows = 5;
-      input.value = JSON.stringify(step.params[fieldDef.name] ?? {}, null, 2);
-      input.addEventListener("focus", () => {
-        if (!editing) {
-          pushUndo();
-          editing = true;
-        }
-      });
-      input.addEventListener("blur", () => {
-        editing = false;
-      });
-    } else if (fieldDef.type === "hotkey") {
-      input = document.createElement("input");
-      input.type = "text";
-      input.readOnly = true;
-      input.placeholder = "z.B. ctrl+s";
-      input.value = step.params[fieldDef.name] ?? "";
-    } else {
-      input = document.createElement("input");
-      input.type = fieldDef.type === "number" ? "number" : "text";
-      input.value = step.params[fieldDef.name] ?? "";
-      // Snapshot once per edit session (on focus), not once per keystroke.
-      input.addEventListener("focus", () => {
-        if (!editing) {
-          pushUndo();
-          editing = true;
-        }
-      });
-      input.addEventListener("blur", () => {
-        editing = false;
-      });
-    }
-
-    input.addEventListener("input", () => {
-      const raw = fieldDef.type === "checkbox" ? input.checked : input.value;
-      const value = fieldValue(fieldDef, raw);
-      if (fieldDef.type === "json" && value === undefined) {
-        return; // invalid JSON mid-typing - keep the last valid committed value untouched
-      }
-      if (value === undefined || value === false) {
-        delete step.params[fieldDef.name];
-      } else {
-        step.params[fieldDef.name] = value;
-      }
-      if (opts.onFieldMutate) opts.onFieldMutate();
-    });
-
-    if (fieldDef.type === "checkbox") {
-      wrap.append(input, label);
-    } else if (fieldDef.type === "hotkey") {
-      const recordBtn = document.createElement("button");
-      recordBtn.type = "button";
-      recordBtn.className = "btn-icon hotkey-record";
-      recordBtn.innerHTML = ICONS.keyboard;
-      recordBtn.title = "Tastenkombination aufnehmen";
-      recordBtn.setAttribute("aria-label", "Tastenkombination aufnehmen");
-      recordBtn.addEventListener("click", () => recordHotkey(input, step, fieldDef.name));
-      const inputRow = document.createElement("div");
-      inputRow.className = "hotkey-row";
-      inputRow.append(input, recordBtn);
-      wrap.append(label, inputRow);
-    } else {
-      wrap.append(label, input);
-    }
-    fieldsDiv.appendChild(wrap);
+  // Branch fields are structural: they are edited on the canvas as drop
+  // targets, not as form inputs, so the panel skips them.
+  for (const fieldDef of actions[step.action] || []) {
+    if (fieldDef.type === "steps" || fieldDef.type === "cases") continue;
+    body.appendChild(renderField(step, fieldDef));
   }
 
-  // --- save_as: universal, not action-specific - stores this step's result
-  // (e.g. get_text's return value) into a variable usable as {var.name} later ---
   const saveAsWrap = document.createElement("div");
   saveAsWrap.className = "field";
   const saveAsLabel = document.createElement("label");
@@ -477,16 +855,14 @@ function renderStepCard(step, index, actions, opts) {
   saveAsInput.type = "text";
   saveAsInput.placeholder = "Variablenname";
   saveAsInput.value = step.save_as || "";
+  saveAsInput.addEventListener("focus", () => pushUndo());
   saveAsInput.addEventListener("input", () => {
     step.save_as = saveAsInput.value || "";
-    if (opts.onFieldMutate) opts.onFieldMutate();
   });
   saveAsWrap.append(saveAsLabel, saveAsInput);
-  fieldsDiv.appendChild(saveAsWrap);
+  body.appendChild(saveAsWrap);
 
-  card.appendChild(fieldsDiv);
-
-  // --- "Element wählen" button: only for actions that actually target an element ---
+  const fieldDefs = actions[step.action] || [];
   const hasSelectorField = fieldDefs.some((f) => f.name === "selector");
   const hasDesktopTargetFields = fieldDefs.some((f) => ["control_type", "title", "auto_id"].includes(f.name));
   if (hasSelectorField || hasDesktopTargetFields) {
@@ -498,188 +874,8 @@ function renderStepCard(step, index, actions, opts) {
       if (hasSelectorField) pickWebSelector(step);
       else pickDesktopSelector(step);
     });
-    card.appendChild(pickBtn);
+    body.appendChild(pickBtn);
   }
-
-  return card;
-}
-
-// Renders a nested, fully-visual (add/remove/reorder/edit) list of steps for a
-// control-flow branch (if.then/else, for_each.steps, try.steps/catch) instead
-// of the raw JSON textarea this used to be. `parentStep.params[fieldName]` is
-// the wire-format raw array; edits are made against a locally-decoded "model"
-// array and synced back on every change - see the onFieldMutate chaining
-// comment on renderStepCard for why a sync is needed on every keystroke, not
-// just on structural changes.
-function renderNestedStepsField(parentStep, fieldName, label, actions, opts, parentPath) {
-  const wrap = document.createElement("div");
-  wrap.className = "field-wide nested-steps-wrap";
-
-  const heading = document.createElement("div");
-  heading.className = "nested-steps-label";
-  heading.textContent = label;
-  wrap.appendChild(heading);
-
-  const list = document.createElement("div");
-  list.className = "nested-steps-list";
-
-  const modelBranch = rawStepsToModel(parentStep.params[fieldName]);
-
-  const sync = () => {
-    parentStep.params[fieldName] = modelStepsToRaw(modelBranch);
-    if (opts.onFieldMutate) opts.onFieldMutate();
-  };
-
-  const childOpts = {
-    stepsArray: modelBranch,
-    isNested: true,
-    pathPrefix: `${parentPath}.${fieldName}`,
-    onChange: () => {
-      sync();
-      renderSteps();
-    },
-    onFieldMutate: sync,
-  };
-
-  if (modelBranch.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "nested-steps-empty";
-    empty.textContent = "Keine Schritte";
-    list.appendChild(empty);
-  }
-  modelBranch.forEach((childStep, i) => {
-    list.appendChild(renderStepCard(childStep, i, actions, childOpts));
-  });
-  wrap.appendChild(list);
-
-  const addBtn = document.createElement("button");
-  addBtn.type = "button";
-  addBtn.className = "btn btn-add btn-add-nested";
-  addBtn.textContent = "+ Schritt hinzufügen";
-  addBtn.addEventListener("click", () => {
-    pushUndo();
-    modelBranch.push(newStepFor(state.backend));
-    sync();
-    renderSteps();
-  });
-  wrap.appendChild(addBtn);
-
-  return wrap;
-}
-
-// Same idea as renderNestedStepsField, but for switch's `cases` (a dict of
-// case-value -> step list rather than a single list) - each case gets its own
-// editable key plus a nested step list.
-function renderCasesField(parentStep, fieldName, label, actions, opts, parentPath) {
-  const wrap = document.createElement("div");
-  wrap.className = "field-wide nested-cases-wrap";
-
-  const heading = document.createElement("div");
-  heading.className = "nested-steps-label";
-  heading.textContent = label;
-  wrap.appendChild(heading);
-
-  // Tracked as an ordered array (not just Object.entries() each render) so a
-  // case key can be edited - including transiently duplicating another key -
-  // without entries collapsing into each other mid-edit.
-  const entries = Object.entries(parentStep.params[fieldName] || {}).map(([key, raw]) => ({
-    key,
-    modelBranch: rawStepsToModel(raw),
-  }));
-
-  const sync = () => {
-    const cases = {};
-    for (const entry of entries) {
-      cases[entry.key || ""] = modelStepsToRaw(entry.modelBranch);
-    }
-    parentStep.params[fieldName] = cases;
-    if (opts.onFieldMutate) opts.onFieldMutate();
-  };
-
-  for (const entry of entries) {
-    const caseBox = document.createElement("div");
-    caseBox.className = "case-box";
-
-    const caseHead = document.createElement("div");
-    caseHead.className = "case-box-head";
-
-    const keyInput = document.createElement("input");
-    keyInput.type = "text";
-    keyInput.placeholder = "Wert (z.B. DE)";
-    keyInput.value = entry.key;
-    keyInput.addEventListener("focus", () => pushUndo());
-    keyInput.addEventListener("input", () => {
-      entry.key = keyInput.value;
-      sync();
-    });
-
-    const removeBtn = document.createElement("button");
-    removeBtn.type = "button";
-    removeBtn.className = "btn-icon danger";
-    removeBtn.textContent = "✕";
-    removeBtn.title = "Fall entfernen";
-    removeBtn.setAttribute("aria-label", "Fall entfernen");
-    removeBtn.addEventListener("click", () => {
-      pushUndo();
-      entries.splice(entries.indexOf(entry), 1);
-      sync();
-      renderSteps();
-    });
-
-    caseHead.append(keyInput, removeBtn);
-    caseBox.appendChild(caseHead);
-
-    const list = document.createElement("div");
-    list.className = "nested-steps-list";
-    const childOpts = {
-      stepsArray: entry.modelBranch,
-      isNested: true,
-      pathPrefix: `${parentPath}.${fieldName}.${entry.key}`,
-      onChange: () => {
-        sync();
-        renderSteps();
-      },
-      onFieldMutate: sync,
-    };
-    if (entry.modelBranch.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "nested-steps-empty";
-      empty.textContent = "Keine Schritte";
-      list.appendChild(empty);
-    }
-    entry.modelBranch.forEach((childStep, i) => {
-      list.appendChild(renderStepCard(childStep, i, actions, childOpts));
-    });
-    caseBox.appendChild(list);
-
-    const addBtn = document.createElement("button");
-    addBtn.type = "button";
-    addBtn.className = "btn btn-add btn-add-nested";
-    addBtn.textContent = "+ Schritt hinzufügen";
-    addBtn.addEventListener("click", () => {
-      pushUndo();
-      entry.modelBranch.push(newStepFor(state.backend));
-      sync();
-      renderSteps();
-    });
-    caseBox.appendChild(addBtn);
-
-    wrap.appendChild(caseBox);
-  }
-
-  const addCaseBtn = document.createElement("button");
-  addCaseBtn.type = "button";
-  addCaseBtn.className = "btn btn-pick";
-  addCaseBtn.textContent = "+ Fall hinzufügen";
-  addCaseBtn.addEventListener("click", () => {
-    pushUndo();
-    entries.push({ key: "", modelBranch: [] });
-    sync();
-    renderSteps();
-  });
-  wrap.appendChild(addCaseBtn);
-
-  return wrap;
 }
 
 function renderRecordingControls() {
@@ -699,41 +895,6 @@ function renderRecordingControls() {
     wrap.appendChild(hint);
   }
   return wrap;
-}
-
-function renderSteps() {
-  const container = el("steps");
-  container.innerHTML = "";
-  const actions = schema[state.backend] || {};
-
-  if (state.steps.length && isScopeStep(state.steps[0], 0)) {
-    const scopeWrap = document.createElement("div");
-    scopeWrap.className = "scope-wrap";
-
-    const scopeLabel = document.createElement("div");
-    scopeLabel.className = "scope-label";
-    scopeLabel.innerHTML = ICONS.monitor + "<span>Anwendungs-Scope</span>";
-    scopeWrap.appendChild(scopeLabel);
-
-    scopeWrap.appendChild(renderStepCard(state.steps[0], 0, actions, { isScope: true }));
-    scopeWrap.appendChild(renderRecordingControls());
-
-    const seq = document.createElement("div");
-    seq.className = "scope-sequence";
-    const seqLabel = document.createElement("div");
-    seqLabel.className = "sequence-label";
-    seqLabel.textContent = "Sequenz";
-    seq.appendChild(seqLabel);
-    state.steps.slice(1).forEach((step, i) => {
-      seq.appendChild(renderStepCard(step, i + 1, actions, {}));
-    });
-    scopeWrap.appendChild(seq);
-    container.appendChild(scopeWrap);
-  } else {
-    state.steps.forEach((step, index) => {
-      container.appendChild(renderStepCard(step, index, actions, {}));
-    });
-  }
 }
 
 function findNavigateUrl() {
@@ -893,7 +1054,7 @@ async function startRecording() {
   source.addEventListener("step", (event) => {
     const s = JSON.parse(event.data);
     pushUndo();
-    state.steps.push({ action: s.action, params: s.params || {}, breakpoint: false });
+    state.steps.push(rawStepToModel({ action: s.action, ...(s.params || {}) }, schema[state.backend] || {}));
     renderSteps();
   });
   source.addEventListener("stopped", () => {
@@ -920,12 +1081,7 @@ function currentWorkflowPayload() {
     name: el("wf-name").value || "workflow",
     backend: state.backend,
     browser_channel: state.backend === "web" ? el("wf-browser-channel").value || undefined : undefined,
-    steps: state.steps.map((s) => {
-      const entry = { action: s.action, ...s.params };
-      if (s.breakpoint) entry.breakpoint = true;
-      if (s.save_as) entry.save_as = s.save_as;
-      return entry;
-    }),
+    steps: modelStepsToRaw(state.steps),
   };
 }
 
@@ -1650,15 +1806,24 @@ function startNewWorkflow() {
   el("wf-browser-channel").value = "";
   updateBrowserChannelVisibility();
   state.steps = [newStepFor(state.backend)];
+  state.selected = null;
   undoStack = [];
   updateUndoButton();
+  renderCatalog();
   renderSteps();
 }
 
 function init() {
   el("btn-add-step").addEventListener("click", () => {
     pushUndo();
-    state.steps.push(newStepFor(state.backend));
+    const step = newStepFor(state.backend);
+    state.steps.push(step);
+    state.selected = step;
+    renderSteps();
+  });
+
+  el("steps").addEventListener("click", () => {
+    state.selected = null;
     renderSteps();
   });
   el("btn-save").addEventListener("click", saveWorkflow);
@@ -1705,7 +1870,9 @@ function init() {
     pushUndo();
     state.backend = e.target.value;
     state.steps = [];
+    state.selected = null;
     updateBrowserChannelVisibility();
+    renderCatalog();
     renderSteps();
   });
 
@@ -1713,7 +1880,11 @@ function init() {
     if (e.target.value) loadWorkflow(e.target.value);
   });
 
-  loadSchema().then(() => {
+  el("catalog-search").addEventListener("input", renderCatalog);
+
+  Promise.all([loadSchema(), loadCatalog()]).then(() => {
+    renderCatalog();
+    initCatalogSortable();
     state.steps = [newStepFor(state.backend)];
     renderSteps();
   });

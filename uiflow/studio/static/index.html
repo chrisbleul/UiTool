@@ -101,9 +101,30 @@
         <button id="btn-run" class="btn btn-primary">Ausführen</button>
       </div>
 
-      <div class="builder-canvas">
-        <section id="steps" class="steps"></section>
-        <button id="btn-add-step" class="btn btn-add">+ Schritt hinzufügen</button>
+      <div class="builder-layout">
+        <!-- left: searchable activity catalog, dragged into the canvas -->
+        <aside class="activity-catalog" id="activity-catalog">
+          <div class="catalog-head">
+            <label class="catalog-search-label" for="catalog-search">Aktivitäten</label>
+            <input id="catalog-search" type="search" placeholder="Suchen (z.B. klick, schleife)" autocomplete="off">
+          </div>
+          <div id="catalog-list" class="catalog-list"></div>
+        </aside>
+
+        <!-- middle: the sequence itself -->
+        <div class="builder-canvas">
+          <div id="record-controls-host"></div>
+          <section id="steps" class="steps"></section>
+          <button id="btn-add-step" class="btn btn-add">+ Schritt hinzufügen</button>
+        </div>
+
+        <!-- right: properties of the selected activity -->
+        <aside class="properties-panel" id="properties-panel">
+          <div class="properties-head">
+            <span id="properties-title">Eigenschaften</span>
+          </div>
+          <div id="properties-body" class="properties-body"></div>
+        </aside>
       </div>
     </section>
 
@@ -216,6 +237,7 @@
   </div>
 </div>
 
+<script src="/static/vendor/sortable.min.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>
