@@ -134,11 +134,17 @@ async function loadWorkflowList() {
   const names = await res.json();
   const select = el("wf-load");
   select.innerHTML = '<option value="">Workflow laden...</option>';
+  const datalist = el("workflow-names");
+  datalist.innerHTML = "";
   for (const name of names) {
     const opt = document.createElement("option");
     opt.value = name;
     opt.textContent = name;
     select.appendChild(opt);
+    // the same names feed every "workflow"-typed field, e.g. run_workflow's
+    const suggestion = document.createElement("option");
+    suggestion.value = name;
+    datalist.appendChild(suggestion);
   }
 }
 
@@ -740,6 +746,24 @@ function renderField(step, fieldDef) {
     input.readOnly = true;
     input.placeholder = "z.B. ctrl+s";
     input.value = step.params[fieldDef.name] ?? "";
+  } else if (fieldDef.type === "workflow") {
+    // Free text with suggestions rather than a <select>: a sub-workflow may be
+    // named by a placeholder ("{var.zielprozess}"), and it stays referencable
+    // even if the file is added after this one was written.
+    input = document.createElement("input");
+    input.type = "text";
+    input.setAttribute("list", "workflow-names");
+    input.placeholder = "Name des Workflows";
+    input.value = step.params[fieldDef.name] ?? "";
+    input.addEventListener("focus", () => {
+      if (!editing) {
+        pushUndo();
+        editing = true;
+      }
+    });
+    input.addEventListener("blur", () => {
+      editing = false;
+    });
   } else {
     input = document.createElement("input");
     input.type = fieldDef.type === "number" ? "number" : "text";

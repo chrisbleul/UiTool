@@ -2,8 +2,9 @@
 Studio UI should render for each. This is a UI concern only - the engine itself
 just calls whatever method matches the step's `action` name (see engine.py),
 except the engine-level actions in _CONTROL_FLOW_AND_VARIABLES below (if,
-switch, for_each, try, assign, increment, read_excel, write_excel,
-http_request, get_credential, send_email, read_emails, read_pdf, ocr_image),
+switch, for_each, try, run_workflow, assign, increment, read_excel,
+write_excel, http_request, get_credential, send_email, read_emails, read_pdf,
+ocr_image),
 which the engine handles itself (not backend methods) and are therefore
 identical for both backends."""
 
@@ -13,7 +14,8 @@ identical for both backends."""
 # editable list of sub-steps - used for if/for_each/try branches), cases (a
 # switch statement's {value: [steps]} map, rendered as editable key + nested
 # step list per case), hotkey (text input + "record" button that captures a
-# key combo from the browser and fills it in).
+# key combo from the browser and fills it in), workflow (text input backed by a
+# datalist of the workflows that exist, for referencing a sub-workflow by name).
 
 _CONTROL_FLOW_AND_VARIABLES: dict[str, list[dict]] = {
     "if": [
@@ -54,6 +56,21 @@ _CONTROL_FLOW_AND_VARIABLES: dict[str, list[dict]] = {
         {"name": "steps", "label": "Versuchen", "type": "steps", "required": False},
         {"name": "catch", "label": "Bei Fehler", "type": "steps", "required": False},
         {"name": "error_var", "label": "Fehlermeldung speichern als (optional)", "type": "text", "required": False},
+    ],
+    "run_workflow": [
+        {"name": "workflow", "label": "Workflow", "type": "workflow", "required": True},
+        {
+            "name": "arguments",
+            "label": 'Argumente (JSON, z.B. {"kunde": "{var.name}"})',
+            "type": "json",
+            "required": False,
+        },
+        {
+            "name": "outputs",
+            "label": 'Rückgaben (JSON: Variable im Unterprozess -> Variable hier)',
+            "type": "json",
+            "required": False,
+        },
     ],
     "http_request": [
         {
@@ -331,6 +348,13 @@ ACTION_META: dict[str, dict] = {
         "description": "Fängt Fehler der enthaltenen Schritte ab und behandelt sie.",
         "keywords": ["fehler", "catch", "exception", "absichern"],
         "primary": ["error_var"],
+    },
+    "run_workflow": {
+        "label": "Unterprozess ausführen",
+        "category": "Ablaufsteuerung",
+        "description": "Führt einen anderen Workflow als Baustein aus, mit eigenen Variablen.",
+        "keywords": ["unterprozess", "aufrufen", "wiederverwenden", "baustein", "invoke"],
+        "primary": ["workflow"],
     },
     "assign": {
         "label": "Variable zuweisen",

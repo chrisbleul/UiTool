@@ -824,3 +824,290 @@ def test_breakpoint_path_for_a_catch_branch():
         pass
 
     assert paths == ["0.catch.0"]
+
+
+# --- run_workflow (sub-workflows) ------------------------------------------
+
+
+@pytest.fixture
+def workflows_dir(tmp_path, monkeypatch):
+    """Points name-based workflow lookup at a temp directory."""
+    monkeypatch.setattr("uiflow.models.WORKFLOWS_DIR", tmp_path)
+    return tmp_path
+
+
+def write_workflow(directory, name, steps, backend="web"):
+    Workflow(name=name, backend=backend, steps=[Step.from_dict(s) for s in steps]).save(
+        directory / f"{name}.yaml"
+    )
+
+
+def test_run_workflow_executes_the_referenced_workflow(workflows_dir):
+    write_workflow(workflows_dir, "teilprozess", [{"action": "navigate", "url": "sub"}])
+    workflow = Workflow(
+        name="haupt",
+        backend="web",
+        steps=[Step("navigate", {"url": "a"}), Step("run_workflow", {"workflow": "teilprozess"})],
+    )
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow)
+
+    assert backend.calls == [("navigate", "a"), ("navigate", "sub")]
+
+
+def test_sub_workflow_only_sees_the_arguments_it_is_given(workflows_dir):
+    write_workflow(workflows_dir, "teilprozess", [{"action": "navigate", "url": "{var.kunde}"}])
+    workflow = Workflow(
+        name="haupt",
+        backend="web",
+        steps=[
+            Step("assign", {"variable": "geheim", "value": "nicht weitergeben"}),
+            Step("run_workflow", {"workflow": "teilprozess", "arguments": {"kunde": "{var.name}"}}),
+        ],
+    )
+    backend = RecordingBackend()
+    engine = WorkflowEngine(backend)
+
+    engine.run(workflow, variables={"name": "Anna"})
+
+    assert backend.calls == [("navigate", "Anna")]
+    # the caller's own variables never entered the sub-workflow
+    assert engine.variables["geheim"] == "nicht weitergeben"
+
+
+def test_sub_workflow_variables_do_not_leak_back_unless_declared(workflows_dir):
+    write_workflow(workflows_dir, "teilprozess", [{"action": "assign", "variable": "intern", "value": "x"}])
+    workflow = Workflow(
+        name="haupt", backend="web", steps=[Step("run_workflow", {"workflow": "teilprozess"})]
+    )
+    engine = WorkflowEngine(RecordingBackend())
+
+    engine.run(workflow)
+
+    assert "intern" not in engine.variables
+
+
+def test_outputs_map_sub_workflow_variables_into_the_caller(workflows_dir):
+    write_workflow(
+        workflows_dir, "teilprozess", [{"action": "assign", "variable": "ergebnis", "value": "gebucht"}]
+    )
+    workflow = Workflow(
+        name="haupt",
+        backend="web",
+        steps=[
+            Step("run_workflow", {"workflow": "teilprozess", "outputs": {"ergebnis": "buchungsstatus"}}),
+        ],
+    )
+    engine = WorkflowEngine(RecordingBackend())
+
+    engine.run(workflow)
+
+    assert engine.variables["buchungsstatus"] == "gebucht"
+
+
+def test_outputs_are_not_copied_when_the_sub_workflow_fails(workflows_dir):
+    write_workflow(
+        workflows_dir,
+        "teilprozess",
+        [
+            {"action": "assign", "variable": "ergebnis", "value": "halb fertig"},
+            {"action": "does_not_exist", "x": 1},
+        ],
+    )
+    workflow = Workflow(
+        name="haupt",
+        backend="web",
+        steps=[Step("run_workflow", {"workflow": "teilprozess", "outputs": {"ergebnis": "status"}})],
+    )
+    engine = WorkflowEngine(RecordingBackend())
+
+    with pytest.raises(StepError):
+        engine.run(workflow)
+
+    assert "status" not in engine.variables
+
+
+def test_caller_variables_are_restored_after_a_failing_sub_workflow(workflows_dir):
+    write_workflow(workflows_dir, "teilprozess", [{"action": "does_not_exist", "x": 1}])
+    workflow = Workflow(
+        name="haupt",
+        backend="web",
+        steps=[
+            Step("assign", {"variable": "vorher", "value": "da"}),
+            Step("try", {"steps": [{"action": "run_workflow", "workflow": "teilprozess"}]}),
+            Step("navigate", {"url": "{var.vorher}"}),
+        ],
+    )
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow)
+
+    assert backend.calls == [("navigate", "da")]  # the caller's scope came back intact
+
+
+def test_run_workflow_rejects_a_cycle(workflows_dir):
+    write_workflow(workflows_dir, "b", [{"action": "run_workflow", "workflow": "haupt"}])
+    workflow = Workflow(name="haupt", backend="web", steps=[Step("run_workflow", {"workflow": "b"})])
+
+    with pytest.raises(StepError) as excinfo:
+        WorkflowEngine(RecordingBackend()).run(workflow)
+
+    assert "cycle" in str(excinfo.value).lower()
+    assert "haupt -> b -> haupt" in str(excinfo.value)
+
+
+def test_run_workflow_rejects_a_backend_mismatch(workflows_dir):
+    write_workflow(workflows_dir, "desktop_teil", [{"action": "click"}], backend="desktop")
+    workflow = Workflow(
+        name="haupt", backend="web", steps=[Step("run_workflow", {"workflow": "desktop_teil"})]
+    )
+
+    with pytest.raises(StepError) as excinfo:
+        WorkflowEngine(RecordingBackend()).run(workflow)
+
+    assert "backend 'desktop'" in str(excinfo.value)
+
+
+def test_run_workflow_reports_a_missing_file_with_step_context(workflows_dir):
+    workflow = Workflow(name="haupt", backend="web", steps=[Step("run_workflow", {"workflow": "gibtsnicht"})])
+
+    with pytest.raises(StepError) as excinfo:
+        WorkflowEngine(RecordingBackend()).run(workflow)
+
+    assert isinstance(excinfo.value.original, FileNotFoundError)
+
+
+def test_run_workflow_requires_a_name(workflows_dir):
+    workflow = Workflow(name="haupt", backend="web", steps=[Step("run_workflow", {})])
+
+    with pytest.raises(StepError):
+        WorkflowEngine(RecordingBackend()).run(workflow)
+
+
+def test_breakpoint_in_a_sub_workflow_reports_a_path_of_its_own(workflows_dir):
+    write_workflow(workflows_dir, "teilprozess", [{"action": "navigate", "url": "x", "breakpoint": True}])
+    workflow = Workflow(
+        name="haupt",
+        backend="web",
+        steps=[Step("navigate", {"url": "a"}), Step("run_workflow", {"workflow": "teilprozess"})],
+    )
+    seen = []
+
+    def on_breakpoint(index, step, variables, path):
+        seen.append(path)
+
+    WorkflowEngine(RecordingBackend()).run(workflow, on_breakpoint=on_breakpoint)
+
+    # Carries the sub-workflow's name, so it cannot collide with a path in the
+    # calling workflow - whose canvas has no card for this step.
+    assert seen == ["1@teilprozess.0"]
+
+
+def test_credentials_stay_masked_across_the_sub_workflow_boundary(workflows_dir, monkeypatch, caplog):
+    monkeypatch.setattr("keyring.get_password", lambda service, name: "hunter2")
+    write_workflow(
+        workflows_dir,
+        "teilprozess",
+        [{"action": "get_credential", "name": "pw", "save_as": "pw"}, {"action": "navigate", "url": "sub"}],
+    )
+    workflow = Workflow(
+        name="haupt",
+        backend="web",
+        steps=[
+            Step("run_workflow", {"workflow": "teilprozess", "outputs": {"pw": "uebernommen"}}),
+            Step("assign", {"variable": "kopie", "expression": "uebernommen"}),
+        ],
+    )
+
+    logs = _run_capturing_logs(workflow, caplog)
+
+    assert "hunter2" not in logs
+    assert "assign kopie = '***'" in logs
+
+
+def test_a_sub_workflow_can_itself_call_another(workflows_dir):
+    write_workflow(workflows_dir, "innen", [{"action": "navigate", "url": "innen"}])
+    write_workflow(
+        workflows_dir,
+        "mitte",
+        [{"action": "navigate", "url": "mitte"}, {"action": "run_workflow", "workflow": "innen"}],
+    )
+    workflow = Workflow(name="haupt", backend="web", steps=[Step("run_workflow", {"workflow": "mitte"})])
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow)
+
+    assert backend.calls == [("navigate", "mitte"), ("navigate", "innen")]
+
+
+def test_a_whole_placeholder_argument_keeps_its_type(workflows_dir):
+    write_workflow(
+        workflows_dir,
+        "teilprozess",
+        [{"action": "assign", "variable": "anzahl", "expression": "len(kunden)"}],
+    )
+    workflow = Workflow(
+        name="haupt",
+        backend="web",
+        steps=[
+            Step(
+                "run_workflow",
+                {
+                    "workflow": "teilprozess",
+                    "arguments": {"kunden": "{var.alle_kunden}"},
+                    "outputs": {"anzahl": "wie_viele"},
+                },
+            )
+        ],
+    )
+    engine = WorkflowEngine(RecordingBackend())
+
+    engine.run(workflow, variables={"alle_kunden": [{"nr": 1}, {"nr": 2}, {"nr": 3}]})
+
+    # len() on the list, not on its str() - which would have been 24 characters
+    assert engine.variables["wie_viele"] == 3
+
+
+def test_a_placeholder_inside_a_longer_argument_still_substitutes(workflows_dir):
+    write_workflow(workflows_dir, "teilprozess", [{"action": "navigate", "url": "{var.ziel}"}])
+    workflow = Workflow(
+        name="haupt",
+        backend="web",
+        steps=[
+            Step(
+                "run_workflow",
+                {"workflow": "teilprozess", "arguments": {"ziel": "https://x/{var.pfad}?q=1"}},
+            )
+        ],
+    )
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow, variables={"pfad": "suche"})
+
+    assert backend.calls == [("navigate", "https://x/suche?q=1")]
+
+
+def test_queue_item_fields_can_be_passed_whole(workflows_dir):
+    write_workflow(
+        workflows_dir, "teilprozess", [{"action": "assign", "variable": "erste", "expression": "zeilen[0]"}]
+    )
+    workflow = Workflow(
+        name="haupt",
+        backend="web",
+        steps=[
+            Step(
+                "run_workflow",
+                {
+                    "workflow": "teilprozess",
+                    "arguments": {"zeilen": "{item.positionen}"},
+                    "outputs": {"erste": "erste_position"},
+                },
+            )
+        ],
+    )
+    engine = WorkflowEngine(RecordingBackend())
+
+    engine.run(workflow, variables={"item": {"positionen": ["a", "b"]}})
+
+    assert engine.variables["erste_position"] == "a"

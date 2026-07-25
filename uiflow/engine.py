@@ -5,7 +5,7 @@ import logging
 import re
 from typing import Any, Callable, Optional
 
-from .models import Step, Workflow
+from .models import Step, Workflow, load_workflow_by_name
 
 logger = logging.getLogger("uiflow")
 
@@ -78,8 +78,8 @@ class WorkflowCancelled(RuntimeError):
 class WorkflowEngine:
     """Runs a Workflow by dispatching each Step to a same-named method on the
     backend - except a handful of action names the engine handles itself
-    (`if`, `switch`, `for_each`, `try`, `assign`, `increment`, `read_excel`,
-    `write_excel`, `http_request`, `get_credential`, `send_email`,
+    (`if`, `switch`, `for_each`, `try`, `run_workflow`, `assign`, `increment`,
+    `read_excel`, `write_excel`, `http_request`, `get_credential`, `send_email`,
     `read_emails`, `read_pdf`, `ocr_image`), since they operate on
     workflow-run-scoped `variables` (or external services) rather than the UI.
 
@@ -112,6 +112,10 @@ class WorkflowEngine:
         self.variables = dict(variables) if variables else {}
         self._secrets = set()
         self._counter = 0
+        self._backend_name = workflow.backend
+        # Names of the workflows currently on the call stack, so `run_workflow`
+        # can refuse a cycle instead of recursing until Python's stack gives out.
+        self._workflow_stack = [workflow.name]
         logger.info("Running workflow '%s' on backend=%s", workflow.name, workflow.backend)
         self._run_steps(workflow.steps, on_breakpoint, should_stop)
         logger.info("Workflow '%s' completed successfully", workflow.name)
@@ -151,6 +155,8 @@ class WorkflowEngine:
                 self._run_for_each(step, index, path, on_breakpoint, should_stop)
             elif step.action == "try":
                 self._run_try(step, index, path, on_breakpoint, should_stop)
+            elif step.action == "run_workflow":
+                self._run_sub_workflow(step, index, path, on_breakpoint, should_stop)
             elif step.action == "assign":
                 self._run_assign(step, index)
             elif step.action == "increment":
@@ -270,6 +276,95 @@ class WorkflowEngine:
             if error_var:
                 self.variables[error_var] = message
             self._run_steps(catch_body, on_breakpoint, should_stop, f"{path}.catch")
+
+    def _resolve_argument(self, value: Any) -> Any:
+        """Resolves one `run_workflow` argument.
+
+        A value consisting of nothing but a placeholder passes the variable
+        through *with its type*: `"{var.kunden}"` hands over the list itself,
+        not "[{'nr': 1}, ...]". Ordinary substitution stringifies everything,
+        which is right when a placeholder sits inside a larger string, but would
+        silently flatten a table or number handed to a sub-workflow.
+        """
+        if isinstance(value, str):
+            whole = _PLACEHOLDER_RE.fullmatch(value.strip())
+            if whole:
+                namespace, name = whole.group(1), whole.group(2)
+                if namespace == "item":
+                    return (self.variables.get("item") or {}).get(name)
+                return self.variables.get(name)
+        return substitute_variables(value, self.variables)
+
+    def _run_sub_workflow(
+        self,
+        step: Step,
+        index: int,
+        path: str,
+        on_breakpoint: Optional[OnBreakpoint],
+        should_stop: Optional[ShouldStop],
+    ) -> None:
+        """Runs another workflow file as a building block of this one.
+
+        Variables do *not* leak in either direction: the sub-workflow starts
+        with only what `arguments` passes in, and only what `outputs` names comes
+        back. Sharing the caller's variables would make a sub-workflow silently
+        depend on - and overwrite - names it never declared, which is exactly the
+        coupling that reusing it is supposed to avoid.
+
+        It runs on the caller's *existing* backend rather than a second one, so
+        the browser or application already opened stays the one being driven.
+        """
+        name = substitute_variables(step.params.get("workflow", ""), self.variables)
+        if not name:
+            raise StepError(index, step, ValueError("run_workflow requires 'workflow'"))
+        if name in self._workflow_stack:
+            chain = " -> ".join([*self._workflow_stack, name])
+            raise StepError(index, step, ValueError(f"Sub-workflow cycle: {chain}"))
+
+        try:
+            sub = load_workflow_by_name(name)
+        except Exception as exc:  # noqa: BLE001 - wrap a missing/broken file with step context
+            raise StepError(index, step, exc) from exc
+        if sub.backend != self._backend_name:
+            raise StepError(
+                index,
+                step,
+                ValueError(
+                    f"Sub-workflow '{name}' expects backend '{sub.backend}', "
+                    f"but it is called from a '{self._backend_name}' workflow"
+                ),
+            )
+
+        raw_arguments = step.params.get("arguments") or {}
+        if not isinstance(raw_arguments, dict):
+            raise StepError(index, step, ValueError("run_workflow 'arguments' must be a mapping"))
+        arguments = {arg: self._resolve_argument(value) for arg, value in raw_arguments.items()}
+        outputs = step.params.get("outputs") or {}
+        if not isinstance(outputs, dict):
+            raise StepError(index, step, ValueError("run_workflow 'outputs' must be a mapping"))
+
+        self._log("[%d] run_workflow '%s' (%d step(s), arguments: %s)", index, name, len(sub.steps), arguments)
+
+        caller_variables = self.variables
+        self.variables = dict(arguments)
+        self._workflow_stack.append(name)
+        try:
+            # The path prefix carries the sub-workflow's name because its steps
+            # live in another file: nothing on the calling workflow's canvas has
+            # that path, so a breakpoint inside it pauses without the Studio
+            # highlighting an unrelated card (see studio/static/app.js).
+            self._run_steps(sub.steps, on_breakpoint, should_stop, f"{path}@{name}")
+            produced = self.variables
+        finally:
+            self.variables = caller_variables
+            self._workflow_stack.pop()
+            # self._secrets is deliberately *not* restored: a credential read
+            # inside the sub-workflow must stay masked in the caller's log too.
+
+        for sub_name, caller_name in outputs.items():
+            caller_variables[caller_name] = produced.get(sub_name)
+        if outputs:
+            self._log("[%d] run_workflow '%s' -> %s", index, name, self._redact_secrets(dict(outputs)))
 
     def _run_assign(self, step: Step, index: int) -> None:
         name = step.params.get("variable")

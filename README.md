@@ -272,6 +272,14 @@ steps:
       - action: screenshot
         path: "fehler.png"
     error_var: fehlermeldung        # optional - Exception-Text als Variable
+
+  - action: run_workflow
+    workflow: "Rechnung buchen"     # Name einer YAML-Datei in workflows/
+    arguments:                       # was der Unterprozess sieht (Werte im Kontext des Aufrufers)
+      rechnungsnummer: "{item.nr}"
+      betrag: "{var.summe}"
+    outputs:                         # Variable im Unterprozess -> Variable hier
+      belegnummer: letzter_beleg
 ```
 
 `condition`/`expression`-Auswertung läuft über ein eingeschränktes `eval()` (kein `__import__`, `open`,
@@ -281,6 +289,33 @@ geschrieben und ausgeführt, wie ein lokales Skript, nicht von nicht vertrauensw
 `try`/`catch` fängt Step-Fehler innerhalb seines eigenen `steps`-Blocks ab (nicht nur einzelne Schritte,
 sondern beliebig verschachtelte Sub-Blöcke); ein per Stop-Button angefordertes Abbrechen wird davon
 absichtlich **nicht** abgefangen.
+
+#### Unterprozesse (`run_workflow`)
+
+`run_workflow` führt eine andere Workflow-Datei als Baustein aus — für Schrittfolgen, die in mehreren
+Automatisierungen vorkommen, und um einen langen Ablauf in benannte Teile zu zerlegen. Vier Eigenschaften
+sind bewusst so gewählt:
+
+- **Variablen fließen nicht automatisch.** Der Unterprozess startet mit genau dem, was `arguments`
+  übergibt, und zurück kommt nur, was `outputs` benennt. Besteht ein Argumentwert ausschließlich aus
+  einem Platzhalter (`"{var.kunden}"`), wird der Wert **mit seinem Typ** übergeben — eine Liste bleibt
+  eine Liste. Steht der Platzhalter dagegen in einem längeren Text (`"https://x/{var.pfad}"`), wird
+  wie überall sonst textuell ersetzt. Würde er die Variablen des Aufrufers teilen,
+  hinge er still an Namen, die er nie deklariert hat — genau die Kopplung, die Wiederverwendung
+  vermeiden soll. Schlägt der Unterprozess fehl, werden **keine** `outputs` übernommen.
+- **Dasselbe Backend, dieselbe Anwendung.** Der Unterprozess läuft auf der bereits geöffneten
+  Browser-/Anwendungssitzung des Aufrufers, nicht auf einer zweiten. Deklariert er ein anderes `backend`,
+  bricht der Schritt mit einer klaren Meldung ab, statt Desktop-Aufrufe gegen einen Browser zu schicken.
+- **Zyklen werden abgelehnt.** Ruft A den Prozess B auf, der wieder A aufruft, endet der Schritt mit
+  `Sub-workflow cycle: A -> B -> A`.
+- **Auflösung zur Laufzeit.** Der Name wird beim Ausführen in `workflows/` nachgeschlagen — dieselbe
+  Datei, die der Builder speichert und in der Auswahlliste anbietet. Das heißt auch: wird ein
+  Unterprozess bearbeitet, während ein Job schon in der Warteschlange steht, läuft der Job mit der
+  neuen Fassung (der Job-Snapshot in `orchestrator.db` enthält nur den aufrufenden Workflow).
+
+Ein Haltepunkt *innerhalb* eines Unterprozesses hält den Lauf korrekt an und zeigt dessen Variablen,
+markiert aber keine Karte auf der Zeichenfläche — die zeigt den aufrufenden Workflow, in dem dieser
+Schritt gar nicht vorkommt.
 
 ### Excel, HTTP, PDF/OCR
 
@@ -409,25 +444,11 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
   umschließenden `try`): aktuell fängt nur ein expliziter `try`/`catch`-Block Fehler ab; ein Step ohne
   `try` drumherum bricht den Workflow beim ersten Fehler weiterhin ab (Queue-Items haben ihr eigenes,
   davon unabhängiges Retry via `max_retries`).
-- **Unterprozesse (Workflow ruft Workflow)**: Ein Workflow ist heute genau eine YAML-Datei, und es gibt
-  keine Aktivität, die eine andere aufruft. Eine Schrittfolge, die in drei Automatisierungen gebraucht
-  wird — anmelden, Suchmaske füllen, Ergebnis prüfen — steht dreimal da und muss dreimal gepflegt werden.
-  Gewünscht ist eine Engine-Aktivität, die einen anderen Workflow als Baustein ausführt, damit ein langer
-  Ablauf in benannte Teilprozesse zerfällt statt in eine endlose Kartenliste. Vier Stellen entscheiden
-  darüber, wie das aussehen muss:
-  - **Argumente statt gemeinsamer Variablen**: `variables` ist heute *ein* flaches Dictionary pro Lauf. Ohne
-    deklarierte Ein-/Ausgabe-Argumente würde ein Unterprozess die Variablen des Aufrufers still mitlesen
-    und überschreiben. Hängt direkt am nächsten Punkt (globale Variablen) — die Sichtbarkeitsregeln
-    sollten für beide zusammen festgelegt werden.
-  - **Haltepunkt-Pfade**: ein Pfad wie `1.then.0` adressiert eine Position in *einer* Definition. Schritte
-    aus einer zweiten Datei brauchen eine Datei-Kennung im Pfad, sonst markiert das Studio beim Pausieren
-    die falsche Karte (siehe `_run_steps` in `engine.py`).
-  - **Job-Snapshot**: `create_job` legt den kompletten Workflow als JSON in der Job-Zeile ab — ein Job
-    führt damit exakt das aus, was beim Einreihen galt. Ein per Name referenzierter Unterprozess würde
-    dagegen erst zur Laufzeit von der Platte gelesen: eine Bearbeitung zwischen Einreihen und Start
-    änderte den Lauf unbemerkt. Entweder Unterprozesse beim Einreihen mit auflösen (Snapshot bleibt
-    vollständig) oder die späte Bindung bewusst in Kauf nehmen.
-  - **Zyklen**: A ruft B ruft A muss erkannt werden, statt in die Rekursion zu laufen.
+- **Unterprozesse beim Einreihen auflösen**: `run_workflow` gibt es inzwischen (siehe oben), es löst
+  den Namen aber erst zur Laufzeit auf. `create_job` legt sonst den kompletten Workflow als JSON in der
+  Job-Zeile ab, damit ein Job exakt das ausführt, was beim Einreihen galt — für Unterprozesse gilt diese
+  Zusage derzeit nicht. Sie ließe sich wiederherstellen, indem referenzierte Unterprozesse beim Einreihen
+  mit in den Snapshot aufgenommen werden.
 - **Globale Variablen**: Zwei verschiedene Dinge, die beide fehlen und sich sauber trennen lassen:
   - **Deklarierte Workflow-Variablen** (UiPaths Variablen-Panel): Variablen entstehen heute stillschweigend
     beim ersten `assign`; nirgends steht, welche ein Workflow überhaupt verwendet, und es gibt keine

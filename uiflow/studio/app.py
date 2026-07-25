@@ -11,12 +11,12 @@ from typing import Any
 
 from flask import Flask, Response, jsonify, redirect, request, send_from_directory, session
 
+from .. import models
 from ..models import Workflow
 from ..orchestrator import db
 from .schema import ACTION_SCHEMAS, activity_catalog
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-WORKFLOWS_DIR = PROJECT_ROOT / "workflows"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 # One entry per in-flight recording session (unaffected by the orchestrator -
@@ -26,16 +26,16 @@ _recordings: dict[str, Any] = {}
 
 
 def _safe_workflow_path(name: str) -> Path:
-    filename = Path(name).name  # discard any directory components
-    if not filename.endswith(".yaml"):
-        filename += ".yaml"
-    return WORKFLOWS_DIR / filename
+    # models.workflow_path is the single resolver, shared with the engine's
+    # `run_workflow` action - otherwise the Studio could save a sub-workflow
+    # into a different directory than the one a run resolves names against.
+    return models.workflow_path(name)
 
 
 def create_app() -> Flask:
     app = Flask(__name__, static_folder=None)
     app.json.sort_keys = False  # preserve schema.py's action order (e.g. "navigate" before "click")
-    WORKFLOWS_DIR.mkdir(exist_ok=True)
+    models.WORKFLOWS_DIR.mkdir(parents=True, exist_ok=True)
     db.init_db()
 
     # Login is entirely opt-in: this Studio is a local single-user MVP tool by
@@ -96,7 +96,7 @@ def create_app() -> Flask:
 
     @app.get("/api/workflows")
     def list_workflows() -> Response:
-        names = sorted(p.stem for p in WORKFLOWS_DIR.glob("*.yaml"))
+        names = sorted(p.stem for p in models.WORKFLOWS_DIR.glob("*.yaml"))
         return jsonify(names)
 
     @app.get("/api/workflows/<name>")

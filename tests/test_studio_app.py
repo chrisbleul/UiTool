@@ -12,7 +12,8 @@ def isolated_db(tmp_path, monkeypatch):
 
 @pytest.fixture
 def client(isolated_db, monkeypatch, tmp_path):
-    monkeypatch.setattr("uiflow.studio.app.WORKFLOWS_DIR", tmp_path / "workflows")
+    # one resolver for both the Studio and the engine's run_workflow action
+    monkeypatch.setattr("uiflow.models.WORKFLOWS_DIR", tmp_path / "workflows")
     monkeypatch.delenv("UIFLOW_STUDIO_PASSWORD", raising=False)
     app = create_app()
     app.config.update(TESTING=True)
@@ -21,7 +22,8 @@ def client(isolated_db, monkeypatch, tmp_path):
 
 @pytest.fixture
 def protected_client(isolated_db, monkeypatch, tmp_path):
-    monkeypatch.setattr("uiflow.studio.app.WORKFLOWS_DIR", tmp_path / "workflows")
+    # one resolver for both the Studio and the engine's run_workflow action
+    monkeypatch.setattr("uiflow.models.WORKFLOWS_DIR", tmp_path / "workflows")
     monkeypatch.setenv("UIFLOW_STUDIO_PASSWORD", "hunter2")
     app = create_app()
     app.config.update(TESTING=True)

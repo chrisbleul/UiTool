@@ -8,6 +8,11 @@ import yaml
 
 VALID_BACKENDS = ("web", "desktop")
 
+# Where workflows referenced *by name* are looked up - the `run_workflow` action
+# and the Studio both resolve against this one directory, so a sub-workflow is
+# the same file the builder saves and lists.
+WORKFLOWS_DIR = Path(__file__).resolve().parent.parent / "workflows"
+
 
 @dataclass
 class Step:
@@ -78,3 +83,20 @@ class Workflow:
             yaml.safe_dump(self.to_dict(), sort_keys=False, allow_unicode=True),
             encoding="utf-8",
         )
+
+
+def workflow_path(name: str) -> Path:
+    """Resolves a workflow *name* to its file in WORKFLOWS_DIR. Any directory
+    part is discarded, so a name coming from a workflow definition can't reach
+    outside that directory."""
+    filename = Path(name).name
+    if not filename.endswith(".yaml"):
+        filename += ".yaml"
+    return WORKFLOWS_DIR / filename
+
+
+def load_workflow_by_name(name: str) -> Workflow:
+    path = workflow_path(name)
+    if not path.exists():
+        raise FileNotFoundError(f"No workflow named '{name}' in {WORKFLOWS_DIR}")
+    return Workflow.load(path)
