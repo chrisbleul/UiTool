@@ -139,6 +139,24 @@ CREATE TABLE IF NOT EXISTS users (
     role TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+-- Every state-changing Studio API request (see studio/app.py's after_request
+-- hook), regardless of outcome - a rejected attempt (403/401/400) is exactly
+-- as auditable as a successful one. `username`/`role` are the acting
+-- session's, both NULL outside multi-user mode (see users table above), where
+-- there is no individual account to attribute the action to. `action` is
+-- "METHOD /api/path", which - given this API's naming - already names the
+-- target in almost every case (e.g. "DELETE /api/users/bob"), without having
+-- to duplicate that per-route.
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    username TEXT,
+    role TEXT,
+    action TEXT NOT NULL,
+    status_code INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts);
 """
 
 
@@ -718,3 +736,20 @@ def any_users_exist() -> bool:
     """Whether multi-user mode is active - see studio/app.py's require_login."""
     with connect() as conn:
         return conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None
+
+
+# --- audit log ---------------------------------------------------------------
+
+
+def add_audit_entry(username: str | None, role: str | None, action: str, status_code: int) -> None:
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO audit_log (ts, username, role, action, status_code) VALUES (?, ?, ?, ?, ?)",
+            (_now(), username, role, action, status_code),
+        )
+
+
+def list_audit_entries(limit: int = 200) -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]

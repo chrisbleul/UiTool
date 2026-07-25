@@ -37,7 +37,12 @@ def _required_role(method: str, path: str) -> str:
     variables) is admin-only; any other state-changing request needs at least
     "operator"; a plain read (GET) only needs to be logged in at all
     ("viewer")."""
-    if path.startswith("/api/users") or path.startswith("/api/credentials") or path.startswith("/api/globals"):
+    if (
+        path.startswith("/api/users")
+        or path.startswith("/api/credentials")
+        or path.startswith("/api/globals")
+        or path.startswith("/api/audit-log")
+    ):
         return "admin"
     if path.startswith("/api/worker/"):
         # A remote worker executes workflows and reads global variables via
@@ -101,6 +106,31 @@ def create_app() -> Flask:
         if request.path.startswith("/api/"):
             return jsonify({"error": "unauthenticated"}), 401
         return redirect("/login")
+
+    @app.after_request
+    def audit_log(response: Response) -> Response:
+        # Every state-changing API call, regardless of outcome - a rejected
+        # attempt (401/403/400) is exactly as auditable as a successful one.
+        # GETs (plain reads) are deliberately not logged, matching how
+        # _required_role treats them - noisy and rarely what an audit trail is
+        # for. request.path already names the target for almost every route
+        # (e.g. "DELETE /api/users/bob"), see the audit_log table's own
+        # comment in orchestrator/db.py. /api/worker/* is excluded too - that's
+        # a worker process's own claim/heartbeat/log traffic (every 15s per
+        # running job, or more), not an administrative action; the job/queue
+        # tables are already that traffic's own durable record.
+        if (
+            request.method != "GET"
+            and not request.path.startswith("/api/worker/")
+            and (request.path.startswith("/api/") or request.path == "/login")
+        ):
+            db.add_audit_entry(
+                session.get("username"),
+                session.get("role"),
+                f"{request.method} {request.path}",
+                response.status_code,
+            )
+        return response
 
     @app.get("/login")
     def login_form() -> Response:
@@ -610,6 +640,11 @@ def create_app() -> Flask:
             return jsonify({"error": "Kann den eigenen Account nicht selbst löschen"}), 400
         db.delete_user(username)
         return jsonify({"deleted": username})
+
+    @app.get("/api/audit-log")
+    def get_audit_log() -> Response:
+        limit = request.args.get("limit", default=200, type=int)
+        return jsonify(db.list_audit_entries(limit=limit))
 
     @app.get("/api/credentials")
     def list_credentials() -> Response:

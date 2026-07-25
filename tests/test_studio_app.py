@@ -162,6 +162,33 @@ def test_operator_can_write_workflows_but_not_manage_users_or_credentials(multiu
     assert client.post("/api/globals", json={"name": "x", "value": "1"}).status_code == 403
 
 
+def test_audit_log_endpoint_requires_admin_in_multiuser_mode(multiuser_app):
+    viewer = multiuser_app.test_client()
+    _login(viewer, "view1", "viewpass")
+    assert viewer.get("/api/audit-log").status_code == 403
+
+    operator = multiuser_app.test_client()
+    _login(operator, "op1", "oppass")
+    assert operator.get("/api/audit-log").status_code == 403
+
+    admin = multiuser_app.test_client()
+    _login(admin, "admin1", "adminpass")
+    assert admin.get("/api/audit-log").status_code == 200
+
+
+def test_audit_log_records_the_acting_username_and_role(multiuser_app):
+    admin = multiuser_app.test_client()
+    _login(admin, "admin1", "adminpass")
+
+    admin.post("/api/globals", json={"name": "x", "value": "1"})
+
+    entries = admin.get("/api/audit-log").get_json()
+    entry = next(e for e in entries if e["action"] == "POST /api/globals")
+    assert entry["username"] == "admin1"
+    assert entry["role"] == "admin"
+    assert entry["status_code"] == 200
+
+
 def test_admin_can_manage_users(multiuser_app):
     client = multiuser_app.test_client()
     _login(client, "admin1", "adminpass")
@@ -697,6 +724,53 @@ def test_globals_endpoint_parses_json_values_but_keeps_plain_text(client):
 
 def test_globals_endpoint_requires_a_name(client):
     assert client.post("/api/globals", json={"name": "", "value": "x"}).status_code == 400
+
+
+def test_audit_log_is_reachable_without_admin_outside_multiuser_mode(client):
+    # _required_role's admin gate is only consulted once db.any_users_exist() -
+    # single-user mode has no accounts to gate by, same as credentials/globals.
+    assert client.get("/api/audit-log").status_code == 200
+
+
+def test_audit_log_records_a_successful_write_with_a_null_identity_in_single_user_mode(client):
+    client.post("/api/globals", json={"name": "x", "value": "1"})
+
+    entries = client.get("/api/audit-log").get_json()
+    entry = next(e for e in entries if e["action"] == "POST /api/globals")
+    assert entry["username"] is None
+    assert entry["role"] is None
+    assert entry["status_code"] == 200
+
+
+def test_audit_log_records_a_failed_attempt_too(client):
+    client.post("/api/globals", json={"name": "", "value": "x"})  # rejected, 400
+
+    entries = client.get("/api/audit-log").get_json()
+    entry = next(e for e in entries if e["action"] == "POST /api/globals")
+    assert entry["status_code"] == 400
+
+
+def test_audit_log_does_not_record_plain_reads(client):
+    client.get("/api/workflows")
+
+    entries = client.get("/api/audit-log").get_json()
+    assert not any(e["action"] == "GET /api/workflows" for e in entries)
+
+
+def test_audit_log_does_not_record_worker_api_traffic(client):
+    client.post("/api/worker/claim", json={"worker_id": "w1"})
+
+    entries = client.get("/api/audit-log").get_json()
+    assert not any("/api/worker/" in e["action"] for e in entries)
+
+
+def test_audit_log_newest_entries_come_first(client):
+    client.post("/api/globals", json={"name": "a", "value": "1"})
+    client.post("/api/globals", json={"name": "b", "value": "2"})
+
+    entries = [e for e in client.get("/api/audit-log").get_json() if e["action"] == "POST /api/globals"]
+    assert len(entries) >= 2
+    assert entries[0]["id"] > entries[1]["id"]
 
 
 def test_globals_endpoint_refuses_a_reserved_namespace_name(client):

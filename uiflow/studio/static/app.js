@@ -2007,6 +2007,7 @@ function applyRoleVisibility() {
   el("tab-btn-credentials").classList.toggle("hidden", !isAdmin);
   el("tab-btn-globals").classList.toggle("hidden", !isAdmin);
   el("tab-btn-users").classList.toggle("hidden", !currentUser.multiuser || !isAdmin);
+  el("tab-btn-audit").classList.toggle("hidden", !isAdmin);
 
   const userBox = el("current-user");
   if (currentUser.multiuser && currentUser.username) {
@@ -2014,6 +2015,44 @@ function applyRoleVisibility() {
     userBox.classList.remove("hidden");
   } else {
     userBox.classList.add("hidden");
+  }
+}
+
+async function renderAuditLogPanel() {
+  const container = el("audit-log-list");
+  container.innerHTML = "Lädt...";
+  const res = await fetch("/api/audit-log");
+  if (!res.ok) {
+    container.innerHTML = '<p style="color:var(--muted)">Nur für Admins sichtbar.</p>';
+    return;
+  }
+  const entries = await res.json();
+  if (entries.length === 0) {
+    container.innerHTML = '<p style="color:var(--muted)">Noch keine Einträge.</p>';
+    return;
+  }
+  container.innerHTML = "";
+  for (const entry of entries) {
+    const row = document.createElement("div");
+    row.className = "list-row";
+
+    const badge = document.createElement("span");
+    badge.className = `audit-status-badge ${entry.status_code < 400 ? "ok" : "fail"}`;
+    badge.textContent = entry.status_code;
+
+    const info = document.createElement("div");
+    info.style.flex = "1";
+    info.style.minWidth = "0";
+    const label = document.createElement("div");
+    label.className = "list-row-name";
+    label.textContent = entry.action;
+    const meta = document.createElement("div");
+    meta.className = "list-row-meta";
+    meta.textContent = `${entry.username ? entry.username + " · " : ""}${new Date(entry.ts).toLocaleString()}`;
+    info.append(label, meta);
+
+    row.append(badge, info);
+    container.appendChild(row);
   }
 }
 
@@ -2721,6 +2760,7 @@ function switchTab(name) {
   if (name === "globals") renderGlobalsPanel();
   if (name === "schedules") renderSchedulesPanel();
   if (name === "users") renderUsersPanel();
+  if (name === "audit") renderAuditLogPanel();
 }
 
 function startNewWorkflow() {

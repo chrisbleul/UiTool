@@ -768,6 +768,32 @@ def test_run_scheduler_loop_sweeps_stale_jobs_each_iteration(monkeypatch):
     assert db.get_job(job_id)["status"] == "error"
 
 
+# --- audit log ---------------------------------------------------------------
+
+
+def test_add_and_list_audit_entries():
+    db.add_audit_entry("alice", "admin", "POST /api/globals", 200)
+    db.add_audit_entry(None, None, "POST /api/globals", 400)
+
+    entries = db.list_audit_entries()
+
+    assert len(entries) == 2
+    assert entries[0]["action"] == "POST /api/globals"
+    assert entries[0]["status_code"] == 400
+    assert entries[0]["username"] is None
+    assert entries[1]["username"] == "alice"
+    assert entries[1]["role"] == "admin"
+
+
+def test_list_audit_entries_newest_first_and_respects_limit():
+    for i in range(5):
+        db.add_audit_entry("alice", "admin", f"POST /api/x{i}", 200)
+
+    entries = db.list_audit_entries(limit=2)
+
+    assert [e["action"] for e in entries] == ["POST /api/x4", "POST /api/x3"]
+
+
 # --- global variables -------------------------------------------------------
 
 

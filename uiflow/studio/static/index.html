@@ -147,6 +147,7 @@
         <button class="tab-btn" data-tab="globals" role="tab" id="tab-btn-globals">Globale Variablen</button>
         <button class="tab-btn" data-tab="schedules" role="tab">Zeitplan</button>
         <button class="tab-btn hidden" data-tab="users" role="tab" id="tab-btn-users">Benutzer</button>
+        <button class="tab-btn hidden" data-tab="audit" role="tab" id="tab-btn-audit">Audit-Log</button>
       </div>
 
       <div class="tab-panel active" data-tab-panel="workflows">
@@ -224,6 +225,16 @@
           Anmeldedaten und globale Variablen verwalten.
         </p>
         <div id="users-list" class="queues-list"></div>
+      </div>
+
+      <div class="tab-panel" data-tab-panel="audit">
+        <p class="panel-hint">
+          Jeder verändernde API-Aufruf (auch abgelehnte Versuche) — wer, was, wann, mit welchem Ergebnis.
+          Lesende Aufrufe und der interne Worker-Datenverkehr (Claiming/Heartbeat/Logging, siehe
+          Remote-Worker oben) erscheinen bewusst nicht hier; die Job-Historie unter "Runs" ist deren
+          eigene Aufzeichnung. Neueste zuerst, die letzten 200 Einträge.
+        </p>
+        <div id="audit-log-list" class="queues-list"></div>
       </div>
     </section>
 

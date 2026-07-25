@@ -750,6 +750,19 @@ dass sich eine Installation versehentlich aussperrt). Solange kein einziger Benu
 verhält sich `uiflow studio` exakt wie zuvor (kein Login oder das einfache `UIFLOW_STUDIO_PASSWORD`-Gate)
 — die Umstellung ist rein additiv und ändert nichts an bestehenden Installationen.
 
+## Audit-Log
+
+Tab **Audit-Log** (nur für Admins sichtbar, siehe Rollen oben) — jeder verändernde API-Aufruf wird
+protokolliert: wer (Benutzername, sofern Multi-User-Modus aktiv), was (`METHODE /api/pfad` — bei
+dieser API praktisch immer selbsterklärend, z.B. `DELETE /api/users/bob`), wann und mit welchem
+HTTP-Status. **Auch abgelehnte Versuche** (401/403/400) werden aufgezeichnet, nicht nur erfolgreiche
+— gerade die sind für ein Audit-Log oft die interessanteren. Lesende Aufrufe (GET) werden bewusst
+nicht protokolliert (zu viel Rauschen, kein Sicherheits-relevantes Ereignis), ebenso wenig der interne
+Worker-Datenverkehr (`/api/worker/*` — Claiming/Heartbeat/Logging, siehe Remote-Worker oben, das wäre
+tausende Einträge pro Job); die Job-Historie unter **Runs** ist dessen eigene, bereits vollständige
+Aufzeichnung. In der Studio-Oberfläche über `GET /api/audit-log?limit=200` abrufbar (Standard: die
+letzten 200 Einträge, neueste zuerst).
+
 ## Tests
 
 ```powershell
@@ -821,9 +834,6 @@ Ideen, was als Nächstes sinnvoll sein könnte. Reihenfolge ist keine Priorität
   (viewer/operator/admin, siehe "Benutzer & Rollen" oben) — kein "Team A darf nur Workflows in Ordner
   X sehen/starten". Setzt vermutlich eine Ordner-/Projektstruktur (siehe unten) als Voraussetzung
   voraus, bevor sich Rechte überhaupt sinnvoll darauf beziehen lassen.
-- **Audit-Log**: wer hat wann welchen Workflow gespeichert, gestartet, gestoppt, ein Credential
-  geändert oder einen Benutzer angelegt? Mit RBAC gibt es jetzt einzelne Konten, aber keine Historie
-  ihrer Aktionen — relevant, sobald mehr als eine Person an derselben Installation arbeitet.
 - **Proaktive Fehlerbenachrichtigung** (E-Mail/Slack/Webhook, wenn ein Job oder Queue-Item endgültig
   fehlschlägt): heute muss man aktiv die Runs-Ansicht oder `/api/jobs?status=error` abfragen. Die
   Bausteine (`send_email`-Aktion, `http_request`) existieren im Workflow selbst bereits — hier ginge es

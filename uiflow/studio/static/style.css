@@ -209,6 +209,7 @@ body {
 }
 .tab-btn:hover { color: var(--text); }
 .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab-btn.hidden { display: none; }
 
 .tab-panel { display: none; max-width: 1100px; margin: 0 auto; padding: 0 32px 40px; }
 .tab-panel.active { display: block; }
@@ -1030,6 +1031,16 @@ body {
 .run-status-badge.success { color: var(--success); border: 1px solid var(--success); }
 .run-status-badge.error { color: var(--danger); border: 1px solid var(--danger); }
 .run-status-badge.cancelled { color: var(--muted); border: 1px solid var(--border); }
+
+.audit-status-badge {
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  flex: none;
+}
+.audit-status-badge.ok { color: var(--success); border: 1px solid var(--success); }
+.audit-status-badge.fail { color: var(--danger); border: 1px solid var(--danger); }
 
 /* --- inline rename/duplicate text field (Orchestrator > Workflows) ----------- */
 
