@@ -104,6 +104,39 @@ def test_api_run_snapshots_referenced_sub_workflows_into_the_job(client):
     assert detail["sub_workflows"]["teilprozess"]["steps"] == [{"action": "navigate", "url": "sub"}]
 
 
+def test_inspect_web_endpoint_reports_match_count(client, monkeypatch):
+    monkeypatch.setattr(
+        "uiflow.studio.picker.inspect_web_selector",
+        lambda url, selector: {"count": 2, "matches": [{"tag": "button", "text": "Absenden", "visible": True}]},
+    )
+
+    res = client.post("/api/inspect/web", json={"url": "https://example.com", "selector": "button"})
+
+    assert res.status_code == 200
+    data = res.get_json()
+    assert data["ok"] is True
+    assert data["count"] == 2
+
+
+def test_inspect_web_endpoint_requires_url_and_selector(client):
+    res = client.post("/api/inspect/web", json={"url": "https://example.com"})
+
+    assert res.status_code == 400
+    assert res.get_json()["ok"] is False
+
+
+def test_inspect_web_endpoint_reports_a_value_error_as_a_400(client, monkeypatch):
+    def raise_value_error(url, selector):
+        raise ValueError("Ungültiger Selector: boom")
+
+    monkeypatch.setattr("uiflow.studio.picker.inspect_web_selector", raise_value_error)
+
+    res = client.post("/api/inspect/web", json={"url": "https://example.com", "selector": "$bad"})
+
+    assert res.status_code == 400
+    assert "Ungültiger Selector" in res.get_json()["error"]
+
+
 def test_saving_over_an_existing_workflow_is_refused_when_overwrite_is_false(client):
     client.post("/api/workflows/report", json=_workflow("report", "https://original"))
 

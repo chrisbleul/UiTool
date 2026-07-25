@@ -315,6 +315,23 @@ def create_app() -> Flask:
         except Exception as exc:  # noqa: BLE001 - surface any picker failure to the UI
             return jsonify({"ok": False, "error": str(exc)}), 500
 
+    @app.post("/api/inspect/web")
+    def inspect_web() -> Response:
+        data = request.get_json(force=True) or {}
+        url = data.get("url")
+        selector = data.get("selector")
+        if not url or not selector:
+            return jsonify({"ok": False, "error": "url and selector required"}), 400
+        from .picker import inspect_web_selector
+
+        try:
+            result = inspect_web_selector(url, selector)
+            return jsonify({"ok": True, **result})
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001 - surface any picker failure to the UI
+            return jsonify({"ok": False, "error": str(exc)}), 500
+
     @app.post("/api/pick/desktop")
     def pick_desktop() -> Response:
         data = request.get_json(silent=True) or {}

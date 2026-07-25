@@ -123,6 +123,12 @@ python -m uiflow.cli studio
     manuell zur Zielanwendung zu wechseln.
   - **Live-Umrandung (nur Desktop)**: während der Aufnahme wird das Element unter dem Mauszeiger
     laufend mit einem roten Rahmen markiert (wie UiPaths "Auf Bildschirm anzeigen"), bevor geklickt wird.
+- **Selector prüfen** (nur Web, neben jedem Selector-Feld): prüft den bereits eingetragenen Selector
+  gegen die (per vorherigem `navigate`-Schritt bekannte) Seite in einem unsichtbaren Browser und meldet,
+  wie viele Elemente er trifft und als was (Tag, sichtbarer Text, sichtbar/unsichtbar) — ohne dass der
+  Workflow dafür erst laufen muss. Ein einzelner Treffer wird bestätigt, kein Treffer und mehr als ein
+  Treffer werden ausdrücklich als Problem markiert: ein mehrdeutiger Selector ist die klassische Ursache
+  dafür, dass ein Bot später das falsche Element anklickt.
 - **↶ Rückgängig** (oder Strg+Z) macht die letzte Änderung rückgängig — Schritt hinzugefügt/gelöscht/
   verschoben, Haltepunkt umgeschaltet, Feld bearbeitet, Backend gewechselt, Selektor übernommen.
 - **Anwendungs-Scope**: Ist der erste Schritt eines Desktop-Workflows `launch` oder `connect`, gilt er
@@ -592,21 +598,25 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
   n8n). Der Builder ist ein Sequenz-Designer — er bildet den Ablauf als verschachtelte Kartenliste ab,
   passend zum sequenziellen YAML-Format. Eine Flowchart-Ansicht bräuchte ein eigenes Format mit Knoten,
   Kanten und Koordinaten und ist deshalb bewusst noch nicht gebaut.
-- **UI Explorer (Oberflächen analysieren)**: Zum Erkunden einer Zielanwendung gibt es heute zwei
+- **UI Explorer (Oberflächen analysieren)**: Zum Erkunden einer Zielanwendung gibt es heute drei
   Teilstücke — `uiflow inspect-desktop "Fenstertitel" --depth 4` druckt den UI-Automation-Baum als Text
-  in die Konsole, und der Picker markiert während der Aufnahme das Element unter dem Mauszeiger. Was
-  fehlt, ist das Werkzeug dazwischen: den Baum interaktiv durchklicken, alle Eigenschaften eines Elements
-  sehen und vor allem **einen Selektor ausprobieren, bevor er in einem Workflow landet**. Drei Lücken:
-  - **Wie viele Treffer?** Ein mehrdeutiger Selektor ist die klassische Ursache dafür, dass ein Bot das
-    falsche Element anklickt — und genau das zeigt heute nichts an. Ein Explorer sollte einen Selektor
-    gegen die laufende Anwendung prüfen und melden, wie viele Elemente passen und welche.
-  - **Web fehlt komplett**: `inspect-desktop` hat kein Gegenstück für den Browser. Playwright kann einen
-    Selektor auswerten und die Treffer hervorheben — die Grundlage dafür ist also schon im Projekt.
-  - **Zwei Element-Modelle**: pywinauto-Eigenschaften auf der einen, DOM plus Playwright-Selektor auf der
-    anderen Seite. Der Explorer bräuchte eine gemeinsame Darstellung (Name, Typ, Eigenschaften, Kinder) —
-    die erzeugt `picker.py` im Kern bereits, bisher nur nicht als durchsuchbaren Baum.
+  in die Konsole, der Picker markiert während der Aufnahme das Element unter dem Mauszeiger, und der
+  Button **Selector prüfen** neben jedem Web-Selector-Feld beantwortet die wichtigste Einzelfrage direkt
+  im Eigenschaften-Panel: wie viele Elemente ein Selector auf der (per `navigate` bekannten) Seite trifft,
+  und als was (Tag, Text, sichtbar/unsichtbar) — ein mehrdeutiger Treffer wird dabei ausdrücklich als
+  solcher geflaggt, nicht nur gezählt, weil das die klassische Ursache dafür ist, dass ein Bot das
+  falsche Element anklickt. Was fehlt, ist das Werkzeug *dazwischen*: den Baum interaktiv durchklicken
+  und alle Eigenschaften eines Elements sehen, statt nur einen bereits eingetragenen Selector zu prüfen.
+  Zwei Lücken bleiben:
+  - **Kein Gegenstück für Desktop.** `Selector prüfen` gibt es nur für Web (Playwright wertet den
+    Selector gegen die geladene Seite aus); ein Desktop-Äquivalent müsste denselben "wie viele Treffer"-
+    Check gegen die laufende `pywinauto`-Anwendung fahren.
+  - **Kein durchsuchbarer Baum.** Weder `inspect-desktop` (nur Text in der Konsole) noch der neue Prüfen-
+    Button (nur ein bereits eingetragener Selector) lassen sich interaktiv durchklicken. Der Explorer
+    bräuchte dafür eine gemeinsame Darstellung über beide Backends hinweg (Name, Typ, Eigenschaften,
+    Kinder) — die erzeugt `picker.py` im Kern bereits, bisher nur nicht als Baum.
 
-  Zusammen mit dem nächsten Punkt ergibt das den natürlichen Arbeitsablauf: im Explorer suchen und prüfen,
+  Zusammen mit dem nächsten Punkt ergäbe das den natürlichen Arbeitsablauf: im Explorer suchen und prüfen,
   von dort als benanntes Element ins Repository speichern, in Aktivitäten wiederverwenden.
 - **Object Repository (wiederverwendbare Selektoren)**: Heute trägt jede Aktivität ihren Selektor
   inline — bei Web das Feld `selector`, bei Desktop das Tripel `control_type`/`title`/`auto_id`.

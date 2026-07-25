@@ -1020,6 +1020,16 @@ function renderProperties() {
     });
     body.appendChild(pickBtn);
   }
+
+  if (hasSelectorField) {
+    const inspectBtn = document.createElement("button");
+    inspectBtn.type = "button";
+    inspectBtn.className = "btn";
+    inspectBtn.textContent = "Selector prüfen";
+    inspectBtn.title = "Prüft, wie viele Elemente dieser Selector auf der Seite trifft";
+    inspectBtn.addEventListener("click", () => inspectWebSelector(step));
+    body.appendChild(inspectBtn);
+  }
 }
 
 function renderRecordingControls() {
@@ -1124,6 +1134,50 @@ async function pickWebSelector(step) {
     toast("Auswahl fehlgeschlagen: " + err, "error");
   } finally {
     hidePickStatus(banner);
+  }
+}
+
+// Read-only counterpart to pickWebSelector: checks the selector already in
+// the field against the running page instead of waiting for a click - a
+// selector matching more than one element is the classic reason a bot ends up
+// clicking the wrong one, so that case is flagged rather than just reported.
+async function inspectWebSelector(step) {
+  const selector = step.params.selector;
+  if (!selector) {
+    toast("Bitte zuerst einen Selector eintragen.", "error");
+    return;
+  }
+  let url = findNavigateUrl();
+  if (!url) {
+    url = window.prompt("URL der Seite, gegen die geprüft werden soll:", "https://");
+    if (!url) return;
+  }
+  let data;
+  try {
+    const res = await fetch("/api/inspect/web", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, selector }),
+    });
+    data = await res.json();
+  } catch (err) {
+    toast("Prüfung fehlgeschlagen: " + err, "error");
+    return;
+  }
+  if (!data.ok) {
+    toast("Prüfung fehlgeschlagen: " + data.error, "error");
+    return;
+  }
+  const first = data.matches[0];
+  const preview = first ? ` (z.B. <${first.tag}>${first.text ? ` "${first.text}"` : ""})` : "";
+  if (data.count === 0) {
+    toast(`Kein Element gefunden für "${selector}".`, "error");
+  } else if (data.count === 1) {
+    toast(`1 Treffer für "${selector}"${preview}.`, "success");
+  } else {
+    // More than one match is flagged, not just reported: an ambiguous
+    // selector is the classic reason a bot ends up clicking the wrong element.
+    toast(`${data.count} Treffer für "${selector}" - mehrdeutig${preview}.`, "error");
   }
 }
 

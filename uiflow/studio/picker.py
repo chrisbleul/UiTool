@@ -1,7 +1,12 @@
 """'Click to detect' selector recognition, used by the Studio's "Element wählen"
 button. Each function blocks the calling (request) thread until the user clicks
 somewhere, then returns the detected selector - no job/queue bookkeeping needed
-since Flask's dev server handles each request in its own thread."""
+since Flask's dev server handles each request in its own thread.
+
+inspect_web_selector below is the read-only counterpart: it doesn't wait for a
+click, it evaluates an already-written selector against the page and reports
+how many elements match - the first slice of the "UI Explorer" a selector
+could otherwise only be checked by actually running the workflow."""
 
 from __future__ import annotations
 
@@ -69,6 +74,57 @@ def pick_web_selector(url: str, timeout: float = 60.0) -> dict[str, Any]:
     if "selector" not in result:
         raise TimeoutError("Kein Element ausgewählt (Timeout)")
     return result
+
+
+# A broad selector (e.g. "div") can match the whole page - capped so the
+# response (and the Studio's display of it) stays a quick glance, not a DOM dump.
+_MAX_INSPECT_MATCHES = 20
+
+
+def inspect_web_selector(url: str, selector: str, timeout: float = 15.0) -> dict[str, Any]:
+    """Opens `url` in a headless browser and evaluates `selector` against the
+    loaded page, without waiting for a click - lets a selector be checked
+    before it lands in a workflow step instead of only surfacing a wrong or
+    ambiguous one once the workflow actually runs. A selector matching more
+    than one element is the classic reason a bot ends up clicking the wrong
+    one; this is what makes that visible up front.
+
+    Returns {"count": N, "matches": [{"tag", "text", "visible"}, ...]},
+    `matches` capped at _MAX_INSPECT_MATCHES entries (`count` is the true,
+    uncapped total). Raises ValueError for a page that fails to load or a
+    selector Playwright itself rejects (e.g. invalid CSS syntax).
+    """
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            try:
+                page.goto(url, timeout=int(timeout * 1000))
+            except Exception as exc:  # noqa: BLE001 - wrap any navigation failure (bad URL, timeout, ...)
+                raise ValueError(f"Seite konnte nicht geladen werden: {exc}") from exc
+            try:
+                locator = page.locator(selector)
+                count = locator.count()
+            except Exception as exc:  # noqa: BLE001 - an invalid selector raises deep inside Playwright
+                raise ValueError(f"Ungültiger Selector: {exc}") from exc
+            matches = []
+            for i in range(min(count, _MAX_INSPECT_MATCHES)):
+                element = locator.nth(i)
+                try:
+                    matches.append(
+                        {
+                            "tag": element.evaluate("el => el.tagName.toLowerCase()"),
+                            "text": (element.inner_text(timeout=1000) or "").strip()[:80],
+                            "visible": element.is_visible(),
+                        }
+                    )
+                except Exception:  # noqa: BLE001 - one unreadable element shouldn't hide the rest
+                    matches.append({"tag": "?", "text": "", "visible": False})
+            return {"count": count, "matches": matches}
+        finally:
+            browser.close()
 
 
 def _most_specific_element_at(x: int, y: int):
