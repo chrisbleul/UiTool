@@ -418,15 +418,6 @@ body {
   pointer-events: none;
 }
 
-/* The placeholder left where the drop would land. */
-.drag-ghost {
-  opacity: 1;
-  background: color-mix(in srgb, var(--accent) 7%, transparent);
-  border: 1px dashed var(--accent);
-  border-radius: 12px;
-  box-shadow: none;
-}
-.drag-ghost > * { visibility: hidden; }
 .drag-chosen { cursor: grabbing; }
 
 .slot { margin-top: 10px; }
@@ -496,6 +487,19 @@ body {
   transition: box-shadow 0.2s var(--ease-spring), border-color 0.2s var(--ease-spring);
   animation: step-in 220ms var(--ease-spring) both;
 }
+/* The placeholder showing where the drop would land. Declared after
+   .step-card because it overrides that rule's border and shadow, and the two
+   selectors have equal specificity. */
+.drag-ghost {
+  opacity: 1;
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  border: 1px dashed var(--accent);
+  border-radius: 12px;
+  box-shadow: none;
+  animation: none;
+}
+.drag-ghost > * { visibility: hidden; }
+
 .step-card.selected {
   border-color: var(--accent);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 30%, transparent), var(--shadow-md);
