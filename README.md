@@ -130,10 +130,26 @@ python -m uiflow.cli studio
   Karte fixiert: nicht verschiebbar, und es lässt sich nichts darüber ablegen, weil alle folgenden
   Schritte sich auf ihn beziehen.
 - **🔴 Aufnahme starten** (im Scope-Bereich, sobald ein `launch`/`connect`-Schritt existiert): zeichnet
-  echte Klicks und Texteingaben in der Zielanwendung live als Workflow-Schritte auf. Text wird gepuffert
-  und beim nächsten Klick oder mit Tab/Enter als `type`-Schritt übernommen; Klicks außerhalb der
-  Scope-Anwendung werden ignoriert. **⏹ Aufnahme stoppen** beendet die Sitzung (verbleibender
-  Text wird noch als letzter Schritt übernommen).
+  echte Interaktionen in der Zielanwendung live als Workflow-Schritte auf:
+  - **Klicks** werden als `click` übernommen; ein **Rechtsklick** trägt zusätzlich `button: right`
+    (Mittelklick entsprechend `middle`).
+  - **Ziehen** (Maustaste gedrückt halten und über eine kurze Distanz bewegen, z.B. eine Zeile per
+    Drag & Drop verschieben) wird als `drag` mit der Zielposition (`to_x`/`to_y`) aufgezeichnet, nicht
+    als Klick — kleine Zitterbewegungen unterhalb weniger Pixel zählen weiterhin als Klick.
+  - **Scrollen** wird als `scroll` aufgezeichnet; mehrere Mausrad-Bewegungen über demselben Element
+    hintereinander werden zu einem einzigen `scroll`-Schritt zusammengefasst (wie Text: erst ein
+    Elementwechsel oder eine andere Aktion committet ihn), statt einen Schritt pro Rad-Kerbe zu erzeugen.
+  - **Tastenkombinationen** mit gehaltenem Strg oder Alt (z.B. Strg+S) werden als `send_hotkey` erfasst,
+    nicht als Text. Reines Umschalttaste-Tippen (Großbuchstaben, Sonderzeichen) bleibt normaler Text —
+    Umschalttaste allein löst keine Tastenkombination aus.
+  - Text wird weiterhin gepuffert und beim nächsten Klick, einem `send_hotkey` oder mit Tab/Enter als
+    `type`-Schritt übernommen.
+  - **Scope über mehrere Fenster**: Interaktionen zählen nicht nur im ursprünglich verbundenen Fenster,
+    sondern auch in Fenstern, die von diesem *besessen* werden (Windows' eigene Owner-Beziehung, z.B.
+    ein modaler "Speichern unter"-Dialog) — selbst wenn ein solches Fenster technisch unter einer
+    anderen Prozess-ID läuft. Interaktionen außerhalb dieses Scopes werden ignoriert.
+  - **⏹ Aufnahme stoppen** beendet die Sitzung (verbleibender Text bzw. eine noch offene Scroll-Serie
+    wird noch als letzter Schritt übernommen).
 
 `--port`/`--host`/`--no-browser` stehen als Flags zur Verfügung. `uiflow run` (CLI ohne Studio)
 unterstützt Haltepunkte ebenfalls: die Ausführung stoppt im Terminal mit "Weiter mit Enter...".
@@ -210,8 +226,13 @@ Web-Actions (siehe `uiflow/backends/web.py`): `navigate`, `click`, `type`, `get_
 `wait_for_selector`, `wait`, `screenshot`.
 
 Desktop-Actions (siehe `uiflow/backends/desktop.py`): `launch`, `connect`, `wait_for_element`, `click`,
-`type`, `get_text`, `send_hotkey`, `wait`, `screenshot`.
+`drag`, `scroll`, `type`, `get_text`, `send_hotkey`, `wait`, `screenshot`.
 Desktop-Selektoren sind beliebige `pywinauto` `child_window(**kwargs)`-Argumente, z.B. `control_type`, `title`, `auto_id`, `class_name`.
+`click` nimmt optional `button` (`left`/`right`/`middle`, Standard `left`) für Rechts-/Mittelklick.
+`drag` zieht das aufgelöste Element per gedrückter Maustaste zu einer absoluten Bildschirmposition
+(`to_x`/`to_y`) — das Ziel ist bewusst ein Punkt statt eines zweiten Selektors, weil eine Ablagestelle
+oft kein eigenes Element ist (leere Listenfläche, Lücke zwischen Zeilen). `scroll` bewegt das Mausrad
+über der Mitte des Elements; `amount` folgt der Windows-Konvention (positiv = hoch, negativ = runter).
 
 Jeder Step kann zusätzlich `save_as: <name>` tragen — der Rückgabewert der Aktion (z.B. der von
 `get_text` gelesene Text) landet dann in einer Variable, die spätere Steps als `{var.name}` verwenden können.
@@ -505,9 +526,6 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
 - **Echtes Multi-User-/Rechte-System**: das optionale Login (`UIFLOW_STUDIO_PASSWORD`) ist ein
   einzelnes geteiltes Passwort ohne einzelne Konten, Rollen oder Berechtigungen — bewusst minimal
   gehalten, kein Ersatz für echtes RBAC.
-- **Recorder-Feinschliff**: der Aufnahme-Modus (`uiflow/studio/recorder.py`) deckt Klick + Texteingabe
-  ab; Drag, Rechtsklick, Scroll, Tastenkombinationen und Mehrfach-Fenster-Scopes werden noch nicht
-  erfasst.
 - **Unterprozesse beim Einreihen auflösen**: `run_workflow` gibt es inzwischen (siehe oben), es löst
   den Namen aber erst zur Laufzeit auf. `create_job` legt sonst den kompletten Workflow als JSON in der
   Job-Zeile ab, damit ein Job exakt das ausführt, was beim Einreihen galt — für Unterprozesse gilt diese
