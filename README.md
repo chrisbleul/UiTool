@@ -360,10 +360,17 @@ sind bewusst so gewählt:
   bricht der Schritt mit einer klaren Meldung ab, statt Desktop-Aufrufe gegen einen Browser zu schicken.
 - **Zyklen werden abgelehnt.** Ruft A den Prozess B auf, der wieder A aufruft, endet der Schritt mit
   `Sub-workflow cycle: A -> B -> A`.
-- **Auflösung zur Laufzeit.** Der Name wird beim Ausführen in `workflows/` nachgeschlagen — dieselbe
-  Datei, die der Builder speichert und in der Auswahlliste anbietet. Das heißt auch: wird ein
-  Unterprozess bearbeitet, während ein Job schon in der Warteschlange steht, läuft der Job mit der
-  neuen Fassung (der Job-Snapshot in `orchestrator.db` enthält nur den aufrufenden Workflow).
+- **Beim Einreihen aufgelöst und mit eingereiht.** `uiflow run` von der Kommandozeile löst den Namen
+  direkt in `workflows/` auf — dieselbe Datei, die der Builder speichert und in der Auswahlliste anbietet.
+  Ein **Job** dagegen bettet jeden referenzierten Unterprozess (rekursiv, falls dieser selbst weitere
+  aufruft) beim Einreihen als Snapshot mit in die Job-Zeile ein (`sub_workflows_json`, siehe
+  `models.resolve_sub_workflows`) — genau wie der aufrufende Workflow selbst schon als Snapshot vorliegt.
+  Ein Job führt damit exakt die Unterprozess-Fassung aus, die beim Einreihen galt, selbst wenn die Datei
+  danach bearbeitet oder gelöscht wird, bevor ein Worker sie abholt. Ein `workflow`-Wert, der kein
+  wörtlicher Name ist (z.B. `"{var.ziel}"`, erst zur Laufzeit aus Job-/Item-Daten bekannt), lässt sich so
+  nicht vorab festlegen und bleibt wie zuvor eine Live-Auflösung zum Ausführungszeitpunkt — ebenso ein
+  zyklischer oder fehlender Verweis, der ohnehin erst beim tatsächlichen Lauf mit einer klaren
+  Fehlermeldung abbricht.
 
 Ein Haltepunkt *innerhalb* eines Unterprozesses hält den Lauf korrekt an und zeigt dessen Variablen,
 markiert aber keine Karte auf der Zeichenfläche — die zeigt den aufrufenden Workflow, in dem dieser
@@ -526,11 +533,6 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
 - **Echtes Multi-User-/Rechte-System**: das optionale Login (`UIFLOW_STUDIO_PASSWORD`) ist ein
   einzelnes geteiltes Passwort ohne einzelne Konten, Rollen oder Berechtigungen — bewusst minimal
   gehalten, kein Ersatz für echtes RBAC.
-- **Unterprozesse beim Einreihen auflösen**: `run_workflow` gibt es inzwischen (siehe oben), es löst
-  den Namen aber erst zur Laufzeit auf. `create_job` legt sonst den kompletten Workflow als JSON in der
-  Job-Zeile ab, damit ein Job exakt das ausführt, was beim Einreihen galt — für Unterprozesse gilt diese
-  Zusage derzeit nicht. Sie ließe sich wiederherstellen, indem referenzierte Unterprozesse beim Einreihen
-  mit in den Snapshot aufgenommen werden.
 - **Deklarierte Workflow-Variablen** (UiPaths Variablen-Panel): Installationsweite globale Variablen
   gibt es inzwischen (siehe oben), die *workflow-eigenen* entstehen aber weiterhin stillschweigend beim
   ersten `assign` — nirgends steht, welche ein Workflow verwendet, und es gibt keine Startwerte oder

@@ -130,3 +130,76 @@ def load_workflow_by_name(name: str) -> Workflow:
     if not path.exists():
         raise FileNotFoundError(f"No workflow named '{name}' in {WORKFLOWS_DIR}")
     return Workflow.load(path)
+
+
+def parse_steps(raw: Any) -> list[Step]:
+    """Parses a nested branch (if.then, for_each.steps, try.catch, a switch
+    case, ...) into Step objects. A branch stays a raw list-of-dicts inside its
+    parent step's `params` until something actually needs to look inside it -
+    the engine to execute it, resolve_sub_workflows below to walk it without
+    executing it - so this one parser is shared rather than duplicated."""
+    if not isinstance(raw, list):
+        return []
+    return [Step.from_dict(dict(item)) for item in raw]
+
+
+_LIST_BRANCH_FIELDS = ("then", "else", "steps", "catch", "default")
+
+
+def _nested_branches(step: Step) -> list[list[Step]]:
+    branches = []
+    for field_name in _LIST_BRANCH_FIELDS:
+        value = step.params.get(field_name)
+        if isinstance(value, list):
+            branches.append(parse_steps(value))
+    cases = step.params.get("cases")
+    if isinstance(cases, dict):
+        for value in cases.values():
+            if isinstance(value, list):
+                branches.append(parse_steps(value))
+    return branches
+
+
+def resolve_sub_workflows(workflow: Workflow) -> dict[str, dict[str, Any]]:
+    """Recursively resolves every literal `run_workflow` reference in
+    `workflow` - and, transitively, inside each resolved sub-workflow - to its
+    current file contents, keyed by name.
+
+    Used at job-enqueue time (see orchestrator/db.create_job) so a queued job
+    keeps running exactly the sub-workflow that existed when it was queued,
+    even if the referenced file is edited or deleted before a worker picks the
+    job up - the same guarantee the job's own workflow snapshot already gives
+    its top-level steps.
+
+    A `workflow:` value that isn't a literal name (e.g. "{var.ziel}", only
+    known from run-time data) can't be pinned this way and is skipped, same as
+    a cycle or a missing file - all three keep resolving at run time exactly
+    as before (engine.py raises a clear StepError for a cycle or a missing
+    file once the workflow actually runs; this walk just must not itself loop
+    forever or abort on either).
+    """
+    resolved: dict[str, dict[str, Any]] = {}
+
+    def visit(steps: list[Step], stack: list[str]) -> None:
+        for step in steps:
+            if step.action == "run_workflow":
+                name = step.params.get("workflow")
+                if (
+                    isinstance(name, str)
+                    and name
+                    and "{" not in name
+                    and name not in stack
+                    and name not in resolved
+                ):
+                    try:
+                        sub = load_workflow_by_name(name)
+                    except Exception:  # noqa: BLE001 - a missing/broken file surfaces at run time instead
+                        sub = None
+                    if sub is not None:
+                        resolved[name] = sub.to_dict()
+                        visit(sub.steps, [*stack, name])
+            for branch in _nested_branches(step):
+                visit(branch, stack)
+
+    visit(workflow.steps, [workflow.name])
+    return resolved

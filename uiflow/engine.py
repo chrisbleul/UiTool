@@ -6,7 +6,7 @@ import re
 import time
 from typing import Any, Callable, Optional
 
-from .models import Step, Workflow, load_workflow_by_name
+from .models import Step, Workflow, load_workflow_by_name, parse_steps
 
 logger = logging.getLogger("uiflow")
 
@@ -117,6 +117,7 @@ class WorkflowEngine:
         # (see _log/_redact_secrets) can mask them instead of writing secrets
         # to the job log / console in plain text.
         self._secrets: set[str] = set()
+        self._sub_workflows: dict[str, Workflow] = {}
 
     def run(
         self,
@@ -125,6 +126,7 @@ class WorkflowEngine:
         should_stop: Optional[ShouldStop] = None,
         variables: Optional[dict[str, Any]] = None,
         global_variables: Optional[dict[str, Any]] = None,
+        sub_workflows: Optional[dict[str, Workflow]] = None,
     ) -> None:
         self.variables = dict(variables) if variables else {}
         # Installation-wide values, kept apart from the run's own variables so
@@ -136,6 +138,14 @@ class WorkflowEngine:
         self._secrets = set()
         self._counter = 0
         self._backend_name = workflow.backend
+        # A snapshot of every `run_workflow` reference this workflow (and its
+        # own sub-workflows) had at enqueue time - see models.resolve_sub_workflows
+        # and orchestrator/db.create_job. `_run_sub_workflow` prefers this over
+        # reading the file fresh, so a queued job keeps running exactly what it
+        # was queued with even if the file changes before a worker gets to it.
+        # Not reset when entering a sub-workflow: it's a whole-run snapshot, not
+        # a per-scope value.
+        self._sub_workflows = dict(sub_workflows) if sub_workflows else {}
         # Names of the workflows currently on the call stack, so `run_workflow`
         # can refuse a cycle instead of recursing until Python's stack gives out.
         self._workflow_stack = [workflow.name]
@@ -260,9 +270,7 @@ class WorkflowEngine:
 
     @staticmethod
     def _sub_steps(raw: Any) -> list[Step]:
-        if not isinstance(raw, list):
-            return []
-        return [Step.from_dict(dict(item)) for item in raw]
+        return parse_steps(raw)
 
     def _run_if(
         self,
@@ -399,10 +407,12 @@ class WorkflowEngine:
             chain = " -> ".join([*self._workflow_stack, name])
             raise StepError(index, step, ValueError(f"Sub-workflow cycle: {chain}"))
 
-        try:
-            sub = load_workflow_by_name(name)
-        except Exception as exc:  # noqa: BLE001 - wrap a missing/broken file with step context
-            raise StepError(index, step, exc) from exc
+        sub = self._sub_workflows.get(name)
+        if sub is None:
+            try:
+                sub = load_workflow_by_name(name)
+            except Exception as exc:  # noqa: BLE001 - wrap a missing/broken file with step context
+                raise StepError(index, step, exc) from exc
         if sub.backend != self._backend_name:
             raise StepError(
                 index,

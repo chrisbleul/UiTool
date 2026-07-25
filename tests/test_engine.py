@@ -1148,6 +1148,44 @@ def test_a_sub_workflow_can_itself_call_another(workflows_dir):
     assert backend.calls == [("navigate", "mitte"), ("navigate", "innen")]
 
 
+def test_sub_workflows_snapshot_is_used_instead_of_the_live_file(workflows_dir):
+    # No file for "teilprozess" is written at all - a run relying on the live
+    # file would fail with FileNotFoundError; the snapshot must be enough.
+    workflow = Workflow(name="haupt", backend="web", steps=[Step("run_workflow", {"workflow": "teilprozess"})])
+    snapshot = Workflow(name="teilprozess", backend="web", steps=[Step("navigate", {"url": "aus dem snapshot"})])
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow, sub_workflows={"teilprozess": snapshot})
+
+    assert backend.calls == [("navigate", "aus dem snapshot")]
+
+
+def test_sub_workflows_snapshot_wins_over_a_changed_file(workflows_dir):
+    write_workflow(workflows_dir, "teilprozess", [{"action": "navigate", "url": "aktuelle datei"}])
+    snapshot = Workflow(
+        name="teilprozess", backend="web", steps=[Step("navigate", {"url": "stand beim einreihen"})]
+    )
+    workflow = Workflow(name="haupt", backend="web", steps=[Step("run_workflow", {"workflow": "teilprozess"})])
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow, sub_workflows={"teilprozess": snapshot})
+
+    assert backend.calls == [("navigate", "stand beim einreihen")]
+
+
+def test_a_name_missing_from_the_snapshot_still_falls_back_to_the_live_file(workflows_dir):
+    write_workflow(workflows_dir, "teilprozess", [{"action": "navigate", "url": "von der platte"}])
+    workflow = Workflow(name="haupt", backend="web", steps=[Step("run_workflow", {"workflow": "teilprozess"})])
+    backend = RecordingBackend()
+
+    # An irrelevant snapshot entry (e.g. an older job queued before this
+    # sub-workflow existed) must not break resolution - it just falls through.
+    unrelated = Workflow(name="andere", backend="web", steps=[])
+    WorkflowEngine(backend).run(workflow, sub_workflows={"andere": unrelated})
+
+    assert backend.calls == [("navigate", "von der platte")]
+
+
 def test_a_whole_placeholder_argument_keeps_its_type(workflows_dir):
     write_workflow(
         workflows_dir,

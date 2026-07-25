@@ -30,7 +30,7 @@ from typing import Any
 
 from . import db
 from ..engine import StepError, WorkflowCancelled, WorkflowEngine
-from ..models import Workflow
+from ..models import Workflow, resolve_sub_workflows
 
 logger = logging.getLogger("uiflow")
 
@@ -62,7 +62,12 @@ def _make_backend(workflow: Workflow) -> Any:
     return DesktopBackend()
 
 
-def _run_workflow_once(job_id: str, workflow: Workflow, variables: dict[str, Any] | None = None) -> None:
+def _run_workflow_once(
+    job_id: str,
+    workflow: Workflow,
+    variables: dict[str, Any] | None = None,
+    sub_workflows: dict[str, Workflow] | None = None,
+) -> None:
     # Tracks whether this run was ever paused at a breakpoint - if the user then
     # clicks "Stoppen" while paused there (mid-debug), we deliberately skip
     # backend.close() below so the browser/desktop app stays open exactly where
@@ -89,6 +94,7 @@ def _run_workflow_once(job_id: str, workflow: Workflow, variables: dict[str, Any
             # Read per run, not per job: editing a global takes effect on the
             # next run without re-queuing anything.
             global_variables=db.get_global_variables(),
+            sub_workflows=sub_workflows,
         )
     finally:
         stopped_while_debugging = reached_breakpoint and db.is_stop_requested(job_id)
@@ -111,16 +117,19 @@ def _run_job(job: dict[str, Any]) -> None:
     logger.setLevel(logging.INFO)
 
     workflow_dict = json.loads(job["workflow_json"])
+    sub_workflows = {
+        name: Workflow.from_raw(raw) for name, raw in json.loads(job.get("sub_workflows_json") or "{}").items()
+    }
     queue_name = job["queue_name"]
 
     try:
         failed = 0
         processed = 0
         if queue_name:
-            processed, failed = _run_queue_driven(job_id, workflow_dict, queue_name)
+            processed, failed = _run_queue_driven(job_id, workflow_dict, queue_name, sub_workflows)
         else:
             logger.info("Running job '%s'", job["name"])
-            _run_workflow_once(job_id, Workflow.from_raw(workflow_dict))
+            _run_workflow_once(job_id, Workflow.from_raw(workflow_dict), sub_workflows=sub_workflows)
         if db.is_stop_requested(job_id):
             db.finish_job(job_id, "cancelled")
         elif failed:
@@ -155,7 +164,12 @@ def _sleep_unless_stopped(job_id: str, seconds: float, tick: float = 0.5) -> boo
         time.sleep(min(tick, remaining))
 
 
-def _run_queue_driven(job_id: str, workflow_dict: dict[str, Any], queue_name: str) -> tuple[int, int]:
+def _run_queue_driven(
+    job_id: str,
+    workflow_dict: dict[str, Any],
+    queue_name: str,
+    sub_workflows: dict[str, Workflow] | None = None,
+) -> tuple[int, int]:
     """Processes the queue until it's exhausted (or stopped), returning
     (processed, permanently_failed) so the caller can set the job's status from
     what actually happened to the items. Both counts are per *item*, not per
@@ -189,7 +203,9 @@ def _run_queue_driven(job_id: str, workflow_dict: dict[str, Any], queue_name: st
         attempted.add(item["id"])
         logger.info("[item %d] %s", item["id"], payload)
         try:
-            _run_workflow_once(job_id, Workflow.from_raw(workflow_dict), variables={"item": payload})
+            _run_workflow_once(
+                job_id, Workflow.from_raw(workflow_dict), variables={"item": payload}, sub_workflows=sub_workflows
+            )
             db.complete_queue_item(item["id"], True, output={})
         except WorkflowCancelled:
             # A user-requested stop says nothing about the item - hand it back
@@ -249,8 +265,13 @@ def run_scheduler_loop(poll_interval: float = 20.0, stop_event=None) -> None:
                 continue
             if not due:
                 continue
-            workflow = json.loads(schedule["workflow_json"])
-            db.create_job(schedule["name"], workflow, queue_name=schedule["queue_name"])
+            workflow_obj = Workflow.from_raw(json.loads(schedule["workflow_json"]))
+            db.create_job(
+                schedule["name"],
+                workflow_obj.to_dict(),
+                queue_name=schedule["queue_name"],
+                sub_workflows=resolve_sub_workflows(workflow_obj),
+            )
             db.mark_schedule_ran(schedule["id"])
             logger.info("Schedule '%s' fired -> new job enqueued", schedule["name"])
         if stop_event is not None:
