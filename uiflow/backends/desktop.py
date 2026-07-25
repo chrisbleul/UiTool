@@ -114,6 +114,17 @@ class DesktopBackend:
             raise TimeoutError(f"Element still present after {timeout}s: {selector}")
         self._resolve(timeout=timeout, **selector)
 
+    def element_exists(self, **selector: Any) -> bool:
+        """Quick, non-waiting existence check (used to pick between an Object
+        Repository element's fallback candidates, see engine.py's
+        _resolve_element_reference) - not a workflow action of its own."""
+        if self._window is None:
+            return False
+        try:
+            return bool(self._window.child_window(**selector).exists())
+        except Exception:  # noqa: BLE001 - an unresolvable selector just isn't a match
+            return False
+
     def click(self, timeout: int = 10, double: bool = False, button: str = "left", **selector: Any) -> None:
         control = self._resolve(timeout=timeout, **selector)
         if double:

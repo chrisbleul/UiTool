@@ -574,6 +574,30 @@ aktuell eingetragenen Felder des Steps unter einem neuen Namen im Repository abl
   die Referenz deshalb als eigenen Schritt vor dem Backend-Dispatch auf, nicht über das
   Platzhalter-Muster.
 
+### Fallback-Selektoren
+
+Ein Element im Repository kann mehrere alternative Feldsätze tragen, der Reihe nach versucht, bis
+einer tatsächlich passt — die Fallback-Strategie, die UiPath für Legacy- oder instabile Oberflächen
+anbietet:
+
+```yaml
+MeineApp:
+  Suchfeld:
+    - selector: "#search"          # zuerst versucht
+    - selector: "input[name=q]"    # Fallback, falls #search nicht (mehr) existiert
+```
+
+Kann das Backend prüfen, ob ein Kandidat gerade existiert (`element_exists` — für Web per Playwright-
+Selektor, für Desktop per `pywinauto child_window(...).exists()`), probiert die Engine die Kandidaten
+der Reihe nach durch und nimmt den ersten, der zutrifft. Passt keiner (oder kann das Backend das nicht
+prüfen), wird trotzdem der erste Kandidat verwendet — der eigentliche Schritt läuft dann normal weiter
+und meldet einen gewohnten, klaren Fehler, statt dass der Schritt still übersprungen wird.
+
+Im Studio erscheint der Button **+ Alternative aufnehmen** (dasselbe Auswahl-Symbol wie beim normalen
+Picker) anstelle von "Als Element speichern", sobald eine Repository-Referenz aktiv ist — er startet
+denselben Klick-zu-Auswählen-Ablauf, hängt das Ergebnis aber als zusätzlichen Kandidaten an, statt es
+zu überschreiben.
+
 ## Anmeldedaten (Credentials)
 
 `get_credential` liest ein Geheimnis (Passwort, API-Key, ...) zur Laufzeit in eine Variable ein, ohne
@@ -670,8 +694,8 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
   Zusammen mit dem Object Repository (siehe oben) ergäbe das den natürlichen Arbeitsablauf: im Explorer
   suchen und prüfen, von dort direkt als benanntes Element speichern, statt den Umweg über "Selector
   prüfen" -> Feld ausfüllen -> "Als Element speichern" zu nehmen.
-- **Selectors robuster machen** (Fallback-Strategien, Bild-basierte Erkennung wie UiPath es für
-  Legacy-Apps anbietet). Das Object Repository (siehe oben) gibt dem jetzt einen natürlichen Ort: eine
-  Fallback-Strategie wäre eine Eigenschaft des dort gespeicherten Elements (z.B. mehrere alternative
-  Selektoren derselben Sache, der Reihe nach versucht) statt eine Eigenschaft jeder einzelnen Aktivität,
-  die es referenziert — noch nicht gebaut.
+- **Bild-basierte Elementerkennung** (wie UiPath es für Legacy-Apps ohne brauchbare UI-Automation-Baum
+  anbietet). Fallback-Selektoren für das Object Repository gibt es inzwischen (siehe oben, mehrere
+  alternative `control_type`/`title`/`auto_id`- bzw. `selector`-Kandidaten, der Reihe nach versucht) —
+  eine Erkennung rein über ein Bildmuster auf dem Bildschirm, unabhängig von jedem Automation-Baum, ist
+  davon unabhängig und fehlt weiterhin.

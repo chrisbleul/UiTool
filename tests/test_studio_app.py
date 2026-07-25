@@ -147,11 +147,37 @@ def test_repository_endpoints_add_list_and_delete_an_element(client):
     assert res.status_code == 200
 
     entries = client.get("/api/repository").get_json()
-    assert entries == [{"scope": "MeineApp", "name": "Suchfeld", "fields": {"selector": "#search"}}]
+    assert entries == [
+        {
+            "scope": "MeineApp",
+            "name": "Suchfeld",
+            "fields": {"selector": "#search"},
+            "candidates": [{"selector": "#search"}],
+        }
+    ]
 
     res = client.delete("/api/repository/MeineApp/Suchfeld")
     assert res.status_code == 200
     assert client.get("/api/repository").get_json() == []
+
+
+def test_repository_fallback_endpoint_appends_a_candidate(client):
+    client.post("/api/repository", json={"scope": "MeineApp", "name": "Suchfeld", "fields": {"selector": "#a"}})
+
+    res = client.post("/api/repository/MeineApp/Suchfeld/fallback", json={"fields": {"selector": "#b"}})
+
+    assert res.status_code == 200
+    assert res.get_json()["candidates"] == [{"selector": "#a"}, {"selector": "#b"}]
+    entries = client.get("/api/repository").get_json()
+    assert entries[0]["candidates"] == [{"selector": "#a"}, {"selector": "#b"}]
+
+
+def test_repository_fallback_endpoint_requires_non_empty_fields(client):
+    client.post("/api/repository", json={"scope": "MeineApp", "name": "Suchfeld", "fields": {"selector": "#a"}})
+
+    res = client.post("/api/repository/MeineApp/Suchfeld/fallback", json={"fields": {}})
+
+    assert res.status_code == 400
 
 
 def test_repository_endpoint_requires_scope_name_and_fields(client):

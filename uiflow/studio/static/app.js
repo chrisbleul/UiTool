@@ -1090,14 +1090,28 @@ function renderElementReferenceSection(step, hasSelectorField) {
   });
   row.appendChild(select);
 
-  const saveBtn = document.createElement("button");
-  saveBtn.type = "button";
-  saveBtn.className = "btn-icon";
-  saveBtn.innerHTML = ICONS.copy;
-  saveBtn.title = "Aktuelle Felder als Element speichern";
-  saveBtn.setAttribute("aria-label", "Aktuelle Felder als Element speichern");
-  saveBtn.addEventListener("click", () => saveStepAsRepositoryElement(step, hasSelectorField));
-  row.appendChild(saveBtn);
+  if (step.params.element) {
+    // A reference is already active - offer a fallback candidate for it
+    // instead of "save as new element" (the step's own fields are hidden/
+    // cleared while a reference is active, so there'd be nothing to save).
+    const fallbackBtn = document.createElement("button");
+    fallbackBtn.type = "button";
+    fallbackBtn.className = "btn-icon";
+    fallbackBtn.innerHTML = ICONS.target;
+    fallbackBtn.title = "Alternative aufnehmen (Fallback, falls das Element nicht gefunden wird)";
+    fallbackBtn.setAttribute("aria-label", "Alternative für dieses Element aufnehmen");
+    fallbackBtn.addEventListener("click", () => addFallbackForReferencedElement(step, hasSelectorField));
+    row.appendChild(fallbackBtn);
+  } else {
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.className = "btn-icon";
+    saveBtn.innerHTML = ICONS.copy;
+    saveBtn.title = "Aktuelle Felder als Element speichern";
+    saveBtn.setAttribute("aria-label", "Aktuelle Felder als Element speichern");
+    saveBtn.addEventListener("click", () => saveStepAsRepositoryElement(step, hasSelectorField));
+    row.appendChild(saveBtn);
+  }
 
   wrap.appendChild(row);
   return wrap;
@@ -1151,6 +1165,32 @@ async function saveStepAsRepositoryElement(step, hasSelectorField) {
   await loadRepository();
   toast(`Element "${scope}/${name}" gespeichert.`, "success");
   renderSteps();
+}
+
+// Adds another candidate field-set to an already-referenced Object Repository
+// element (see engine.py's _resolve_element_reference / add_fallback) - the
+// fallback-selector strategy a flaky or legacy-app element needs, picked at
+// run time by trying each candidate in order until one actually matches.
+async function addFallbackForReferencedElement(step, hasSelectorField) {
+  const ref = step.params.element;
+  if (!ref) return;
+  const [scope, name] = ref.split("/");
+
+  const fields = await pickRawFields(hasSelectorField);
+  if (!fields) return;
+
+  const res = await fetch(`/api/repository/${encodeURIComponent(scope)}/${encodeURIComponent(name)}/fallback`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ fields }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    toast("Speichern fehlgeschlagen: " + (data.error || res.status), "error");
+    return;
+  }
+  await loadRepository();
+  toast(`Alternative für "${ref}" gespeichert (${data.candidates.length} Kandidaten insgesamt).`, "success");
 }
 
 function renderRecordingControls() {
@@ -1230,32 +1270,84 @@ function recordHotkey(input, step, fieldName) {
   window.addEventListener("keydown", handler, true);
 }
 
-async function pickWebSelector(step) {
-  let url = findNavigateUrl();
-  if (!url) {
-    url = window.prompt("URL der Seite, auf der ausgewählt werden soll:", "https://");
-    if (!url) return;
+// Runs the click-to-pick flow (web or desktop) and returns the raw fields it
+// produced ({selector} or {control_type, title, auto_id}, only the ones
+// actually present), or null on cancel/failure - shared by pickWebSelector/
+// pickDesktopSelector (write the result into the step) and
+// addFallbackForReferencedElement (saves it into the Object Repository
+// instead, see engine.py's _resolve_element_reference fallback support).
+async function pickRawFields(hasSelectorField) {
+  if (hasSelectorField) {
+    let url = findNavigateUrl();
+    if (!url) {
+      url = window.prompt("URL der Seite, auf der ausgewählt werden soll:", "https://");
+      if (!url) return null;
+    }
+    const banner = showPickStatus("Browser öffnet sich – bitte im Fenster auf das gewünschte Element klicken...");
+    try {
+      const res = await fetch("/api/pick/web", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url }),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        toast("Auswahl fehlgeschlagen: " + data.error, "error");
+        return null;
+      }
+      return { selector: data.selector };
+    } catch (err) {
+      toast("Auswahl fehlgeschlagen: " + err, "error");
+      return null;
+    } finally {
+      hidePickStatus(banner);
+    }
   }
-  const banner = showPickStatus("Browser öffnet sich – bitte im Fenster auf das gewünschte Element klicken...");
+
+  const scope = findDesktopScope();
+  const raw = window.prompt(
+    scope
+      ? "Timeout (Sekunden) vor der Aufnahme — die Zielanwendung wird automatisch in den Vordergrund geholt:"
+      : "Kein Scope (launch/connect-Schritt) im Workflow gefunden. Timeout (Sekunden), um manuell zur Zielanwendung zu wechseln:",
+    scope ? "0" : "3"
+  );
+  if (raw === null) return null;
+  const delay = Math.max(0, Number(raw) || 0);
+  const banner = showPickStatus(
+    delay > 0
+      ? `Wechsle jetzt zur Zielanwendung – Aufnahme startet in ${delay}s...`
+      : "Bitte jetzt auf das gewünschte Element im Zielfenster klicken..."
+  );
   try {
-    const res = await fetch("/api/pick/web", {
+    const res = await fetch("/api/pick/desktop", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify({ delay, ...(scope || {}) }),
     });
     const data = await res.json();
-    if (data.ok) {
-      pushUndo();
-      step.params.selector = data.selector;
-      renderSteps();
-    } else {
+    if (!data.ok) {
       toast("Auswahl fehlgeschlagen: " + data.error, "error");
+      return null;
     }
+    const fields = {};
+    if (data.control_type) fields.control_type = data.control_type;
+    if (data.auto_id) fields.auto_id = data.auto_id;
+    if (data.title) fields.title = data.title;
+    return fields;
   } catch (err) {
     toast("Auswahl fehlgeschlagen: " + err, "error");
+    return null;
   } finally {
     hidePickStatus(banner);
   }
+}
+
+async function pickWebSelector(step) {
+  const fields = await pickRawFields(true);
+  if (!fields) return;
+  pushUndo();
+  step.params.selector = fields.selector;
+  renderSteps();
 }
 
 // Read-only counterpart to pickWebSelector: checks the selector already in
@@ -1311,42 +1403,11 @@ function findDesktopScope() {
 }
 
 async function pickDesktopSelector(step) {
-  const scope = findDesktopScope();
-  const raw = window.prompt(
-    scope
-      ? "Timeout (Sekunden) vor der Aufnahme — die Zielanwendung wird automatisch in den Vordergrund geholt:"
-      : "Kein Scope (launch/connect-Schritt) im Workflow gefunden. Timeout (Sekunden), um manuell zur Zielanwendung zu wechseln:",
-    scope ? "0" : "3"
-  );
-  if (raw === null) return;
-  const delay = Math.max(0, Number(raw) || 0);
-
-  const banner = showPickStatus(
-    delay > 0
-      ? `Wechsle jetzt zur Zielanwendung – Aufnahme startet in ${delay}s...`
-      : "Bitte jetzt auf das gewünschte Element im Zielfenster klicken..."
-  );
-  try {
-    const res = await fetch("/api/pick/desktop", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ delay, ...(scope || {}) }),
-    });
-    const data = await res.json();
-    if (data.ok) {
-      pushUndo();
-      if (data.control_type) step.params.control_type = data.control_type;
-      if (data.auto_id) step.params.auto_id = data.auto_id;
-      if (data.title) step.params.title = data.title;
-      renderSteps();
-    } else {
-      toast("Auswahl fehlgeschlagen: " + data.error, "error");
-    }
-  } catch (err) {
-    toast("Auswahl fehlgeschlagen: " + err, "error");
-  } finally {
-    hidePickStatus(banner);
-  }
+  const fields = await pickRawFields(false);
+  if (!fields) return;
+  pushUndo();
+  Object.assign(step.params, fields);
+  renderSteps();
 }
 
 async function startRecording() {

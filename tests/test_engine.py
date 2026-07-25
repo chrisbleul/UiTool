@@ -1523,3 +1523,64 @@ def test_element_reference_supports_a_variable_placeholder_in_the_reference(work
     WorkflowEngine(backend).run(workflow, variables={"ref": "MeineApp/Suchfeld"})
 
     assert backend.calls == [("click", "#search")]
+
+
+class _ExistsAwareBackend:
+    """A RecordingBackend that also answers element_exists(), for testing
+    fallback-candidate selection - only the selectors in `existing` are
+    reported as present."""
+
+    def __init__(self, existing):
+        self.calls = []
+        self._existing = existing
+
+    def click(self, selector):
+        self.calls.append(("click", selector))
+
+    def element_exists(self, selector):
+        return selector in self._existing
+
+
+def test_element_reference_tries_fallback_candidates_in_order(workflows_dir):
+    from uiflow import object_repository
+
+    object_repository.set_element("MeineApp", "Suchfeld", {"selector": "#alt-1"})
+    object_repository.add_fallback("MeineApp", "Suchfeld", {"selector": "#alt-2"})
+    object_repository.add_fallback("MeineApp", "Suchfeld", {"selector": "#alt-3"})
+    workflow = Workflow(name="t", backend="web", steps=[Step("click", {"element": "MeineApp/Suchfeld"})])
+    # Only the second candidate currently matches - the engine must skip the
+    # first (absent) and use it instead of just taking the first one blindly.
+    backend = _ExistsAwareBackend(existing={"#alt-2"})
+
+    WorkflowEngine(backend).run(workflow)
+
+    assert backend.calls == [("click", "#alt-2")]
+
+
+def test_element_reference_falls_back_to_the_first_candidate_when_none_match(workflows_dir):
+    from uiflow import object_repository
+
+    object_repository.set_element("MeineApp", "Suchfeld", {"selector": "#alt-1"})
+    object_repository.add_fallback("MeineApp", "Suchfeld", {"selector": "#alt-2"})
+    workflow = Workflow(name="t", backend="web", steps=[Step("click", {"element": "MeineApp/Suchfeld"})])
+    backend = _ExistsAwareBackend(existing=set())  # nothing currently matches
+
+    WorkflowEngine(backend).run(workflow)
+
+    # Falls through to the first candidate so the real click still runs (and
+    # would raise its own normal "not found" error), instead of silently
+    # skipping the step because no fallback matched.
+    assert backend.calls == [("click", "#alt-1")]
+
+
+def test_element_reference_uses_the_first_candidate_when_backend_cannot_check_existence(workflows_dir):
+    from uiflow import object_repository
+
+    object_repository.set_element("MeineApp", "Suchfeld", {"selector": "#alt-1"})
+    object_repository.add_fallback("MeineApp", "Suchfeld", {"selector": "#alt-2"})
+    workflow = Workflow(name="t", backend="web", steps=[Step("click", {"element": "MeineApp/Suchfeld"})])
+    backend = RecordingBackend()  # no element_exists method at all
+
+    WorkflowEngine(backend).run(workflow)
+
+    assert backend.calls == [("click", "#alt-1")]

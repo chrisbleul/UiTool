@@ -494,6 +494,18 @@ def create_app() -> Flask:
         object_repository.delete_element(scope, name)
         return jsonify({"deleted": {"scope": scope, "name": name}})
 
+    @app.post("/api/repository/<scope>/<name>/fallback")
+    def add_repository_fallback(scope: str, name: str) -> Response:
+        from .. import object_repository
+
+        data = request.get_json(force=True) or {}
+        fields = data.get("fields") or {}
+        if not isinstance(fields, dict) or not fields:
+            return jsonify({"error": "fields must be a non-empty mapping"}), 400
+        object_repository.add_fallback(scope, name, fields)
+        candidates = object_repository.get_element_candidates(scope, name)
+        return jsonify({"saved": {"scope": scope, "name": name}, "candidates": candidates})
+
     @app.get("/api/schedules")
     def list_schedules() -> Response:
         schedules = db.list_schedules()

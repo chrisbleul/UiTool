@@ -71,6 +71,15 @@ class WebBackend:
     def get_text(self, selector: str, timeout: int = 10000) -> str:
         return self.page.inner_text(selector, timeout=timeout)
 
+    def element_exists(self, selector: str) -> bool:
+        """Quick, non-waiting existence check (used to pick between an Object
+        Repository element's fallback candidates, see engine.py's
+        _resolve_element_reference) - not a workflow action of its own."""
+        try:
+            return self.page.locator(selector).count() > 0
+        except Exception:  # noqa: BLE001 - an invalid selector just isn't a match
+            return False
+
     def send_hotkey(self, keys: str) -> None:
         self.page.keyboard.press(_translate_hotkey(keys))
 

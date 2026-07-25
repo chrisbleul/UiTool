@@ -688,19 +688,43 @@ class WorkflowEngine:
         Repository fields replace any inline selector fields on the same step
         (a step either references a repository element or carries its own
         selector, not both) - `element` is consumed here and never reaches the
-        backend method itself."""
+        backend method itself.
+
+        An element can carry more than one candidate field-set (fallbacks,
+        added via the Studio's "+ Alternative aufnehmen" or
+        object_repository.add_fallback) - if the backend can report whether a
+        given one currently matches (`element_exists`), they're tried in
+        order and the first that does is used, exactly the fallback-selector
+        behaviour UiPath offers for legacy/flaky apps. Without that capability
+        (or if none of them match right now), the first candidate is used, so
+        the real action's own resolution/timeout still produces its usual,
+        clear error instead of a silent no-op here."""
         ref = params.pop("element", None)
         if not ref:
             return params
         if "/" not in ref:
             raise StepError(index, step, ValueError(f"Invalid element reference '{ref}', expected 'Scope/Name'"))
         scope, name = ref.split("/", 1)
-        fields = object_repository.get_element(scope, name)
-        if fields is None:
+        candidates = object_repository.get_element_candidates(scope, name)
+        if not candidates:
             raise StepError(
                 index, step, ValueError(f"No element '{name}' in scope '{scope}' in the object repository")
             )
+        fields = self._pick_matching_candidate(candidates)
         return {**params, **fields}
+
+    def _pick_matching_candidate(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+        if len(candidates) == 1:
+            return candidates[0]
+        exists = getattr(self.backend, "element_exists", None)
+        if callable(exists):
+            for fields in candidates:
+                try:
+                    if exists(**fields):
+                        return fields
+                except Exception:  # noqa: BLE001 - a candidate that can't even be checked just isn't a match
+                    continue
+        return candidates[0]
 
     def _run_backend_step(self, step: Step, index: int) -> None:
         handler = getattr(self.backend, step.action, None)
