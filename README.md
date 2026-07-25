@@ -413,5 +413,32 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
   n8n). Der Builder ist ein Sequenz-Designer — er bildet den Ablauf als verschachtelte Kartenliste ab,
   passend zum sequenziellen YAML-Format. Eine Flowchart-Ansicht bräuchte ein eigenes Format mit Knoten,
   Kanten und Koordinaten und ist deshalb bewusst noch nicht gebaut.
+- **Object Repository (wiederverwendbare Selektoren)**: Heute trägt jede Aktivität ihren Selektor
+  inline — bei Web das Feld `selector`, bei Desktop das Tripel `control_type`/`title`/`auto_id`.
+  "Element auf dem Bildschirm wählen" schreibt genau dorthin. Ein Element, das an zehn Stellen
+  angesprochen wird, steht damit zehnmal im Workflow: ändert die Zielanwendung ihre Oberfläche, müssen
+  alle zehn Stellen gefunden und einzeln nachgezogen werden — der Hauptgrund, warum RPA-Automatisierungen
+  im Betrieb brechen.
+  Gewünscht ist stattdessen ein zentraler Speicher benannter UI-Elemente ("Anmelden-Knopf",
+  "Rechnungsnummer-Feld"): einmal während der Entwicklung aufnehmen, danach in beliebigen Aktivitäten
+  per Name referenzieren, und bei einer UI-Änderung an genau einer Stelle korrigieren.
+  Drei Punkte, die den Zuschnitt bestimmen und deshalb vor der Umsetzung geklärt sein wollen:
+  - **Auflösung in der Engine**: `substitute_variables` ersetzt heute `{var.x}`/`{item.x}` rein
+    textuell in den Step-Parametern. Für ein Repository reicht das nicht, weil ein Desktop-Element auf
+    *drei* Felder abbildet, nicht auf einen String. Die Engine müsste eine Element-Referenz vor dem
+    Dispatch ans Backend zu den passenden Parametern auflösen — ein eigener Schritt in `_run_backend_step`,
+    kein zusätzliches Platzhalter-Muster.
+  - **Zuordnung zur Anwendung**: ein Selektor gilt nur innerhalb seiner Anwendung. Der bestehende
+    Scope-Begriff (`launch`/`connect` als erster Schritt) benennt diese Anwendung bereits — er ist der
+    naheliegende Schlüssel, unter dem Elemente gruppiert werden, analog zu UiPaths Aufteilung in
+    Anwendung → Screen → Element.
+  - **Ablage**: anders als Anmeldedaten sind Selektoren kein Geheimnis und gehören versioniert neben die
+    Workflows (eine Datei in `workflows/`), nicht in `orchestrator.db` — sonst lässt sich eine Änderung
+    an der Oberfläche nicht mit dem Workflow zusammen reviewen und zurückrollen.
+
+  Im Studio wären das zwei Ergänzungen: `picker.py` bekommt neben "Felder füllen" ein "als Element
+  speichern", und im Eigenschaften-Panel wird aus dem freien Selektor-Feld eine Auswahl über das
+  Repository plus "neu aufnehmen".
 - **Selectors robuster machen** (Fallback-Strategien, Bild-basierte Erkennung wie UiPath es
-  für Legacy-Apps anbietet).
+  für Legacy-Apps anbietet). Greift ineinander mit dem Object Repository: sind die Selektoren erst
+  zentral, ist eine Fallback-Strategie eine Eigenschaft des Elements statt jeder einzelnen Aktivität.
