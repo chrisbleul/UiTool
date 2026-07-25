@@ -798,3 +798,52 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
   alternative `control_type`/`title`/`auto_id`- bzw. `selector`-Kandidaten, der Reihe nach versucht) —
   eine Erkennung rein über ein Bildmuster auf dem Bildschirm, unabhängig von jedem Automation-Baum, ist
   davon unabhängig und fehlt weiterhin.
+
+### Weitere Ideen (unpriorisiert, unvalidiert)
+
+Unten gesammelt, aber noch nicht bewertet oder gegen den tatsächlichen Bedarf geprüft — einfach
+Ideen, was als Nächstes sinnvoll sein könnte. Reihenfolge ist keine Priorität.
+
+- **Worker-Heartbeat & automatisches Requeuing**: stürzt ein Worker (lokal oder remote, siehe oben)
+  mitten in einem Job ab, bleibt der Job für immer auf `running` stehen — niemand markiert ihn als
+  abgebrochen oder reiht ihn erneut ein. Bräuchte einen periodischen Heartbeat pro laufendem Job
+  (`last_heartbeat_at`-Spalte) und einen Sweep, der Jobs ohne aktuellen Heartbeat nach einem Timeout
+  wieder auf `queued` zurücksetzt (oder als `error` markiert, je nach Retry-Semantik).
+- **Granulare Berechtigungen pro Workflow/Ordner/Queue**: RBAC kennt heute nur drei globale Rollen
+  (viewer/operator/admin, siehe "Benutzer & Rollen" oben) — kein "Team A darf nur Workflows in Ordner
+  X sehen/starten". Setzt vermutlich eine Ordner-/Projektstruktur (siehe unten) als Voraussetzung
+  voraus, bevor sich Rechte überhaupt sinnvoll darauf beziehen lassen.
+- **Audit-Log**: wer hat wann welchen Workflow gespeichert, gestartet, gestoppt, ein Credential
+  geändert oder einen Benutzer angelegt? Mit RBAC gibt es jetzt einzelne Konten, aber keine Historie
+  ihrer Aktionen — relevant, sobald mehr als eine Person an derselben Installation arbeitet.
+- **Proaktive Fehlerbenachrichtigung** (E-Mail/Slack/Webhook, wenn ein Job oder Queue-Item endgültig
+  fehlschlägt): heute muss man aktiv die Runs-Ansicht oder `/api/jobs?status=error` abfragen. Die
+  Bausteine (`send_email`-Aktion, `http_request`) existieren im Workflow selbst bereits — hier ginge es
+  um eine Orchestrator-seitige Benachrichtigung, unabhängig vom Workflow-Inhalt.
+- **Workflow-Versionierung**: "Speichern" überschreibt die YAML-Datei ohne Historie — kein Diff
+  zwischen zwei Ständen, kein Zurückrollen auf eine ältere Version direkt im Studio. Ließe sich
+  entweder über echtes Git im Hintergrund lösen oder über eine einfache eigene Versions-Tabelle
+  (ähnlich den Job-Snapshots, die es für einzelne Läufe schon gibt).
+- **Testbarkeit von Workflows**: ein "Dry-Run"-Modus, der Ausdrücke/Variablen/Selektoren gegen einen
+  Fake-Backend validiert, ohne den echten Browser/Desktop anzufassen — würde Tippfehler in Python-
+  Ausdrücken oder fehlende Variablen schon beim Speichern statt erst beim echten Lauf auffangen.
+- **Business-Kalender für Zeitpläne**: Cron-Ausdrücke allein kennen keine Feiertage oder "nur an
+  Werktagen" — ein Zeitplan, der z.B. jeden Monatsersten läuft, feuert damit auch an einem Feiertag
+  oder Wochenende, falls der auf den Ersten fällt.
+- **Human-in-the-loop / Action Center**: ein Schritt-Typ, der auf eine menschliche Entscheidung wartet
+  (z.B. "Rechnung > 10.000€ manuell freigeben") über ein Web-Formular — nicht dasselbe wie ein
+  Haltepunkt, der eine Person direkt am Studio voraussetzt, sondern eine asynchrone Freigabe, die auch
+  jemand anderes später erledigen kann.
+- **Ordner-/Projektstruktur**: Workflows, Queues und Credentials liegen heute alle flach nebeneinander
+  (`workflows/*.yaml`, eine gemeinsame Queue-/Credential-Liste). Ab einer gewissen Anzahl Workflows
+  fehlt eine Gruppierung (Ordner oder Projekte) — auch Voraussetzung für granulare Rechte pro Ordner
+  (siehe oben).
+- **Reporting/Analytics über die Zeit**: die Übersicht zeigt heute eine Momentaufnahme (Erfolgsquote,
+  offene Queue-Items). Ein Trend über Zeit (Erfolgsquote pro Woche, durchschnittliche Laufzeit pro
+  Workflow, Engpässe in einer Queue) fehlt.
+- **Versionierte, projektübergreifende Bibliotheken**: ein `run_workflow`-Schritt referenziert heute
+  eine Datei im selben `workflows/`-Verzeichnis per Namen — keine Versionierung, kein Teilen eines
+  wiederverwendbaren Sub-Workflows über mehrere unabhängige Installationen hinweg.
+- **Mobile-/App-Automatisierung** (Android/iOS, z.B. über Appium) als dritter Backend-Typ neben
+  Web und Desktop — bisher nicht einmal angedacht, wäre ein eigener Backend + eigene
+  Aktivitäten-Kategorie im Katalog.
