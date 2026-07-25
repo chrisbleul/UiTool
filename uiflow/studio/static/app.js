@@ -2127,6 +2127,187 @@ function closeVariablesOverlay() {
   el("variables-overlay").classList.add("hidden");
 }
 
+// --- flowchart view (read-only visualization of the sequential builder tree) -
+//
+// The builder edits a strictly sequential/nested step list (see the "model <->
+// wire format" comment above) - there is no independent node/edge/coordinate
+// format to maintain alongside it. This renders that same `state.steps` tree
+// as boxes-and-arrows instead of a nested card list, which makes branching
+// control flow (if/switch/for_each/try) easier to see at a glance. It is
+// read-only: editing still happens in the card list, a click here only
+// selects the step there.
+
+const FLOW_NODE_WIDTH = 190;
+const FLOW_NODE_HEIGHT = 56;
+const FLOW_V_GAP = 36;
+const FLOW_H_GAP = 32;
+const FLOW_BRANCH_LABEL_HEIGHT = 22;
+
+// Pure layout pass: turns a list of steps (top-level or one branch's `.steps`)
+// into relative positions, without touching the DOM, so the render pass below
+// can center parents over children without a second measuring pass.
+function flowMeasureList(steps) {
+  let y = 0;
+  let width = FLOW_NODE_WIDTH;
+  const items = [];
+  for (const step of steps) {
+    const branches = (step.slots || []).map((slot) => ({ slot, layout: flowMeasureList(slot.steps) }));
+    let itemWidth = FLOW_NODE_WIDTH;
+    let extraHeight = 0;
+    if (branches.length) {
+      itemWidth = Math.max(
+        FLOW_NODE_WIDTH,
+        branches.reduce((sum, b) => sum + Math.max(b.layout.width, FLOW_NODE_WIDTH), 0) + FLOW_H_GAP * (branches.length - 1)
+      );
+      const branchesHeight = Math.max(FLOW_NODE_HEIGHT, ...branches.map((b) => Math.max(b.layout.height, FLOW_NODE_HEIGHT)));
+      extraHeight = FLOW_V_GAP + FLOW_BRANCH_LABEL_HEIGHT + branchesHeight + FLOW_V_GAP;
+    }
+    items.push({ step, y, width: itemWidth, height: FLOW_NODE_HEIGHT + extraHeight, branches });
+    width = Math.max(width, itemWidth);
+    y += FLOW_NODE_HEIGHT + extraHeight + FLOW_V_GAP;
+  }
+  return { width, height: items.length ? y - FLOW_V_GAP : 0, items };
+}
+
+function renderFlowchart() {
+  const container = el("flowchart-canvas");
+  container.innerHTML = "";
+
+  const layout = flowMeasureList(state.steps);
+  if (layout.items.length === 0) {
+    container.innerHTML = '<p class="flow-empty">Keine Schritte vorhanden.</p>';
+    return;
+  }
+
+  const width = layout.width + FLOW_H_GAP * 2;
+  const height = layout.height + FLOW_V_GAP * 2;
+
+  const stage = document.createElement("div");
+  stage.className = "flow-stage";
+  stage.style.width = `${width}px`;
+  stage.style.height = `${height}px`;
+
+  const svgNS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(svgNS, "svg");
+  svg.setAttribute("width", String(width));
+  svg.setAttribute("height", String(height));
+  svg.classList.add("flow-svg");
+  svg.innerHTML =
+    '<defs><marker id="flow-arrow" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">' +
+    '<path d="M0,0 L8,4 L0,8 Z" fill="var(--muted)"></path></marker></defs>';
+  stage.appendChild(svg);
+  container.appendChild(stage);
+
+  function addLine(x1, y1, x2, y2, arrow) {
+    const line = document.createElementNS(svgNS, "line");
+    line.setAttribute("x1", x1);
+    line.setAttribute("y1", y1);
+    line.setAttribute("x2", x2);
+    line.setAttribute("y2", y2);
+    line.classList.add("flow-edge");
+    if (arrow) line.setAttribute("marker-end", "url(#flow-arrow)");
+    svg.appendChild(line);
+  }
+
+  function addNode(x, y, step) {
+    const box = document.createElement("div");
+    box.className = "flow-node" + (step === state.selected ? " selected" : "");
+    box.style.left = `${x}px`;
+    box.style.top = `${y}px`;
+    box.style.width = `${FLOW_NODE_WIDTH}px`;
+    box.style.height = `${FLOW_NODE_HEIGHT}px`;
+    const meta = activityMeta(step.action);
+    const title = document.createElement("div");
+    title.className = "flow-node-title";
+    title.textContent = meta.label || step.action;
+    const sub = document.createElement("div");
+    sub.className = "flow-node-sub";
+    sub.textContent = stepSummary(step);
+    box.append(title, sub);
+    box.addEventListener("click", () => {
+      selectStep(step);
+      closeFlowchartOverlay();
+      switchView("builder");
+    });
+    stage.appendChild(box);
+  }
+
+  function addBranchLabel(x, y, width, text) {
+    const label = document.createElement("div");
+    label.className = "flow-branch-label";
+    label.style.left = `${x}px`;
+    label.style.top = `${y}px`;
+    label.style.width = `${width}px`;
+    label.textContent = text;
+    stage.appendChild(label);
+  }
+
+  function renderList(listLayout, originX, originY) {
+    const centerX = originX + listLayout.width / 2;
+    let prevBottom = null;
+    for (const item of listLayout.items) {
+      const boxX = centerX - FLOW_NODE_WIDTH / 2;
+      const boxY = originY + item.y;
+      if (prevBottom !== null) addLine(centerX, prevBottom, centerX, boxY, true);
+      addNode(boxX, boxY, item.step);
+
+      let bottom = boxY + FLOW_NODE_HEIGHT;
+      if (item.branches.length) {
+        const forkY = bottom + FLOW_V_GAP / 2;
+        const branchTopY = bottom + FLOW_V_GAP + FLOW_BRANCH_LABEL_HEIGHT;
+        const mergeY = boxY + item.height - FLOW_V_GAP / 2;
+        const groupWidth =
+          item.branches.reduce((sum, b) => sum + Math.max(b.layout.width, FLOW_NODE_WIDTH), 0) +
+          FLOW_H_GAP * (item.branches.length - 1);
+        let colX = centerX - groupWidth / 2;
+        const colCenters = [];
+        for (const branch of item.branches) {
+          const colWidth = Math.max(branch.layout.width, FLOW_NODE_WIDTH);
+          const colCenterX = colX + colWidth / 2;
+          colCenters.push(colCenterX);
+
+          const label =
+            branch.slot.kind === "case" ? `Fall: ${branch.slot.label}` : branch.slot.label || branch.slot.name;
+          addBranchLabel(colX, bottom + FLOW_V_GAP, colWidth, label);
+          addLine(colCenterX, forkY, colCenterX, branchTopY);
+
+          if (branch.layout.items.length === 0) {
+            const placeholder = document.createElement("div");
+            placeholder.className = "flow-branch-empty";
+            placeholder.style.left = `${colX}px`;
+            placeholder.style.top = `${branchTopY}px`;
+            placeholder.style.width = `${colWidth}px`;
+            placeholder.textContent = "leer";
+            stage.appendChild(placeholder);
+            addLine(colCenterX, branchTopY, colCenterX, mergeY);
+          } else {
+            renderList(branch.layout, colX + (colWidth - branch.layout.width) / 2, branchTopY);
+            addLine(colCenterX, branchTopY + branch.layout.height, colCenterX, mergeY);
+          }
+          colX += colWidth + FLOW_H_GAP;
+        }
+        addLine(centerX, bottom, centerX, forkY);
+        addLine(colCenters[0], forkY, colCenters[colCenters.length - 1], forkY);
+        addLine(colCenters[0], mergeY, colCenters[colCenters.length - 1], mergeY);
+        addLine(centerX, mergeY, centerX, boxY + item.height, true);
+        bottom = boxY + item.height;
+      }
+      prevBottom = bottom;
+    }
+  }
+
+  renderList(layout, FLOW_H_GAP, FLOW_V_GAP);
+}
+
+function openFlowchartOverlay() {
+  renderFlowchart();
+  el("flowchart-overlay").classList.remove("hidden");
+}
+
+function closeFlowchartOverlay() {
+  el("flowchart-overlay").classList.add("hidden");
+}
+
 async function addCredential() {
   const name = el("credential-name").value.trim();
   const value = el("credential-value").value;
@@ -2583,6 +2764,11 @@ function init() {
   el("btn-add-var-decl").addEventListener("click", addVariableDeclaration);
   el("variables-overlay").addEventListener("click", (e) => {
     if (e.target === el("variables-overlay")) closeVariablesOverlay();
+  });
+  el("btn-flowchart").addEventListener("click", openFlowchartOverlay);
+  el("btn-close-flowchart").addEventListener("click", closeFlowchartOverlay);
+  el("flowchart-overlay").addEventListener("click", (e) => {
+    if (e.target === el("flowchart-overlay")) closeFlowchartOverlay();
   });
   el("btn-logout").addEventListener("click", async () => {
     await fetch("/logout", { method: "POST" });

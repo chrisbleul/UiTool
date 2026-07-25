@@ -133,6 +133,12 @@ python -m uiflow.cli studio
   Ursache dafür, dass ein Bot später das falsche Element anklickt.
 - **↶ Rückgängig** (oder Strg+Z) macht die letzte Änderung rückgängig — Schritt hinzugefügt/gelöscht/
   verschoben, Haltepunkt umgeschaltet, Feld bearbeitet, Backend gewechselt, Selektor übernommen.
+- **Flowchart** (Button neben "Variablen"): zeigt den aktuell geöffneten Workflow als Kästchen-und-
+  Pfeile-Diagramm statt als verschachtelte Kartenliste — reine Nur-Ansicht desselben Ablaufs, kein
+  eigenes Format. Verzweigende Aktivitäten (`if`s Dann/Sonst, `switch`s Fälle/Standard-Fall,
+  `for_each`s Schleifenkörper, `try`s Versuchen/Bei Fehler) laufen dabei als eigene Spalten nach unten
+  auseinander und danach wieder in der Hauptspalte zusammen. Ein Klick auf ein Kästchen schließt das
+  Flowchart und wählt den Schritt im Builder aus, um ihn dort zu bearbeiten.
 - **Anwendungs-Scope**: Ist der erste Schritt eines Desktop-Workflows `launch` oder `connect`, gilt er
   als Scope des Workflows — analog zu UiPaths "Use Application/Browser"-Aktivität. Er ist als erste
   Karte fixiert: nicht verschiebbar, und es lässt sich nichts darüber ablegen, weil alle folgenden
@@ -740,10 +746,13 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
   "REFramework-Vorlage" oben und `workflows/beispiel_reframework.yaml`. Was fehlt, ist ein Komfort im
   Studio selbst: ein Button "Neu aus REFramework-Vorlage" (analog zu "+ Neuer Workflow"), der einen neuen
   Workflow direkt mit diesem Gerüst vorausfüllt, statt dass man die Beispieldatei von Hand kopiert.
-- **Flowchart-Ansicht** (frei platzierte Knoten mit Verbindungspfeilen, wie UiPaths Flowchart oder
-  n8n). Der Builder ist ein Sequenz-Designer — er bildet den Ablauf als verschachtelte Kartenliste ab,
-  passend zum sequenziellen YAML-Format. Eine Flowchart-Ansicht bräuchte ein eigenes Format mit Knoten,
-  Kanten und Koordinaten und ist deshalb bewusst noch nicht gebaut.
+- ~~**Flowchart-Ansicht**~~ — teilweise erledigt: der Button **Flowchart** (siehe oben) zeigt den
+  Ablauf als automatisch angeordnetes Kästchen-und-Pfeile-Diagramm mit Verzweigungsspalten für
+  `if`/`switch`/`for_each`/`try`. Das ist bewusst eine reine *Visualisierung* des bestehenden
+  sequenziellen YAML-Formats (read-only, automatisches Layout), **nicht** UiPaths/n8ns freies
+  Flowchart mit unabhängig platzierbaren Knoten, beliebiger Kantenführung und einem eigenen
+  Graph-Format als Speicherformat — dafür bräuchte es eine eigene, editierbare Graph-Repräsentation
+  samt eigenem Ausführungsmodell (auch für Zyklen), was ein deutlich größerer, separater Umbau wäre.
 - **UI Explorer (Oberflächen analysieren)**: Zum Erkunden einer Zielanwendung gibt es heute drei
   Teilstücke — `uiflow inspect-desktop "Fenstertitel" --depth 4` druckt den UI-Automation-Baum als Text
   in die Konsole, der Picker markiert während der Aufnahme das Element unter dem Mauszeiger, und der

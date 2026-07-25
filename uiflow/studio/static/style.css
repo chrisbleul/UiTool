@@ -1100,6 +1100,51 @@ body {
 .modal-head h2 { margin: 0; font-size: 1.05rem; }
 .modal-box-wide .queues-list { padding: 0; overflow-y: auto; }
 .btn-danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+
+.modal-box-flowchart { width: 95vw; max-width: 1400px; height: 88vh; display: flex; flex-direction: column; }
+.flowchart-canvas {
+  flex: 1;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg);
+}
+.flow-stage { position: relative; }
+.flow-svg { position: absolute; inset: 0; pointer-events: none; }
+.flow-edge { stroke: var(--muted); stroke-width: 1.5; fill: none; }
+.flow-node {
+  position: absolute;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+  overflow: hidden;
+}
+.flow-node:hover { border-color: var(--accent); box-shadow: var(--shadow-md); }
+.flow-node.selected { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+.flow-node-title { font-size: 0.82rem; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.flow-node-sub { font-size: 0.74rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
+.flow-branch-label {
+  position: absolute;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--muted);
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.flow-branch-empty {
+  position: absolute;
+  font-size: 0.72rem;
+  color: var(--muted);
+  text-align: center;
+  font-style: italic;
+}
+.flow-empty { padding: 24px; color: var(--muted); }
 .btn-danger:hover { background: #b91c1c; border-color: #b91c1c; }
 
 @media (max-width: 640px) {
