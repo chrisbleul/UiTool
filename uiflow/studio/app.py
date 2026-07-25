@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from flask import Flask, Response, jsonify, redirect, request, send_from_directory, session
+from werkzeug.security import check_password_hash
 
 from .. import models
 from ..models import Workflow, resolve_sub_workflows
@@ -23,6 +24,24 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 # called either would be unreachable as {global.item} resolves against the
 # namespace, not the value (see engine.py's _NAMESPACE_KEYS).
 _RESERVED_GLOBAL_NAMES = ("global", "item", "var")
+
+# Multi-user RBAC (see require_login/db.any_users_exist): viewer < operator <
+# admin. Only consulted once at least one user account exists - the default,
+# frictionless single-user mode has no notion of roles at all.
+_ROLE_ORDER = {"viewer": 0, "operator": 1, "admin": 2}
+
+
+def _required_role(method: str, path: str) -> str:
+    """Minimum role a request needs, once multi-user mode is active.
+    Installation-wide, sensitive configuration (accounts, credentials, global
+    variables) is admin-only; any other state-changing request needs at least
+    "operator"; a plain read (GET) only needs to be logged in at all
+    ("viewer")."""
+    if path.startswith("/api/users") or path.startswith("/api/credentials") or path.startswith("/api/globals"):
+        return "admin"
+    if method == "GET":
+        return "viewer"
+    return "operator"
 
 # One entry per in-flight recording session (unaffected by the orchestrator -
 # a recording is a live interactive picking session tied to one browser tab,
@@ -44,18 +63,33 @@ def create_app() -> Flask:
     db.init_db()
 
     # Login is entirely opt-in: this Studio is a local single-user MVP tool by
-    # default (zero friction, matching every earlier session), and a real
-    # multi-user/RBAC system is out of scope here. Setting UIFLOW_STUDIO_PASSWORD
-    # adds a single shared-password gate in front of it - e.g. for the case
-    # where the Studio is bound to a non-loopback host and reachable by others.
+    # default (zero friction, matching every earlier session). Setting
+    # UIFLOW_STUDIO_PASSWORD adds a single shared-password gate in front of it -
+    # e.g. for the case where the Studio is bound to a non-loopback host and
+    # reachable by others. The moment `uiflow create-user` has created at least
+    # one account (db.any_users_exist), per-account login and role checks
+    # (_required_role/_ROLE_ORDER) take over from *both* of the above - a real
+    # multi-user/RBAC system, opted into the same way credentials/globals are:
+    # by using the feature, not by an env var toggle.
     studio_password = os.environ.get("UIFLOW_STUDIO_PASSWORD")
     app.secret_key = os.environ.get("UIFLOW_STUDIO_SECRET_KEY") or secrets.token_hex(32)
 
     @app.before_request
     def require_login() -> Response | None:
-        if not studio_password:
+        if request.path in ("/login", "/logout", "/api/me") or request.path.startswith("/static/"):
             return None
-        if request.path in ("/login", "/logout") or request.path.startswith("/static/"):
+        if db.any_users_exist():
+            username = session.get("username")
+            if not username:
+                if request.path.startswith("/api/"):
+                    return jsonify({"error": "unauthenticated"}), 401
+                return redirect("/login")
+            role = session.get("role", "viewer")
+            required = _required_role(request.method, request.path)
+            if _ROLE_ORDER.get(role, -1) < _ROLE_ORDER[required]:
+                return jsonify({"error": "forbidden"}), 403
+            return None
+        if not studio_password:
             return None
         if session.get("authenticated"):
             return None
@@ -70,6 +104,14 @@ def create_app() -> Flask:
     @app.post("/login")
     def login_submit() -> Response:
         data = request.form or request.get_json(silent=True) or {}
+        if db.any_users_exist():
+            username = (data.get("username") or "").strip()
+            user = db.get_user(username)
+            if user and check_password_hash(user["password_hash"], data.get("password", "")):
+                session["username"] = username
+                session["role"] = user["role"]
+                return redirect("/")
+            return redirect("/login?error=1")
         if studio_password and secrets.compare_digest(data.get("password", ""), studio_password):
             session["authenticated"] = True
             return redirect("/")
@@ -78,7 +120,17 @@ def create_app() -> Flask:
     @app.post("/logout")
     def logout() -> Response:
         session.pop("authenticated", None)
-        return redirect("/login" if studio_password else "/")
+        session.pop("username", None)
+        session.pop("role", None)
+        return redirect("/login" if (studio_password or db.any_users_exist()) else "/")
+
+    @app.get("/api/me")
+    def whoami() -> Response:
+        if db.any_users_exist():
+            username = session.get("username")
+            return jsonify({"username": username, "role": session.get("role") if username else None, "multiuser": True})
+        logged_in = (not studio_password) or bool(session.get("authenticated"))
+        return jsonify({"username": None, "role": "admin" if logged_in else None, "multiuser": False})
 
     @app.get("/")
     def index() -> Response:
@@ -420,6 +472,54 @@ def create_app() -> Flask:
                 yield f"event: step\ndata: {json.dumps(event)}\n\n"
 
         return Response(generate(), mimetype="text/event-stream")
+
+    @app.get("/api/users")
+    def list_users_route() -> Response:
+        return jsonify(db.list_users())
+
+    @app.post("/api/users")
+    def create_user_route() -> Response:
+        from werkzeug.security import generate_password_hash
+
+        data = request.get_json(force=True) or {}
+        username = (data.get("username") or "").strip()
+        password = data.get("password") or ""
+        role = data.get("role") or "viewer"
+        if not username or not password:
+            return jsonify({"error": "username and password required"}), 400
+        if role not in db.VALID_ROLES:
+            return jsonify({"error": f"role must be one of {db.VALID_ROLES}"}), 400
+        if db.get_user(username):
+            return jsonify({"error": f"User '{username}' existiert bereits"}), 409
+        db.create_user(username, generate_password_hash(password), role)
+        return jsonify({"created": username, "role": role})
+
+    @app.patch("/api/users/<username>")
+    def update_user_route(username: str) -> Response:
+        data = request.get_json(force=True) or {}
+        if not db.get_user(username):
+            return jsonify({"error": "not found"}), 404
+        if "role" in data:
+            if data["role"] not in db.VALID_ROLES:
+                return jsonify({"error": f"role must be one of {db.VALID_ROLES}"}), 400
+            if username == session.get("username") and data["role"] != "admin":
+                # Refused, not just discouraged: an admin demoting themselves
+                # could leave the installation with no admin account left to
+                # undo it, locking everyone out of user management for good.
+                return jsonify({"error": "Kann die eigene Admin-Rolle nicht selbst herabstufen"}), 400
+            db.set_user_role(username, data["role"])
+        if data.get("password"):
+            from werkzeug.security import generate_password_hash
+
+            db.set_user_password(username, generate_password_hash(data["password"]))
+        return jsonify({"updated": username})
+
+    @app.delete("/api/users/<username>")
+    def delete_user_route(username: str) -> Response:
+        if username == session.get("username"):
+            return jsonify({"error": "Kann den eigenen Account nicht selbst löschen"}), 400
+        db.delete_user(username)
+        return jsonify({"deleted": username})
 
     @app.get("/api/credentials")
     def list_credentials() -> Response:

@@ -104,6 +104,15 @@ body {
 .nav-item:hover { background: var(--bg); color: var(--text); }
 .nav-item.active { background: color-mix(in srgb, var(--accent) 10%, transparent); color: var(--accent); }
 
+.current-user {
+  padding: 4px 10px 8px;
+  font-size: 0.76rem;
+  color: var(--muted);
+  line-height: 1.35;
+}
+.current-user strong { color: var(--text); }
+.current-user.hidden { display: none; }
+
 .sidebar-spacer { flex: 1; }
 
 .app-main {

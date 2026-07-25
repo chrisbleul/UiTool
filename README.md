@@ -679,9 +679,39 @@ python -m uiflow.cli scheduler
 `uiflow studio` läuft standardmäßig ohne Anmeldung — als lokales Single-User-Tool auf `127.0.0.1`.
 Setzt man vor dem Start die Umgebungsvariable `UIFLOW_STUDIO_PASSWORD`, verlangt die Studio-Oberfläche
 ein gemeinsames Passwort, bevor UI und API erreichbar sind (z.B. wenn `--host` auf mehr als Loopback
-gebunden wird). Das ist bewusst ein einfaches Shared-Password-Gate, **kein** vollständiges
-Multi-User-/Rechte-System (siehe Roadmap) — für mehrere Personen mit getrennten Konten/Berechtigungen
-wäre mehr nötig.
+gebunden wird). Das ist ein einfaches Shared-Password-Gate ohne einzelne Konten oder Rollen — für mehrere
+Personen mit getrennten Konten und Berechtigungen siehe den nächsten Abschnitt.
+
+## Benutzer & Rollen (RBAC)
+
+Sobald mindestens ein Benutzer angelegt wurde, schaltet die Studio-Oberfläche automatisch von der
+einfachen Passwort-Anmeldung auf individuelle Konten um — kein Neustart und keine zusätzliche
+Umgebungsvariable nötig, es reicht:
+
+```powershell
+python -m uiflow.cli create-user alice --role admin
+```
+
+`--role` ist `viewer`, `operator` oder `admin` (Standard `admin` für den allerersten Account). Ohne
+`--password` fragt der Befehl das Passwort interaktiv ab (mit Wiederholung). Ein bestehendes Konto lässt
+sich mit `--update` neu setzen (Passwort und/oder Rolle):
+
+```powershell
+python -m uiflow.cli create-user alice --update --role operator
+```
+
+Die drei Rollen sind hierarchisch (`viewer` < `operator` < `admin`):
+
+- **viewer** — nur lesen: Workflows, Runs und Queues ansehen, aber nichts ausführen oder speichern.
+- **operator** — zusätzlich Workflows bauen/speichern, Runs starten/stoppen, Queues befüllen, Zeitpläne
+  anlegen. Kein Zugriff auf Anmeldedaten, globale Variablen oder die Benutzerverwaltung selbst.
+- **admin** — alles, inklusive Anmeldedaten, globale Variablen und Benutzerverwaltung (Tab **Benutzer**,
+  nur für Admins sichtbar).
+
+Ein Admin kann sich selbst weder die Admin-Rolle entziehen noch das eigene Konto löschen (schützt davor,
+dass sich eine Installation versehentlich aussperrt). Solange kein einziger Benutzer angelegt wurde,
+verhält sich `uiflow studio` exakt wie zuvor (kein Login oder das einfache `UIFLOW_STUDIO_PASSWORD`-Gate)
+— die Umstellung ist rein additiv und ändert nichts an bestehenden Installationen.
 
 ## Tests
 
@@ -699,9 +729,11 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
   mehrfach gegen dieselbe `orchestrator.db` laufen, aber nur, wenn alle Prozesse Zugriff auf dieselbe
   Datei haben (z.B. Netzlaufwerk). Für echte Remote-Worker fehlt noch ein Netzwerk-Layer (Worker
   registrieren sich per HTTP statt direktem DB-Zugriff).
-- **Echtes Multi-User-/Rechte-System**: das optionale Login (`UIFLOW_STUDIO_PASSWORD`) ist ein
-  einzelnes geteiltes Passwort ohne einzelne Konten, Rollen oder Berechtigungen — bewusst minimal
-  gehalten, kein Ersatz für echtes RBAC.
+- ~~**Echtes Multi-User-/Rechte-System**~~ — erledigt: `uiflow create-user` legt einzelne Konten mit
+  Rollen (`viewer`/`operator`/`admin`) an, siehe "Benutzer & Rollen (RBAC)" oben. Was bewusst fehlt: keine
+  Gruppen/Teams, keine fein granularen Rechte pro Workflow oder Queue (nur die drei globalen Rollen), kein
+  SSO/OAuth — für den Einsatz durch mehrere Personen mit unterschiedlichen Berechtigungsstufen reicht das
+  aktuell.
 - **REFramework-Vorlage im Studio erzeugen**: Die Bausteine (fachlich/technischer Fehler via `fail`,
   Konfiguration via globale/deklarierte Variablen, "Transaktion holen" via Orchestrator, Aufräumen
   zwischen Versuchen via frischer Backend-Instanz pro Item) gibt es inzwischen alle — siehe

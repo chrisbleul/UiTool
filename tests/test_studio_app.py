@@ -32,6 +32,25 @@ def protected_client(isolated_db, monkeypatch, tmp_path):
     return app.test_client()
 
 
+@pytest.fixture
+def multiuser_app(isolated_db, monkeypatch, tmp_path):
+    from werkzeug.security import generate_password_hash
+
+    monkeypatch.setattr("uiflow.models.WORKFLOWS_DIR", tmp_path / "workflows")
+    monkeypatch.setattr("uiflow.object_repository.WORKFLOWS_DIR", tmp_path / "workflows")
+    monkeypatch.delenv("UIFLOW_STUDIO_PASSWORD", raising=False)
+    db.create_user("admin1", generate_password_hash("adminpass"), "admin")
+    db.create_user("op1", generate_password_hash("oppass"), "operator")
+    db.create_user("view1", generate_password_hash("viewpass"), "viewer")
+    app = create_app()
+    app.config.update(TESTING=True)
+    return app
+
+
+def _login(client, username, password):
+    return client.post("/login", data={"username": username, "password": password})
+
+
 def test_no_password_set_allows_unauthenticated_access(client):
     res = client.get("/api/schema")
     assert res.status_code == 200
@@ -82,6 +101,141 @@ def test_login_page_itself_is_reachable_without_auth(protected_client):
 def test_static_assets_are_reachable_without_auth(protected_client):
     res = protected_client.get("/static/style.css")
     assert res.status_code == 200
+
+
+# --- multi-user RBAC (see db.any_users_exist / studio/app.py's require_login) ---
+
+
+def test_multiuser_mode_blocks_unauthenticated_api_access(multiuser_app):
+    client = multiuser_app.test_client()
+
+    res = client.get("/api/schema")
+
+    assert res.status_code == 401
+
+
+def test_multiuser_login_sets_username_and_role(multiuser_app):
+    client = multiuser_app.test_client()
+
+    res = _login(client, "admin1", "adminpass")
+
+    assert res.status_code == 302 and res.headers["Location"] == "/"
+    me = client.get("/api/me").get_json()
+    assert me == {"username": "admin1", "role": "admin", "multiuser": True}
+
+
+def test_multiuser_login_with_wrong_password_is_rejected(multiuser_app):
+    client = multiuser_app.test_client()
+
+    res = _login(client, "admin1", "wrong")
+
+    assert "/login" in res.headers["Location"]
+    assert client.get("/api/schema").status_code == 401
+
+
+def test_api_me_reports_logged_out_state_in_multiuser_mode(multiuser_app):
+    client = multiuser_app.test_client()
+
+    assert client.get("/api/me").get_json() == {"username": None, "role": None, "multiuser": True}
+
+
+def test_api_me_reports_admin_in_single_user_mode(client):
+    assert client.get("/api/me").get_json() == {"username": None, "role": "admin", "multiuser": False}
+
+
+def test_viewer_can_read_but_not_write(multiuser_app):
+    client = multiuser_app.test_client()
+    _login(client, "view1", "viewpass")
+
+    assert client.get("/api/workflows").status_code == 200
+    res = client.post("/api/workflows/x", json=_workflow("x", "https://a"))
+    assert res.status_code == 403
+
+
+def test_operator_can_write_workflows_but_not_manage_users_or_credentials(multiuser_app):
+    client = multiuser_app.test_client()
+    _login(client, "op1", "oppass")
+
+    assert client.post("/api/workflows/x", json=_workflow("x", "https://a")).status_code == 200
+    assert client.get("/api/users").status_code == 403
+    assert client.post("/api/credentials", json={"name": "x", "value": "y"}).status_code == 403
+    assert client.post("/api/globals", json={"name": "x", "value": "1"}).status_code == 403
+
+
+def test_admin_can_manage_users(multiuser_app):
+    client = multiuser_app.test_client()
+    _login(client, "admin1", "adminpass")
+
+    res = client.post("/api/users", json={"username": "new1", "password": "pw", "role": "viewer"})
+    assert res.status_code == 200
+
+    names = {u["username"] for u in client.get("/api/users").get_json()}
+    assert names == {"admin1", "op1", "view1", "new1"}
+
+    res = client.delete("/api/users/new1")
+    assert res.status_code == 200
+    names = {u["username"] for u in client.get("/api/users").get_json()}
+    assert "new1" not in names
+
+
+def test_new_user_can_log_in_with_the_password_set_by_admin(multiuser_app):
+    admin_client = multiuser_app.test_client()
+    _login(admin_client, "admin1", "adminpass")
+    admin_client.post("/api/users", json={"username": "new1", "password": "pw", "role": "operator"})
+
+    new_client = multiuser_app.test_client()
+    _login(new_client, "new1", "pw")
+
+    assert new_client.get("/api/me").get_json()["role"] == "operator"
+
+
+def test_admin_cannot_demote_their_own_account(multiuser_app):
+    client = multiuser_app.test_client()
+    _login(client, "admin1", "adminpass")
+
+    res = client.patch("/api/users/admin1", json={"role": "viewer"})
+
+    assert res.status_code == 400
+    assert client.get("/api/me").get_json()["role"] == "admin"
+
+
+def test_admin_cannot_delete_their_own_account(multiuser_app):
+    client = multiuser_app.test_client()
+    _login(client, "admin1", "adminpass")
+
+    res = client.delete("/api/users/admin1")
+
+    assert res.status_code == 400
+    assert any(u["username"] == "admin1" for u in client.get("/api/users").get_json())
+
+
+def test_admin_can_update_another_users_role(multiuser_app):
+    client = multiuser_app.test_client()
+    _login(client, "admin1", "adminpass")
+
+    res = client.patch("/api/users/view1", json={"role": "operator"})
+
+    assert res.status_code == 200
+    roles = {u["username"]: u["role"] for u in client.get("/api/users").get_json()}
+    assert roles["view1"] == "operator"
+
+
+def test_create_user_endpoint_rejects_a_duplicate_username(multiuser_app):
+    client = multiuser_app.test_client()
+    _login(client, "admin1", "adminpass")
+
+    res = client.post("/api/users", json={"username": "op1", "password": "pw", "role": "viewer"})
+
+    assert res.status_code == 409
+
+
+def test_create_user_endpoint_rejects_an_unknown_role(multiuser_app):
+    client = multiuser_app.test_client()
+    _login(client, "admin1", "adminpass")
+
+    res = client.post("/api/users", json={"username": "new2", "password": "pw", "role": "superadmin"})
+
+    assert res.status_code == 400
 
 
 def _workflow(name: str, url: str) -> dict:

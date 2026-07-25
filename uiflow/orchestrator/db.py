@@ -125,6 +125,20 @@ CREATE TABLE IF NOT EXISTS schedules (
     last_run_at TEXT,
     created_at TEXT NOT NULL
 );
+
+-- Individual accounts, opt-in: the Studio defaults to the frictionless
+-- single-user mode (no login, or one shared UIFLOW_STUDIO_PASSWORD) that
+-- every earlier session used. The moment one row exists here, studio/app.py
+-- switches to per-user login and role checks instead - see
+-- ROLE_ORDER/require_login. password_hash never stores a plain password
+-- (werkzeug.security.generate_password_hash), matching how a credential's
+-- secret value never touches this database either (see credentials.py).
+CREATE TABLE IF NOT EXISTS users (
+    username TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -602,3 +616,55 @@ def delete_schedule(schedule_id: int) -> None:
 def mark_schedule_ran(schedule_id: int) -> None:
     with connect() as conn:
         conn.execute("UPDATE schedules SET last_run_at=? WHERE id=?", (_now(), schedule_id))
+
+
+# --- users (opt-in per-account login/RBAC, see the users table comment) -----
+
+VALID_ROLES = ("viewer", "operator", "admin")
+
+
+def create_user(username: str, password_hash: str, role: str) -> None:
+    if role not in VALID_ROLES:
+        raise ValueError(f"Unknown role '{role}', expected one of {VALID_ROLES}")
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?)",
+            (username, password_hash, role, _now()),
+        )
+
+
+def get_user(username: str) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+        return dict(row) if row else None
+
+
+def list_users() -> list[dict[str, Any]]:
+    """Usernames and roles only - never the password hash, same spirit as
+    list_credential_names() never returning a credential's secret value."""
+    with connect() as conn:
+        rows = conn.execute("SELECT username, role, created_at FROM users ORDER BY username").fetchall()
+        return [dict(r) for r in rows]
+
+
+def set_user_role(username: str, role: str) -> None:
+    if role not in VALID_ROLES:
+        raise ValueError(f"Unknown role '{role}', expected one of {VALID_ROLES}")
+    with connect() as conn:
+        conn.execute("UPDATE users SET role=? WHERE username=?", (role, username))
+
+
+def set_user_password(username: str, password_hash: str) -> None:
+    with connect() as conn:
+        conn.execute("UPDATE users SET password_hash=? WHERE username=?", (password_hash, username))
+
+
+def delete_user(username: str) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM users WHERE username=?", (username,))
+
+
+def any_users_exist() -> bool:
+    """Whether multi-user mode is active - see studio/app.py's require_login."""
+    with connect() as conn:
+        return conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None

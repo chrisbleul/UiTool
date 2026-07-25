@@ -1,5 +1,6 @@
 let schema = { web: {}, desktop: {} };
 let repositoryEntries = []; // Object Repository: [{scope, name, fields}, ...] - see /api/repository
+let currentUser = { username: null, role: null, multiuser: false };
 
 let state = {
   backend: "web",
@@ -1891,6 +1892,131 @@ async function addGlobal() {
   toast(`Globale Variable "${name}" gespeichert.`, "success");
 }
 
+// --- users (opt-in multi-user/RBAC - admin-only panel, see studio/app.py) --
+
+const ROLE_LABELS = { viewer: "Viewer", operator: "Operator", admin: "Admin" };
+
+async function renderUsersPanel() {
+  const container = el("users-list");
+  container.innerHTML = "Lädt...";
+  const res = await fetch("/api/users");
+  if (!res.ok) {
+    container.innerHTML = '<p style="color:var(--muted)">Nur für Admins sichtbar.</p>';
+    return;
+  }
+  const users = await res.json();
+  if (users.length === 0) {
+    container.innerHTML = '<p style="color:var(--muted)">Noch keine Benutzer angelegt.</p>';
+    return;
+  }
+  container.innerHTML = "";
+  for (const user of users) {
+    const row = document.createElement("div");
+    row.className = "list-row";
+
+    const info = document.createElement("div");
+    info.style.flex = "1";
+    info.style.minWidth = "0";
+    const label = document.createElement("div");
+    label.className = "list-row-name";
+    label.textContent = user.username + (user.username === currentUser.username ? " (du)" : "");
+    const meta = document.createElement("div");
+    meta.className = "list-row-meta";
+    meta.textContent = ROLE_LABELS[user.role] || user.role;
+    info.append(label, meta);
+
+    const roleSelect = document.createElement("select");
+    for (const [value, roleLabel] of Object.entries(ROLE_LABELS)) {
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = roleLabel;
+      if (value === user.role) opt.selected = true;
+      roleSelect.appendChild(opt);
+    }
+    roleSelect.addEventListener("change", async () => {
+      const res2 = await fetch(`/api/users/${encodeURIComponent(user.username)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role: roleSelect.value }),
+      });
+      const data = await res2.json();
+      if (!res2.ok) {
+        toast("Ändern fehlgeschlagen: " + (data.error || res2.status), "error");
+        renderUsersPanel();
+        return;
+      }
+      toast(`Rolle von "${user.username}" geändert.`, "success");
+    });
+
+    const delBtn = document.createElement("button");
+    delBtn.className = "btn-icon danger";
+    delBtn.textContent = "✕";
+    delBtn.title = "Löschen";
+    delBtn.setAttribute("aria-label", `Benutzer "${user.username}" löschen`);
+    delBtn.disabled = user.username === currentUser.username;
+    delBtn.addEventListener("click", async () => {
+      if (!(await confirmDialog(`Benutzer "${user.username}" wirklich löschen?`))) return;
+      const res2 = await fetch(`/api/users/${encodeURIComponent(user.username)}`, { method: "DELETE" });
+      const data = await res2.json();
+      if (!res2.ok) {
+        toast("Löschen fehlgeschlagen: " + (data.error || res2.status), "error");
+        return;
+      }
+      renderUsersPanel();
+      toast(`Benutzer "${user.username}" gelöscht.`, "success");
+    });
+
+    row.append(info, roleSelect, delBtn);
+    container.appendChild(row);
+  }
+}
+
+async function addUser() {
+  const username = el("user-name").value.trim();
+  const password = el("user-password").value;
+  const role = el("user-role").value;
+  if (!username || !password) {
+    toast("Bitte Benutzername und Passwort angeben.", "error");
+    return;
+  }
+  const res = await fetch("/api/users", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password, role }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    toast("Anlegen fehlgeschlagen: " + (data.error || res.status), "error");
+    return;
+  }
+  el("user-name").value = "";
+  el("user-password").value = "";
+  renderUsersPanel();
+  toast(`Benutzer "${username}" angelegt.`, "success");
+}
+
+async function loadCurrentUser() {
+  const res = await fetch("/api/me");
+  if (!res.ok) return;
+  currentUser = await res.json();
+  applyRoleVisibility();
+}
+
+function applyRoleVisibility() {
+  const isAdmin = !currentUser.multiuser || currentUser.role === "admin";
+  el("tab-btn-credentials").classList.toggle("hidden", !isAdmin);
+  el("tab-btn-globals").classList.toggle("hidden", !isAdmin);
+  el("tab-btn-users").classList.toggle("hidden", !currentUser.multiuser || !isAdmin);
+
+  const userBox = el("current-user");
+  if (currentUser.multiuser && currentUser.username) {
+    userBox.innerHTML = `Angemeldet als <strong>${escapeHtml(currentUser.username)}</strong> (${ROLE_LABELS[currentUser.role] || currentUser.role})`;
+    userBox.classList.remove("hidden");
+  } else {
+    userBox.classList.add("hidden");
+  }
+}
+
 // --- declared workflow variables (per-workflow, saved as part of its own
 // YAML - see models.Workflow.variables - not the installation-wide globals
 // above, which live in orchestrator.db instead) ------------------------------
@@ -2413,6 +2539,7 @@ function switchTab(name) {
   if (name === "credentials") renderCredentialsPanel();
   if (name === "globals") renderGlobalsPanel();
   if (name === "schedules") renderSchedulesPanel();
+  if (name === "users") renderUsersPanel();
 }
 
 function startNewWorkflow() {
@@ -2469,6 +2596,7 @@ function init() {
   el("btn-add-credential").addEventListener("click", addCredential);
   el("btn-add-global").addEventListener("click", addGlobal);
   el("btn-add-schedule").addEventListener("click", addSchedule);
+  el("btn-add-user").addEventListener("click", addUser);
   el("btn-refresh-runs").addEventListener("click", renderRunsView);
   el("btn-quick-new-workflow").addEventListener("click", () => {
     startNewWorkflow();
@@ -2517,6 +2645,7 @@ function init() {
   });
   loadWorkflowList();
   loadQueueNames();
+  loadCurrentUser();
   updateUndoButton();
   updateBrowserChannelVisibility();
   switchView("dashboard");

@@ -105,6 +105,49 @@ def cmd_scheduler(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_create_user(args: argparse.Namespace) -> int:
+    """Creates (or, with --update, updates the password/role of) a Studio user
+    account - the entry point for switching an installation from the default,
+    frictionless single-user mode into per-account login/RBAC (see
+    orchestrator/db.py's users table). The moment one account exists,
+    studio/app.py requires per-account login instead of the shared
+    UIFLOW_STUDIO_PASSWORD gate (or no gate at all)."""
+    import getpass
+
+    from werkzeug.security import generate_password_hash
+
+    from .orchestrator import db
+
+    db.init_db()
+    existing = db.get_user(args.username)
+    if existing and not args.update:
+        print(f"User '{args.username}' existiert bereits (--update verwenden, um Passwort/Rolle zu ändern)")
+        return 1
+    if not existing and args.update:
+        print(f"User '{args.username}' existiert noch nicht (--update weglassen, um ihn anzulegen)")
+        return 1
+
+    password = args.password
+    if not password:
+        password = getpass.getpass("Passwort: ")
+        if password != getpass.getpass("Passwort (Wiederholung): "):
+            print("Passwörter stimmen nicht überein")
+            return 1
+    if not password:
+        print("Passwort darf nicht leer sein")
+        return 1
+
+    password_hash = generate_password_hash(password)
+    if existing:
+        db.set_user_password(args.username, password_hash)
+        db.set_user_role(args.username, args.role)
+        print(f"User '{args.username}' aktualisiert (Rolle: {args.role})")
+    else:
+        db.create_user(args.username, password_hash, args.role)
+        print(f"User '{args.username}' angelegt (Rolle: {args.role})")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="uiflow", description="MVP UI automation for desktop and web apps")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -140,6 +183,17 @@ def build_parser() -> argparse.ArgumentParser:
     scheduler_p = sub.add_parser("scheduler", help="Run a standalone scheduler that enqueues jobs for due cron schedules")
     scheduler_p.add_argument("--poll-interval", type=float, default=20.0, help="Seconds between schedule checks")
     scheduler_p.set_defaults(func=cmd_scheduler)
+
+    user_p = sub.add_parser(
+        "create-user", help="Create or update a Studio user account (switches the Studio into per-account login/RBAC)"
+    )
+    user_p.add_argument("username")
+    user_p.add_argument("--role", choices=["viewer", "operator", "admin"], default="admin")
+    user_p.add_argument("--password", default=None, help="Set non-interactively (e.g. for scripting); otherwise prompted")
+    user_p.add_argument(
+        "--update", action="store_true", help="Update an existing user's password/role instead of creating a new one"
+    )
+    user_p.set_defaults(func=cmd_create_user)
 
     return parser
 
