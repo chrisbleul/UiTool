@@ -123,7 +123,20 @@ CREATE TABLE IF NOT EXISTS schedules (
     queue_name TEXT,
     enabled INTEGER NOT NULL DEFAULT 1,
     last_run_at TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    skip_weekends INTEGER NOT NULL DEFAULT 0,
+    skip_holidays INTEGER NOT NULL DEFAULT 0
+);
+
+-- Installation-wide (not per-schedule) list of dates a schedule may opt out
+-- of firing on via its own skip_holidays flag - see
+-- worker.py's _schedule_is_due, which treats this the same way it treats a
+-- weekend when skip_weekends is set: an occurrence that falls on a listed
+-- date is skipped, not fired late, and the *next* occurrence is what
+-- eventually runs.
+CREATE TABLE IF NOT EXISTS holidays (
+    date TEXT PRIMARY KEY,
+    name TEXT
 );
 
 -- Individual accounts, opt-in: the Studio defaults to the frictionless
@@ -226,6 +239,8 @@ def init_db() -> None:
                     ("queue_items", "retry_after", "TEXT"),
                     ("jobs", "sub_workflows_json", "TEXT"),
                     ("jobs", "last_heartbeat_at", "TEXT"),
+                    ("schedules", "skip_weekends", "INTEGER NOT NULL DEFAULT 0"),
+                    ("schedules", "skip_holidays", "INTEGER NOT NULL DEFAULT 0"),
                 ):
                     try:
                         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
@@ -683,12 +698,20 @@ def delete_global_variable(name: str) -> None:
 # --- schedules ---------------------------------------------------------------
 
 
-def create_schedule(name: str, cron_expr: str, workflow: dict[str, Any], queue_name: str | None = None) -> int:
+def create_schedule(
+    name: str,
+    cron_expr: str,
+    workflow: dict[str, Any],
+    queue_name: str | None = None,
+    skip_weekends: bool = False,
+    skip_holidays: bool = False,
+) -> int:
     with connect() as conn:
         cur = conn.execute(
-            "INSERT INTO schedules (name, cron_expr, workflow_json, queue_name, enabled, created_at) "
-            "VALUES (?, ?, ?, ?, 1, ?)",
-            (name, cron_expr, json.dumps(workflow), queue_name, _now()),
+            "INSERT INTO schedules "
+            "(name, cron_expr, workflow_json, queue_name, enabled, created_at, skip_weekends, skip_holidays) "
+            "VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
+            (name, cron_expr, json.dumps(workflow), queue_name, _now(), int(skip_weekends), int(skip_holidays)),
         )
         return cur.lastrowid
 
@@ -718,6 +741,34 @@ def delete_schedule(schedule_id: int) -> None:
 def mark_schedule_ran(schedule_id: int) -> None:
     with connect() as conn:
         conn.execute("UPDATE schedules SET last_run_at=? WHERE id=?", (_now(), schedule_id))
+
+
+# --- business calendar (holidays a schedule can opt out of, see the holidays
+# table comment and worker.py's _schedule_is_due) ------------------------------
+
+
+def add_holiday(date: str, name: str | None = None) -> None:
+    with connect() as conn:
+        conn.execute("INSERT OR REPLACE INTO holidays (date, name) VALUES (?, ?)", (date, name))
+
+
+def list_holidays() -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute("SELECT * FROM holidays ORDER BY date").fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_holiday_dates() -> set[str]:
+    """Just the ISO date strings, for a fast membership check (see
+    worker.py's _schedule_is_due) - the holiday's own name is display-only."""
+    with connect() as conn:
+        rows = conn.execute("SELECT date FROM holidays").fetchall()
+        return {r["date"] for r in rows}
+
+
+def delete_holiday(date: str) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM holidays WHERE date=?", (date,))
 
 
 # --- users (opt-in per-account login/RBAC, see the users table comment) -----

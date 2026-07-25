@@ -711,6 +711,13 @@ dem Worker, siehe `--no-worker`); eigenständig läuft er über:
 python -m uiflow.cli scheduler
 ```
 
+**Business-Kalender**: die zwei Häkchen beim Anlegen eines Zeitplans, **Nur an Werktagen** (überspringt
+Samstag/Sonntag) und **Feiertage überspringen** (überspringt Daten aus der weiter unten im selben Tab
+gepflegten, Installations-weiten Feiertagsliste), sorgen dafür, dass ein Cron-Ausdruck allein nicht
+reicht, um z.B. "jeden Werktag um 2 Uhr, außer an Feiertagen" abzubilden. Eine übersprungene Ausführung
+wird nicht verspätet nachgeholt, sobald wieder ein gültiger Tag kommt — sie fällt schlicht aus; die
+nächste reguläre, nicht übersprungene Ausführung zählt ganz normal.
+
 ## Login (optional)
 
 `uiflow studio` läuft standardmäßig ohne Anmeldung — als lokales Single-User-Tool auf `127.0.0.1`.
@@ -877,9 +884,9 @@ Ideen, was als Nächstes sinnvoll sein könnte. Reihenfolge ist keine Priorität
 - **Testbarkeit von Workflows**: ein "Dry-Run"-Modus, der Ausdrücke/Variablen/Selektoren gegen einen
   Fake-Backend validiert, ohne den echten Browser/Desktop anzufassen — würde Tippfehler in Python-
   Ausdrücken oder fehlende Variablen schon beim Speichern statt erst beim echten Lauf auffangen.
-- **Business-Kalender für Zeitpläne**: Cron-Ausdrücke allein kennen keine Feiertage oder "nur an
-  Werktagen" — ein Zeitplan, der z.B. jeden Monatsersten läuft, feuert damit auch an einem Feiertag
-  oder Wochenende, falls der auf den Ersten fällt.
+- ~~**Business-Kalender für Zeitpläne**~~ — erledigt, siehe "Zeitpläne (Scheduling)" oben
+  ("Nur an Werktagen" / "Feiertage überspringen"). Was bewusst fehlt: keine wiederkehrenden Regeln für
+  Feiertage (z.B. "jeder erste Montag im Monat") — nur einzelne, von Hand gepflegte Kalenderdaten.
 - **Human-in-the-loop / Action Center**: ein Schritt-Typ, der auf eine menschliche Entscheidung wartet
   (z.B. "Rechnung > 10.000€ manuell freigeben") über ein Web-Formular — nicht dasselbe wie ein
   Haltepunkt, der eine Person direkt am Studio voraussetzt, sondern eine asynchrone Freigabe, die auch

@@ -719,6 +719,159 @@ def test_schedule_is_not_due_right_after_being_marked_ran():
     assert _schedule_is_due(schedule) is False
 
 
+# --- business calendar (skip_weekends / skip_holidays) -----------------------
+
+
+def test_is_occurrence_skipped_by_weekend():
+    import datetime as dt
+
+    from uiflow.orchestrator.worker import _is_occurrence_skipped
+
+    saturday = dt.datetime(2000, 1, 8, tzinfo=dt.timezone.utc)
+    assert saturday.weekday() == 5  # sanity-check the fixed anchor itself
+    assert _is_occurrence_skipped(saturday, True, set()) is True
+    assert _is_occurrence_skipped(saturday, False, set()) is False
+
+
+def test_is_occurrence_skipped_by_holiday():
+    import datetime as dt
+
+    from uiflow.orchestrator.worker import _is_occurrence_skipped
+
+    day = dt.datetime(2026, 12, 25, tzinfo=dt.timezone.utc)
+    assert _is_occurrence_skipped(day, False, {"2026-12-25"}) is True
+    assert _is_occurrence_skipped(day, False, {"2026-12-24"}) is False
+
+
+def test_schedule_with_skip_weekends_skips_saturday_and_sunday_then_fires_monday():
+    import datetime as dt
+
+    from uiflow.orchestrator.worker import _schedule_is_due
+
+    # A fixed, safely-far-in-the-past Friday - any real test run happens long
+    # after this, so every occurrence computed from it is unambiguously in
+    # the past ("due"), which isolates this test from skip_weekends'
+    # weekday-of-the-occurrence logic instead of skip_weekends'
+    # in-the-future logic.
+    friday_late = dt.datetime(2000, 1, 7, 23, 0, tzinfo=dt.timezone.utc)
+    assert friday_late.weekday() == 4  # sanity-check the anchor
+    schedule = {
+        "cron_expr": "0 0 * * *",  # daily at midnight
+        "last_run_at": None,
+        "created_at": friday_late.isoformat(),
+        "skip_weekends": True,
+    }
+
+    # Saturday's and Sunday's occurrences are both skipped; Monday's is the
+    # first one that counts, and it's still due (long since passed).
+    assert _schedule_is_due(schedule) is True
+
+
+def test_schedule_without_skip_weekends_still_fires_on_the_weekend_occurrence():
+    import datetime as dt
+
+    from uiflow.orchestrator.worker import _schedule_is_due
+
+    friday_late = dt.datetime(2000, 1, 7, 23, 0, tzinfo=dt.timezone.utc)
+    schedule = {
+        "cron_expr": "0 0 * * *",
+        "last_run_at": None,
+        "created_at": friday_late.isoformat(),
+        # no skip_weekends key at all - matches every schedule created before
+        # this feature existed
+    }
+
+    assert _schedule_is_due(schedule) is True
+
+
+def test_schedule_with_skip_holidays_skips_a_listed_date():
+    import datetime as dt
+
+    from uiflow.orchestrator.worker import _schedule_is_due
+
+    anchor = dt.datetime(2000, 1, 6, 23, 0, tzinfo=dt.timezone.utc)  # just before Jan 7 midnight
+    db.add_holiday("2000-01-07", "Test-Feiertag")
+    schedule = {
+        "cron_expr": "0 0 * * *",
+        "last_run_at": None,
+        "created_at": anchor.isoformat(),
+        "skip_holidays": True,
+    }
+
+    # Jan 7 is listed as a holiday and skipped; Jan 8 is the next occurrence.
+    assert _schedule_is_due(schedule) is True
+
+
+def test_schedule_with_skip_holidays_ignores_unlisted_dates():
+    import datetime as dt
+
+    from uiflow.orchestrator.worker import _schedule_is_due
+
+    anchor = dt.datetime(2000, 1, 6, 23, 0, tzinfo=dt.timezone.utc)
+    db.add_holiday("2005-05-05", "Ein ganz anderes Datum")  # not Jan 7
+    schedule = {
+        "cron_expr": "0 0 * * *",
+        "last_run_at": None,
+        "created_at": anchor.isoformat(),
+        "skip_holidays": True,
+    }
+
+    assert _schedule_is_due(schedule) is True  # Jan 7 itself is not skipped
+
+
+def test_schedule_is_due_gives_up_when_every_occurrence_is_forever_skipped():
+    from uiflow.orchestrator.worker import _schedule_is_due
+
+    schedule = {
+        "cron_expr": "0 0 * * 6",  # every Saturday, forever
+        "last_run_at": None,
+        "created_at": "2000-01-01T00:00:00+00:00",
+        "skip_weekends": True,  # every possible occurrence is a Saturday
+    }
+
+    assert _schedule_is_due(schedule) is False
+
+
+def test_add_list_and_delete_holidays():
+    db.add_holiday("2026-12-25", "Weihnachten")
+    db.add_holiday("2026-01-01", "Neujahr")
+
+    holidays = db.list_holidays()
+    assert [h["date"] for h in holidays] == ["2026-01-01", "2026-12-25"]  # sorted by date
+    assert db.list_holiday_dates() == {"2026-01-01", "2026-12-25"}
+
+    db.delete_holiday("2026-01-01")
+
+    assert db.list_holiday_dates() == {"2026-12-25"}
+
+
+def test_add_holiday_is_idempotent_by_date():
+    db.add_holiday("2026-12-25", "Weihnachten")
+    db.add_holiday("2026-12-25", "Christmas")  # same date, different name - replaces
+
+    [holiday] = db.list_holidays()
+    assert holiday["name"] == "Christmas"
+
+
+def test_create_schedule_stores_skip_flags():
+    schedule_id = db.create_schedule(
+        "nightly", "0 2 * * *", {"name": "demo", "backend": "web", "steps": []},
+        skip_weekends=True, skip_holidays=True,
+    )
+
+    schedule = db.get_schedule(schedule_id)
+    assert schedule["skip_weekends"] == 1
+    assert schedule["skip_holidays"] == 1
+
+
+def test_create_schedule_defaults_skip_flags_to_false():
+    schedule_id = db.create_schedule("nightly", "0 2 * * *", {"name": "demo", "backend": "web", "steps": []})
+
+    schedule = db.get_schedule(schedule_id)
+    assert schedule["skip_weekends"] == 0
+    assert schedule["skip_holidays"] == 0
+
+
 def test_run_scheduler_loop_snapshots_referenced_sub_workflows(monkeypatch, tmp_path):
     import threading
 

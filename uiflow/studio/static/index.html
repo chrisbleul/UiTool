@@ -200,12 +200,31 @@
         <div class="excel-import-row">
           <input id="schedule-name" type="text" placeholder="Name">
           <input id="schedule-cron" type="text" placeholder="Cron (z.B. 0 2 * * *)">
+          <label class="notifications-checkbox">
+            <input id="schedule-skip-weekends" type="checkbox">
+            Nur an Werktagen
+          </label>
+          <label class="notifications-checkbox">
+            <input id="schedule-skip-holidays" type="checkbox">
+            Feiertage überspringen
+          </label>
           <button id="btn-add-schedule" class="btn">Aktuellen Workflow planen</button>
         </div>
         <p class="panel-hint">
-          Plant den zuletzt im Builder geöffneten Workflow (inkl. Queue-Name, falls gesetzt).
+          Plant den zuletzt im Builder geöffneten Workflow (inkl. Queue-Name, falls gesetzt). "Nur an
+          Werktagen" überspringt Samstag/Sonntag, "Feiertage überspringen" die unten gepflegte Liste —
+          eine übersprungene Ausführung fällt aus, statt verspätet nachzuholen; die nächste reguläre
+          zählt wieder normal.
         </p>
         <div id="schedules-list" class="queues-list"></div>
+
+        <div class="tab-subsection-head">Feiertage</div>
+        <div class="excel-import-row">
+          <input id="holiday-date" type="date">
+          <input id="holiday-name" type="text" placeholder="Name (optional, z.B. Weihnachten)">
+          <button id="btn-add-holiday" class="btn">Hinzufügen</button>
+        </div>
+        <div id="holidays-list" class="queues-list"></div>
       </div>
 
       <div class="tab-panel" data-tab-panel="users">

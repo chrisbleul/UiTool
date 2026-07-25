@@ -307,13 +307,46 @@ def run_worker_loop(
         _run_job(job, store=store, heartbeat_interval=heartbeat_interval)
 
 
+# Safety valve for _schedule_is_due's catch-up loop below: a cron/calendar
+# combination where every occurrence for the foreseeable future is skipped
+# (e.g. "every Saturday" with skip_weekends on) would otherwise advance
+# forever without ever returning - this caps how many occurrences it will
+# walk past in one check, comfortably more than a year of even an hourly cron.
+_MAX_SCHEDULE_LOOKAHEAD_OCCURRENCES = 400
+
+
+def _is_occurrence_skipped(fire_time, skip_weekends: bool, holiday_dates: set[str]) -> bool:
+    if skip_weekends and fire_time.weekday() >= 5:  # 5=Saturday, 6=Sunday
+        return True
+    return bool(holiday_dates) and fire_time.date().isoformat() in holiday_dates
+
+
 def _schedule_is_due(schedule: dict[str, Any]) -> bool:
+    """True if this schedule has an occurrence at or before now that hasn't
+    run yet and isn't skipped by its business-calendar settings
+    (skip_weekends/skip_holidays, see db.py's holidays table). A skipped
+    occurrence is walked past, not fired late - the loop keeps advancing
+    through past occurrences (skipped or not) until it finds one that's
+    either due-and-not-skipped (True) or still in the future (False), so a
+    schedule catches up to the next *valid* occurrence rather than getting
+    stuck retrying the same skipped one forever (last_run_at only advances
+    when a schedule actually fires - see run_scheduler_loop)."""
     from croniter import croniter
 
     last_run = schedule["last_run_at"]
     base = datetime.fromisoformat(last_run) if last_run else datetime.fromisoformat(schedule["created_at"])
-    next_fire = croniter(schedule["cron_expr"], base).get_next(datetime)
-    return next_fire <= datetime.now(next_fire.tzinfo)
+    skip_weekends = bool(schedule.get("skip_weekends"))
+    skip_holidays = bool(schedule.get("skip_holidays"))
+    holiday_dates = db.list_holiday_dates() if skip_holidays else set()
+
+    cron = croniter(schedule["cron_expr"], base)
+    for _ in range(_MAX_SCHEDULE_LOOKAHEAD_OCCURRENCES):
+        next_fire = cron.get_next(datetime)
+        if next_fire > datetime.now(next_fire.tzinfo):
+            return False
+        if not _is_occurrence_skipped(next_fire, skip_weekends, holiday_dates):
+            return True
+    return False
 
 
 def run_scheduler_loop(

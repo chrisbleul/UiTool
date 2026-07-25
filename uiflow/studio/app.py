@@ -6,6 +6,7 @@ import queue
 import secrets
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -817,7 +818,14 @@ def create_app() -> Flask:
         except (CroniterBadCronError, ValueError) as exc:
             return jsonify({"error": f"Invalid cron expression: {exc}"}), 400
 
-        schedule_id = db.create_schedule(name, cron_expr, workflow.to_dict(), queue_name=data.get("queue_name"))
+        schedule_id = db.create_schedule(
+            name,
+            cron_expr,
+            workflow.to_dict(),
+            queue_name=data.get("queue_name"),
+            skip_weekends=bool(data.get("skip_weekends")),
+            skip_holidays=bool(data.get("skip_holidays")),
+        )
         return jsonify({"id": schedule_id})
 
     @app.post("/api/schedules/<int:schedule_id>/toggle")
@@ -832,6 +840,28 @@ def create_app() -> Flask:
     def delete_schedule_route(schedule_id: int) -> Response:
         db.delete_schedule(schedule_id)
         return jsonify({"deleted": schedule_id})
+
+    @app.get("/api/holidays")
+    def list_holidays_route() -> Response:
+        return jsonify(db.list_holidays())
+
+    @app.post("/api/holidays")
+    def add_holiday_route() -> Response:
+        data = request.get_json(force=True) or {}
+        date = (data.get("date") or "").strip()
+        if not date:
+            return jsonify({"error": "date required"}), 400
+        try:
+            datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            return jsonify({"error": "date must be YYYY-MM-DD"}), 400
+        db.add_holiday(date, (data.get("name") or "").strip() or None)
+        return jsonify({"date": date})
+
+    @app.delete("/api/holidays/<date>")
+    def delete_holiday_route(date: str) -> Response:
+        db.delete_holiday(date)
+        return jsonify({"deleted": date})
 
     @app.get("/api/notifications")
     def get_notification_settings_route() -> Response:

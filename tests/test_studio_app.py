@@ -739,6 +739,48 @@ def test_create_and_list_schedule_via_api(client):
     assert "workflow_json" not in schedule
 
 
+def test_create_schedule_stores_skip_flags_via_api(client):
+    workflow = {"name": "demo", "backend": "web", "steps": []}
+    res = client.post(
+        "/api/schedules",
+        json={
+            "name": "nightly",
+            "cron_expr": "0 2 * * *",
+            "workflow": workflow,
+            "skip_weekends": True,
+            "skip_holidays": True,
+        },
+    )
+
+    schedule_id = res.get_json()["id"]
+    [schedule] = client.get("/api/schedules").get_json()
+    assert schedule["id"] == schedule_id
+    assert schedule["skip_weekends"] == 1
+    assert schedule["skip_holidays"] == 1
+
+
+def test_holidays_endpoint_add_list_and_delete(client):
+    res = client.post("/api/holidays", json={"date": "2026-12-25", "name": "Weihnachten"})
+    assert res.status_code == 200
+    client.post("/api/holidays", json={"date": "2026-01-01"})
+
+    holidays = client.get("/api/holidays").get_json()
+    assert [h["date"] for h in holidays] == ["2026-01-01", "2026-12-25"]
+    assert next(h for h in holidays if h["date"] == "2026-12-25")["name"] == "Weihnachten"
+
+    res = client.delete("/api/holidays/2026-01-01")
+    assert res.status_code == 200
+    assert [h["date"] for h in client.get("/api/holidays").get_json()] == ["2026-12-25"]
+
+
+def test_holidays_endpoint_requires_a_date(client):
+    assert client.post("/api/holidays", json={"name": "x"}).status_code == 400
+
+
+def test_holidays_endpoint_rejects_a_malformed_date(client):
+    assert client.post("/api/holidays", json={"date": "25.12.2026"}).status_code == 400
+
+
 def test_create_schedule_rejects_invalid_cron(client):
     workflow = {"name": "demo", "backend": "web", "steps": []}
     res = client.post("/api/schedules", json={"name": "bad", "cron_expr": "not-a-cron", "workflow": workflow})

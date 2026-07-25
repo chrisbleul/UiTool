@@ -973,6 +973,17 @@ body {
 }
 .notifications-actions { display: flex; gap: 8px; }
 
+.tab-subsection-head {
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--muted);
+  padding: 14px 14px 4px;
+  border-top: 1px solid var(--border);
+  margin-top: 8px;
+}
+
 .list-row {
   display: flex;
   align-items: center;

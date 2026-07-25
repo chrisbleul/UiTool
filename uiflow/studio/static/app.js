@@ -2541,6 +2541,8 @@ async function renderSchedulesPanel() {
     meta.textContent =
       cronDescription(s.cron_expr) +
       (s.queue_name ? ` · Queue: ${s.queue_name}` : "") +
+      (s.skip_weekends ? " · nur Werktage" : "") +
+      (s.skip_holidays ? " · ohne Feiertage" : "") +
       (s.last_run_at ? ` · zuletzt: ${new Date(s.last_run_at).toLocaleString()}` : " · noch nie gelaufen");
     info.append(name, meta);
 
@@ -2583,7 +2585,14 @@ async function addSchedule() {
   const res = await fetch("/api/schedules", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, cron_expr: cronExpr, workflow: payload, queue_name: queueName || undefined }),
+    body: JSON.stringify({
+      name,
+      cron_expr: cronExpr,
+      workflow: payload,
+      queue_name: queueName || undefined,
+      skip_weekends: el("schedule-skip-weekends").checked,
+      skip_holidays: el("schedule-skip-holidays").checked,
+    }),
   });
   const data = await res.json();
   if (!res.ok) {
@@ -2592,8 +2601,61 @@ async function addSchedule() {
   }
   el("schedule-name").value = "";
   el("schedule-cron").value = "";
+  el("schedule-skip-weekends").checked = false;
+  el("schedule-skip-holidays").checked = false;
   await renderSchedulesPanel();
   toast(`Zeitplan "${name}" angelegt.`, "success");
+}
+
+async function renderHolidaysPanel() {
+  const container = el("holidays-list");
+  container.innerHTML = "Lädt...";
+  const holidays = await (await fetch("/api/holidays")).json();
+  if (holidays.length === 0) {
+    container.innerHTML = '<p style="color:var(--muted)">Noch keine Feiertage gepflegt.</p>';
+    return;
+  }
+  container.innerHTML = "";
+  for (const holiday of holidays) {
+    const row = document.createElement("div");
+    row.className = "list-row";
+    const label = document.createElement("span");
+    label.className = "list-row-name";
+    label.textContent = holiday.name ? `${holiday.date} — ${holiday.name}` : holiday.date;
+    const delBtn = document.createElement("button");
+    delBtn.className = "btn-icon danger";
+    delBtn.textContent = "✕";
+    delBtn.title = "Löschen";
+    delBtn.setAttribute("aria-label", `Feiertag "${holiday.date}" löschen`);
+    delBtn.addEventListener("click", async () => {
+      await fetch(`/api/holidays/${holiday.date}`, { method: "DELETE" });
+      renderHolidaysPanel();
+    });
+    row.append(label, delBtn);
+    container.appendChild(row);
+  }
+}
+
+async function addHoliday() {
+  const date = el("holiday-date").value;
+  const name = el("holiday-name").value.trim();
+  if (!date) {
+    toast("Bitte ein Datum wählen.", "error");
+    return;
+  }
+  const res = await fetch("/api/holidays", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ date, name }),
+  });
+  if (!res.ok) {
+    toast("Hinzufügen fehlgeschlagen.", "error");
+    return;
+  }
+  el("holiday-date").value = "";
+  el("holiday-name").value = "";
+  await renderHolidaysPanel();
+  toast(`Feiertag "${date}" hinzugefügt.`, "success");
 }
 
 function escapeHtml(text) {
@@ -2902,7 +2964,10 @@ function switchTab(name) {
   if (name === "queues") renderQueuesPanel();
   if (name === "credentials") renderCredentialsPanel();
   if (name === "globals") renderGlobalsPanel();
-  if (name === "schedules") renderSchedulesPanel();
+  if (name === "schedules") {
+    renderSchedulesPanel();
+    renderHolidaysPanel();
+  }
   if (name === "users") renderUsersPanel();
   if (name === "audit") renderAuditLogPanel();
   if (name === "notifications") renderNotificationsPanel();
@@ -2971,6 +3036,7 @@ function init() {
   el("btn-add-credential").addEventListener("click", addCredential);
   el("btn-add-global").addEventListener("click", addGlobal);
   el("btn-add-schedule").addEventListener("click", addSchedule);
+  el("btn-add-holiday").addEventListener("click", addHoliday);
   el("btn-add-user").addEventListener("click", addUser);
   el("btn-save-notifications").addEventListener("click", saveNotificationSettings);
   el("btn-test-notification").addEventListener("click", sendTestNotification);
