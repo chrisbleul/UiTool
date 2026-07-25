@@ -1122,6 +1122,12 @@ body {
   z-index: 1000;
 }
 .modal-overlay.hidden { display: none; }
+/* confirmDialog() can be triggered from *within* an already-open overlay
+   (e.g. "Wiederherstellen" inside the version history overlay) - without a
+   higher z-index here, equal-z-index stacking falls back to DOM order, and
+   #confirm-overlay (defined earliest in index.html) would render *behind*
+   whichever other overlay is open, making its own buttons unclickable. */
+#confirm-overlay { z-index: 1100; }
 .modal-box {
   background: var(--panel);
   border-radius: 16px;
@@ -1137,6 +1143,20 @@ body {
 .modal-head h2 { margin: 0; font-size: 1.05rem; }
 .modal-box-wide .queues-list { padding: 0; overflow-y: auto; }
 .btn-danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+
+.version-preview {
+  margin: 0 12px 10px;
+  padding: 10px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  white-space: pre-wrap;
+  max-height: 260px;
+  overflow-y: auto;
+}
+.version-preview.hidden { display: none; }
 
 .modal-box-flowchart { width: 95vw; max-width: 1400px; height: 88vh; display: flex; flex-direction: column; }
 .flowchart-canvas {

@@ -782,6 +782,21 @@ Studio-Server selbst, sobald der die passende `/api/worker/jobs/<id>/finish`-Mel
 Fehlschlag beim Versenden selbst (falsches SMTP-Passwort, Netzwerkproblem) lässt den eigentlichen Job
 nicht zusätzlich fehlschlagen — er wird nur als Warnung geloggt.
 
+## Workflow-Versionierung
+
+Jedes **Speichern** über einen bereits bestehenden Workflow archiviert dessen bisherigen Inhalt zuerst
+als neue Version, bevor die Datei überschrieben wird — die lebende YAML-Datei in `workflows/` ist
+selbst immer die neueste Version und wird nicht zusätzlich dupliziert. Über den Verlaufs-Button (🕐,
+neben jedem Workflow im Tab **Workflows**) öffnet sich eine Liste früherer Stände (Zeitstempel,
+anlegende Person sofern Multi-User-Modus aktiv, Inhalt einsehbar über "Inhalt anzeigen") mit einem
+**Wiederherstellen**-Button pro Eintrag. Wiederherstellen ist selbst nur ein weiteres Speichern: der
+Stand unmittelbar davor wird ebenfalls archiviert, geht also nicht verloren, auch wenn man sich beim
+Wiederherstellen "vertut". Pro Workflow werden die letzten 50 Versionen aufgehoben, ältere werden beim
+nächsten Speichern automatisch entfernt; löscht man den Workflow selbst, wird auch sein gesamter
+Verlauf gelöscht (ein Wiederherstellen hätte ohnehin keine Datei mehr, in die es schreiben könnte).
+Bewusst eine einfache eigene Versions-Tabelle statt echtem Git im Hintergrund — kein Diff zwischen zwei
+Ständen, kein Branching, nur linearer Verlauf mit Wiederherstellen.
+
 ## Tests
 
 ```powershell
@@ -856,10 +871,9 @@ Ideen, was als Nächstes sinnvoll sein könnte. Reihenfolge ist keine Priorität
 - ~~**Proaktive Fehlerbenachrichtigung**~~ — als E-Mail erledigt, siehe "Proaktive
   Fehlerbenachrichtigung" oben. Was fehlt: Slack- oder Webhook-Kanäle statt/zusätzlich zu E-Mail — die
   Einstellung kennt aktuell nur SMTP.
-- **Workflow-Versionierung**: "Speichern" überschreibt die YAML-Datei ohne Historie — kein Diff
-  zwischen zwei Ständen, kein Zurückrollen auf eine ältere Version direkt im Studio. Ließe sich
-  entweder über echtes Git im Hintergrund lösen oder über eine einfache eigene Versions-Tabelle
-  (ähnlich den Job-Snapshots, die es für einzelne Läufe schon gibt).
+- ~~**Workflow-Versionierung**~~ — erledigt, siehe "Workflow-Versionierung" oben (eigene
+  Versions-Tabelle, kein Git). Was bewusst fehlt: kein Diff zwischen zwei Ständen (nur die volle
+  YAML jeder Version einsehbar), kein Branching — nur linearer Verlauf mit Wiederherstellen.
 - **Testbarkeit von Workflows**: ein "Dry-Run"-Modus, der Ausdrücke/Variablen/Selektoren gegen einen
   Fake-Backend validiert, ohne den echten Browser/Desktop anzufassen — würde Tippfehler in Python-
   Ausdrücken oder fehlende Variablen schon beim Speichern statt erst beim echten Lauf auffangen.

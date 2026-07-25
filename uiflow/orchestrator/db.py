@@ -177,6 +177,20 @@ CREATE TABLE IF NOT EXISTS notification_settings (
     credential_name TEXT,
     updated_at TEXT
 );
+
+-- One row per prior save of a workflow (see studio/app.py's save_workflow,
+-- which archives the file's *current* content here before overwriting it -
+-- the live YAML file in workflows/ is always the newest version, so it is
+-- never duplicated into this table). `saved_by` is the acting session's
+-- username, NULL outside multi-user mode - same convention as audit_log.
+CREATE TABLE IF NOT EXISTS workflow_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workflow_name TEXT NOT NULL,
+    content_yaml TEXT NOT NULL,
+    saved_at TEXT NOT NULL,
+    saved_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_versions_name ON workflow_versions(workflow_name, id);
 """
 
 
@@ -882,3 +896,54 @@ def notify_job_failed(job_id: str, job_name: str, error_message: str | None) -> 
         import logging
 
         logging.getLogger("uiflow").warning("Fehlerbenachrichtigung konnte nicht gesendet werden", exc_info=True)
+
+
+# --- workflow version history -------------------------------------------------
+
+# Caps growth for a workflow that gets saved very often (e.g. scripted) -
+# older versions beyond this are pruned on each new save. A version is a full
+# YAML text snapshot, typically a few KB, so even 50 of them per workflow is
+# not a meaningful amount of storage.
+_MAX_VERSIONS_PER_WORKFLOW = 50
+
+
+def add_workflow_version(workflow_name: str, content_yaml: str, saved_by: str | None) -> int:
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO workflow_versions (workflow_name, content_yaml, saved_at, saved_by) VALUES (?, ?, ?, ?)",
+            (workflow_name, content_yaml, _now(), saved_by),
+        )
+        version_id = cur.lastrowid
+        conn.execute(
+            "DELETE FROM workflow_versions WHERE workflow_name=? AND id NOT IN "
+            "(SELECT id FROM workflow_versions WHERE workflow_name=? ORDER BY id DESC LIMIT ?)",
+            (workflow_name, workflow_name, _MAX_VERSIONS_PER_WORKFLOW),
+        )
+        return version_id
+
+
+def list_workflow_versions(workflow_name: str) -> list[dict[str, Any]]:
+    """Newest first, without `content_yaml` - kept light for a list view, the
+    same way list_jobs() drops each job's workflow_json. Fetch a single
+    version (get_workflow_version) to see its content."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, workflow_name, saved_at, saved_by FROM workflow_versions "
+            "WHERE workflow_name=? ORDER BY id DESC",
+            (workflow_name,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_workflow_version(version_id: int) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM workflow_versions WHERE id=?", (version_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def delete_workflow_versions(workflow_name: str) -> None:
+    """Called when the workflow itself is deleted (see studio/app.py's
+    delete_workflow) - its history is meaningless once there is no longer a
+    live file a restore could write back to."""
+    with connect() as conn:
+        conn.execute("DELETE FROM workflow_versions WHERE workflow_name=?", (workflow_name,))

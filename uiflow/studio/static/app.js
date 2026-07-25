@@ -35,6 +35,7 @@ const ICONS = {
   trash: icon('<path d="M4 7h16"/><path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/><path d="M6 7l1 13a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-13"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>'),
   document: icon('<path d="M7 3h7l4 4v14a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M14 3v4h4"/>'),
   check: icon('<polyline points="5 13 9 17 19 7"/>'),
+  history: icon('<circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 16 14"/>'),
 };
 
 // --- toasts + confirm modal: replace native alert()/confirm(), which break out
@@ -2394,6 +2395,95 @@ function closeFlowchartOverlay() {
   el("flowchart-overlay").classList.add("hidden");
 }
 
+// --- workflow version history -----------------------------------------------
+
+let versionsOverlayWorkflow = null;
+
+async function openVersionsOverlay(name) {
+  versionsOverlayWorkflow = name;
+  el("versions-title").textContent = `Verlauf: ${name}`;
+  el("versions-overlay").classList.remove("hidden");
+  await renderVersionsList();
+}
+
+function closeVersionsOverlay() {
+  el("versions-overlay").classList.add("hidden");
+  versionsOverlayWorkflow = null;
+}
+
+async function renderVersionsList() {
+  const name = versionsOverlayWorkflow;
+  const container = el("versions-list");
+  container.innerHTML = "Lädt...";
+  const versions = await (await fetch(`/api/workflows/${encodeURIComponent(name)}/versions`)).json();
+  if (versions.length === 0) {
+    container.innerHTML = '<p style="color:var(--muted)">Noch keine früheren Versionen — erst ab dem zweiten "Speichern" gibt es etwas zu archivieren.</p>';
+    return;
+  }
+  container.innerHTML = "";
+  for (const version of versions) {
+    const row = document.createElement("div");
+
+    const head = document.createElement("div");
+    head.className = "list-row";
+
+    const info = document.createElement("div");
+    info.style.flex = "1";
+    info.style.minWidth = "0";
+    const label = document.createElement("div");
+    label.className = "list-row-name";
+    label.textContent = new Date(version.saved_at).toLocaleString();
+    const meta = document.createElement("div");
+    meta.className = "list-row-meta";
+    meta.textContent = version.saved_by || "unbekannt";
+    info.append(label, meta);
+
+    const viewBtn = document.createElement("button");
+    viewBtn.className = "btn-icon";
+    viewBtn.innerHTML = ICONS.document;
+    viewBtn.title = "Inhalt anzeigen";
+    viewBtn.setAttribute("aria-label", "Inhalt dieser Version anzeigen");
+
+    const restoreBtn = document.createElement("button");
+    restoreBtn.className = "btn";
+    restoreBtn.textContent = "Wiederherstellen";
+    restoreBtn.addEventListener("click", async () => {
+      if (!(await confirmDialog(`Diesen Stand von "${name}" wiederherstellen? Der aktuelle Stand wird dabei selbst archiviert.`, "Wiederherstellen"))) return;
+      const res = await fetch(`/api/workflows/${encodeURIComponent(name)}/versions/${version.id}/restore`, {
+        method: "POST",
+      });
+      if (!res.ok) {
+        toast("Wiederherstellen fehlgeschlagen.", "error");
+        return;
+      }
+      toast(`"${name}" wiederhergestellt.`, "success");
+      await renderVersionsList();
+      if (el("wf-load").value === name) await loadWorkflow(name);
+    });
+
+    head.append(info, viewBtn, restoreBtn);
+
+    const preview = document.createElement("pre");
+    preview.className = "version-preview hidden";
+    viewBtn.addEventListener("click", async () => {
+      if (!preview.classList.contains("hidden")) {
+        preview.classList.add("hidden");
+        return;
+      }
+      if (!preview.textContent) {
+        const detail = await (
+          await fetch(`/api/workflows/${encodeURIComponent(name)}/versions/${version.id}`)
+        ).json();
+        preview.textContent = detail.content_yaml;
+      }
+      preview.classList.remove("hidden");
+    });
+
+    row.append(head, preview);
+    container.appendChild(row);
+  }
+}
+
 async function addCredential() {
   const name = el("credential-name").value.trim();
   const value = el("credential-value").value;
@@ -2657,6 +2747,13 @@ async function renderWorkflowsPanel() {
     duplicateBtn.setAttribute("aria-label", `Workflow "${name}" duplizieren`);
     duplicateBtn.addEventListener("click", () => startInlineRename(row, name, "duplicate"));
 
+    const historyBtn = document.createElement("button");
+    historyBtn.className = "btn-icon";
+    historyBtn.innerHTML = ICONS.history;
+    historyBtn.title = "Verlauf (frühere Versionen)";
+    historyBtn.setAttribute("aria-label", `Verlauf von Workflow "${name}"`);
+    historyBtn.addEventListener("click", () => openVersionsOverlay(name));
+
     const delBtn = document.createElement("button");
     delBtn.className = "btn-icon danger";
     delBtn.innerHTML = ICONS.trash;
@@ -2670,7 +2767,7 @@ async function renderWorkflowsPanel() {
       toast(`Workflow "${name}" gelöscht.`, "success");
     });
 
-    row.append(label, openBtn, renameBtn, duplicateBtn, delBtn);
+    row.append(label, openBtn, renameBtn, duplicateBtn, historyBtn, delBtn);
     container.appendChild(row);
   }
 }
@@ -2857,6 +2954,10 @@ function init() {
   el("btn-close-flowchart").addEventListener("click", closeFlowchartOverlay);
   el("flowchart-overlay").addEventListener("click", (e) => {
     if (e.target === el("flowchart-overlay")) closeFlowchartOverlay();
+  });
+  el("btn-close-versions").addEventListener("click", closeVersionsOverlay);
+  el("versions-overlay").addEventListener("click", (e) => {
+    if (e.target === el("versions-overlay")) closeVersionsOverlay();
   });
   el("btn-logout").addEventListener("click", async () => {
     await fetch("/logout", { method: "POST" });

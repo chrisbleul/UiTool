@@ -373,6 +373,23 @@
   </div>
 </div>
 
+<div id="versions-overlay" class="modal-overlay hidden">
+  <div class="modal-box modal-box-wide" role="dialog" aria-modal="true" aria-labelledby="versions-title">
+    <div class="modal-head">
+      <h2 id="versions-title">Verlauf</h2>
+      <button id="btn-close-versions" class="btn-icon" aria-label="Schließen">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="5" y1="5" x2="19" y2="19"/><line x1="19" y1="5" x2="5" y2="19"/></svg>
+      </button>
+    </div>
+    <p class="panel-hint">
+      Frühere Stände dieses Workflows, jeweils vor dem nächsten Speichern archiviert (die letzten 50).
+      "Wiederherstellen" überschreibt den aktuellen Stand — der wird dabei selbst als neue Version
+      archiviert, geht also nicht verloren.
+    </p>
+    <div id="versions-list" class="queues-list"></div>
+  </div>
+</div>
+
 <script src="/static/vendor/sortable.min.js"></script>
 <script src="/static/app.js"></script>
 </body>

@@ -1097,3 +1097,58 @@ def test_delete_user_removes_it():
 
     assert db.get_user("alice") is None
     assert db.any_users_exist() is False
+
+
+# --- workflow version history -------------------------------------------------
+
+
+def test_add_and_list_workflow_versions():
+    db.add_workflow_version("report", "steps: []", "alice")
+
+    [version] = db.list_workflow_versions("report")
+    assert version["saved_by"] == "alice"
+    assert version["workflow_name"] == "report"
+
+
+def test_get_workflow_version_includes_content():
+    version_id = db.add_workflow_version("report", "steps: [x]", None)
+
+    version = db.get_workflow_version(version_id)
+
+    assert version["content_yaml"] == "steps: [x]"
+
+
+def test_get_workflow_version_returns_none_for_an_unknown_id():
+    assert db.get_workflow_version(9999) is None
+
+
+def test_list_workflow_versions_is_newest_first_and_scoped_to_its_workflow():
+    db.add_workflow_version("a", "v1", None)
+    db.add_workflow_version("b", "other workflow", None)
+    db.add_workflow_version("a", "v2", None)
+
+    versions = db.list_workflow_versions("a")
+
+    assert [db.get_workflow_version(v["id"])["content_yaml"] for v in versions] == ["v2", "v1"]
+
+
+def test_versions_beyond_the_cap_are_pruned(monkeypatch):
+    monkeypatch.setattr(db, "_MAX_VERSIONS_PER_WORKFLOW", 3)
+    for i in range(5):
+        db.add_workflow_version("report", f"v{i}", None)
+
+    versions = db.list_workflow_versions("report")
+
+    assert len(versions) == 3
+    contents = [db.get_workflow_version(v["id"])["content_yaml"] for v in versions]
+    assert contents == ["v4", "v3", "v2"]  # the two oldest were pruned
+
+
+def test_delete_workflow_versions_removes_only_that_workflows_history():
+    db.add_workflow_version("a", "v1", None)
+    db.add_workflow_version("b", "v1", None)
+
+    db.delete_workflow_versions("a")
+
+    assert db.list_workflow_versions("a") == []
+    assert len(db.list_workflow_versions("b")) == 1

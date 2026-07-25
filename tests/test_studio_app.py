@@ -609,6 +609,84 @@ def test_overwrite_false_still_creates_a_workflow_that_does_not_exist(client):
     assert client.get("/api/workflows/fresh").status_code == 200
 
 
+def test_first_save_of_a_new_workflow_creates_no_version(client):
+    client.post("/api/workflows/report", json=_workflow("report", "https://original"))
+
+    assert client.get("/api/workflows/report/versions").get_json() == []
+
+
+def test_overwriting_a_workflow_archives_the_previous_content_as_a_version(client):
+    client.post("/api/workflows/report", json=_workflow("report", "https://original"))
+    client.post("/api/workflows/report", json=_workflow("report", "https://updated"))
+
+    versions = client.get("/api/workflows/report/versions").get_json()
+    assert len(versions) == 1
+    version = client.get(f"/api/workflows/report/versions/{versions[0]['id']}").get_json()
+    assert "https://original" in version["content_yaml"]
+    # the live file is the new content, not duplicated into the version list
+    assert client.get("/api/workflows/report").get_json()["steps"][0]["url"] == "https://updated"
+
+
+def test_multiple_saves_produce_newest_first_version_history(client):
+    client.post("/api/workflows/report", json=_workflow("report", "https://v1"))
+    client.post("/api/workflows/report", json=_workflow("report", "https://v2"))
+    client.post("/api/workflows/report", json=_workflow("report", "https://v3"))
+
+    versions = client.get("/api/workflows/report/versions").get_json()
+    assert len(versions) == 2  # v1 and v2 were archived, v3 is the live file
+    contents = [client.get(f"/api/workflows/report/versions/{v['id']}").get_json()["content_yaml"] for v in versions]
+    assert "https://v2" in contents[0]  # newest archived version first
+    assert "https://v1" in contents[1]
+
+
+def test_restoring_a_version_writes_it_back_and_archives_the_pre_restore_state(client):
+    client.post("/api/workflows/report", json=_workflow("report", "https://v1"))
+    client.post("/api/workflows/report", json=_workflow("report", "https://v2"))
+    [only_version] = client.get("/api/workflows/report/versions").get_json()
+
+    res = client.post(f"/api/workflows/report/versions/{only_version['id']}/restore")
+
+    assert res.status_code == 200
+    assert client.get("/api/workflows/report").get_json()["steps"][0]["url"] == "https://v1"
+    # the state right before the restore (v2) must not be lost either
+    versions = client.get("/api/workflows/report/versions").get_json()
+    assert len(versions) == 2
+    contents = [client.get(f"/api/workflows/report/versions/{v['id']}").get_json()["content_yaml"] for v in versions]
+    assert any("https://v2" in c for c in contents)
+
+
+def test_restore_endpoint_rejects_a_version_belonging_to_a_different_workflow(client):
+    client.post("/api/workflows/report", json=_workflow("report", "https://v1"))
+    client.post("/api/workflows/report", json=_workflow("report", "https://v2"))
+    [version] = client.get("/api/workflows/report/versions").get_json()
+    client.post("/api/workflows/other", json=_workflow("other", "https://x"))
+
+    res = client.post(f"/api/workflows/other/versions/{version['id']}/restore")
+
+    assert res.status_code == 404
+
+
+def test_deleting_a_workflow_also_deletes_its_version_history(client):
+    client.post("/api/workflows/report", json=_workflow("report", "https://v1"))
+    client.post("/api/workflows/report", json=_workflow("report", "https://v2"))
+
+    client.delete("/api/workflows/report")
+
+    # the file is gone, so a version list for it must not error - it's just empty
+    assert client.get("/api/workflows/report/versions").get_json() == []
+
+
+def test_workflow_version_records_the_acting_username(multiuser_app):
+    admin = multiuser_app.test_client()
+    _login(admin, "admin1", "adminpass")
+    admin.post("/api/workflows/report", json=_workflow("report", "https://v1"))
+    admin.post("/api/workflows/report", json=_workflow("report", "https://v2"))
+
+    [version] = admin.get("/api/workflows/report/versions").get_json()
+
+    assert version["saved_by"] == "admin1"
+
+
 class _FakeKeyring:
     def __init__(self):
         self.store = {}

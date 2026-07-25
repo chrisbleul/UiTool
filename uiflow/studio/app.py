@@ -217,6 +217,11 @@ def create_app() -> Flask:
         # so those callers pass ?overwrite=false and handle the 409.
         if request.args.get("overwrite", "true").lower() in ("false", "0") and path.exists():
             return jsonify({"error": f"Workflow '{path.stem}' existiert bereits"}), 409
+        if path.exists():
+            # Archives what the file *was*, not what it becomes - the file
+            # itself is always the newest version, so it's never duplicated
+            # into workflow_versions (see db.add_workflow_version).
+            db.add_workflow_version(path.stem, path.read_text(encoding="utf-8"), session.get("username"))
         workflow.save(path)
         return jsonify({"saved": path.name})
 
@@ -226,7 +231,32 @@ def create_app() -> Flask:
         if not path.exists():
             return jsonify({"error": "not found"}), 404
         path.unlink()
+        db.delete_workflow_versions(path.stem)
         return jsonify({"deleted": name})
+
+    @app.get("/api/workflows/<name>/versions")
+    def list_workflow_versions_route(name: str) -> Response:
+        return jsonify(db.list_workflow_versions(_safe_workflow_path(name).stem))
+
+    @app.get("/api/workflows/<name>/versions/<int:version_id>")
+    def get_workflow_version_route(name: str, version_id: int) -> Response:
+        version = db.get_workflow_version(version_id)
+        if version is None or version["workflow_name"] != _safe_workflow_path(name).stem:
+            return jsonify({"error": "not found"}), 404
+        return jsonify(version)
+
+    @app.post("/api/workflows/<name>/versions/<int:version_id>/restore")
+    def restore_workflow_version_route(name: str, version_id: int) -> Response:
+        version = db.get_workflow_version(version_id)
+        if version is None or version["workflow_name"] != _safe_workflow_path(name).stem:
+            return jsonify({"error": "not found"}), 404
+        path = _safe_workflow_path(name)
+        if path.exists():
+            # Restoring is itself just another save - the state right before
+            # the restore must stay recoverable too, not get silently lost.
+            db.add_workflow_version(path.stem, path.read_text(encoding="utf-8"), session.get("username"))
+        path.write_text(version["content_yaml"], encoding="utf-8")
+        return jsonify({"restored": version_id})
 
     @app.post("/api/run")
     def run_workflow() -> Response:
