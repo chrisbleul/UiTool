@@ -4,8 +4,11 @@ A job is either a one-shot workflow run, or - if it names a queue
 (`queue_name`) - a "process transaction" loop: pull one item at a time from
 that queue, run the workflow with that item's payload seeded into the engine's
 variables (so `{item.<field>}` placeholders resolve - see engine.py's
-substitute_variables), and mark the item success/failed (with retry) before
-moving on to the next one, until the queue is empty or a stop is requested.
+substitute_variables), and mark the item success/failed (retrying after a
+backoff, see db.retry_delay_seconds) before moving on to the next one, until
+the queue is empty or a stop is requested. A queue-driven job deliberately
+keeps going past a failing item, but its final status still reflects them: it
+only reports success if every item it touched ended up succeeding.
 
 Threading note: this module intentionally does NOT run anything on a pynput
 hook thread (that lesson - keep hook callbacks trivial, never let a second
@@ -66,15 +69,15 @@ def _run_workflow_once(job_id: str, workflow: Workflow, variables: dict[str, Any
     # they left it, instead of yanking it away right as they start inspecting.
     reached_breakpoint = False
 
-    def on_breakpoint(index: int, step, variables: dict[str, Any]) -> None:
+    def on_breakpoint(index: int, step, variables: dict[str, Any], path: str) -> None:
         nonlocal reached_breakpoint
         reached_breakpoint = True
-        db.set_paused(job_id, index, step.action, variables)
+        db.set_paused(job_id, index, step.action, variables, path)
         while not db.wait_and_clear_resume(job_id):
             if db.is_stop_requested(job_id):
                 break
             time.sleep(0.3)
-        db.set_paused(job_id, None, None)
+        db.set_paused(job_id, None, None, path=None)
 
     backend = _make_backend(workflow)
     try:
@@ -108,13 +111,20 @@ def _run_job(job: dict[str, Any]) -> None:
     queue_name = job["queue_name"]
 
     try:
+        failed = 0
+        processed = 0
         if queue_name:
-            _run_queue_driven(job_id, workflow_dict, queue_name)
+            processed, failed = _run_queue_driven(job_id, workflow_dict, queue_name)
         else:
             logger.info("Running job '%s'", job["name"])
             _run_workflow_once(job_id, Workflow.from_raw(workflow_dict))
         if db.is_stop_requested(job_id):
             db.finish_job(job_id, "cancelled")
+        elif failed:
+            # A queue-driven job keeps going past a failing item on purpose, but
+            # it must not then report "success" - the job is only successful if
+            # every item it processed ended up succeeding.
+            db.finish_job(job_id, "error", f"{failed} of {processed} queue item(s) failed permanently")
         else:
             db.finish_job(job_id, "success")
     except WorkflowCancelled:
@@ -129,30 +139,68 @@ def _run_job(job: dict[str, Any]) -> None:
         logger.removeHandler(handler)
 
 
-def _run_queue_driven(job_id: str, workflow_dict: dict[str, Any], queue_name: str) -> None:
+def _sleep_unless_stopped(job_id: str, seconds: float, tick: float = 0.5) -> bool:
+    """Sleeps up to `seconds`, in small slices so a stop request is still picked
+    up promptly. Returns False if a stop was requested while waiting."""
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True
+        if db.is_stop_requested(job_id):
+            return False
+        time.sleep(min(tick, remaining))
+
+
+def _run_queue_driven(job_id: str, workflow_dict: dict[str, Any], queue_name: str) -> tuple[int, int]:
+    """Processes the queue until it's exhausted (or stopped), returning
+    (processed, permanently_failed) so the caller can set the job's status from
+    what actually happened to the items. Both counts are per *item*, not per
+    attempt - a retried item is still one item."""
     queue = db.get_queue_by_name(queue_name)
     if queue is None:
         raise RuntimeError(f"Queue '{queue_name}' does not exist")
 
-    processed = 0
+    attempted: set[int] = set()
+    failed = 0
     while True:
         if db.is_stop_requested(job_id):
-            logger.info("Job stopped; processed %d item(s)", processed)
-            return
+            logger.info("Job stopped; processed %d item(s)", len(attempted))
+            return len(attempted), failed
         item = db.claim_next_queue_item(queue["id"], job_id)
         if item is None:
-            logger.info("Queue '%s' empty; processed %d item(s)", queue_name, processed)
-            return
+            # Nothing claimable *right now* isn't the same as an empty queue:
+            # items awaiting their retry backoff are still ours to process, so
+            # wait them out rather than ending the job with work outstanding.
+            wait_seconds = db.seconds_until_next_retry(queue["id"])
+            if wait_seconds is None:
+                logger.info("Queue '%s' empty; processed %d item(s)", queue_name, len(attempted))
+                return len(attempted), failed
+            logger.info("Queue '%s': waiting %.0fs for the next retry", queue_name, wait_seconds)
+            if not _sleep_unless_stopped(job_id, wait_seconds):
+                logger.info("Job stopped; processed %d item(s)", len(attempted))
+                return len(attempted), failed
+            continue
 
         payload = json.loads(item["payload"])
+        attempted.add(item["id"])
         logger.info("[item %d] %s", item["id"], payload)
         try:
             _run_workflow_once(job_id, Workflow.from_raw(workflow_dict), variables={"item": payload})
             db.complete_queue_item(item["id"], True, output={})
+        except WorkflowCancelled:
+            # A user-requested stop says nothing about the item - hand it back
+            # untouched (no retry consumed) so the next run picks it up again.
+            db.release_queue_item(item["id"])
+            logger.info("[item %d] released after stop request", item["id"])
+            return len(attempted), failed
         except Exception as exc:  # noqa: BLE001 - one bad item must not abort the whole queue
-            logger.error("[item %d] failed: %s", item["id"], exc)
-            db.complete_queue_item(item["id"], False, error_message=str(exc))
-        processed += 1
+            status = db.complete_queue_item(item["id"], False, error_message=str(exc))
+            if status == "failed":
+                failed += 1
+                logger.error("[item %d] failed permanently: %s", item["id"], exc)
+            else:
+                logger.warning("[item %d] failed, queued for retry: %s", item["id"], exc)
 
 
 def run_worker_loop(worker_id: str | None = None, poll_interval: float = 1.0, stop_event=None) -> None:

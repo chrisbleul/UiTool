@@ -107,6 +107,12 @@ def create_app() -> Flask:
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         path = _safe_workflow_path(name)
+        # Saving the workflow you have open is meant to overwrite, so that stays
+        # the default. Writing under a *different* name (rename, duplicate, "save
+        # as") is not - it would destroy an unrelated workflow with no warning -
+        # so those callers pass ?overwrite=false and handle the 409.
+        if request.args.get("overwrite", "true").lower() in ("false", "0") and path.exists():
+            return jsonify({"error": f"Workflow '{path.stem}' existiert bereits"}), 409
         workflow.save(path)
         return jsonify({"saved": path.name})
 
@@ -162,6 +168,7 @@ def create_app() -> Flask:
                     payload = {
                         "index": controls["paused_step_index"],
                         "action": controls["paused_step_action"],
+                        "path": controls["paused_step_path"],
                         "variables": variables,
                     }
                     yield f"event: paused\ndata: {json.dumps(payload)}\n\n"

@@ -9,7 +9,8 @@ from .models import Step, Workflow
 
 logger = logging.getLogger("uiflow")
 
-OnBreakpoint = Callable[[int, Step, "dict[str, Any]"], None]
+# (executed-step number, step, variables snapshot, structural step path)
+OnBreakpoint = Callable[[int, Step, "dict[str, Any]", str], None]
 ShouldStop = Callable[[], bool]
 
 # {item.field} reads from the current queue item's payload (variables["item"]);
@@ -86,14 +87,19 @@ class WorkflowEngine:
     execution order - branches that aren't taken never consume a number, so
     there's no meaningful upfront "total steps" to log (unlike the old flat-only
     engine), only a running count.
+
+    Because that counter depends on which branches actually ran, it can't
+    identify a step in the Studio's statically rendered canvas - so breakpoints
+    additionally report a `path`, the step's structural address in the workflow
+    definition (see _run_steps).
     """
 
     def __init__(self, backend: object):
         self.backend = backend
         self.variables: dict[str, Any] = {}
-        # Values pulled in via `get_credential`, tracked so step-parameter
-        # logging (see _redact) can mask them instead of writing secrets to
-        # the job log / console in plain text.
+        # Values pulled in via `get_credential`, tracked so step logging
+        # (see _log/_redact_secrets) can mask them instead of writing secrets
+        # to the job log / console in plain text.
         self._secrets: set[str] = set()
 
     def run(
@@ -111,31 +117,40 @@ class WorkflowEngine:
         logger.info("Workflow '%s' completed successfully", workflow.name)
 
     def _run_steps(
-        self, steps: list[Step], on_breakpoint: Optional[OnBreakpoint], should_stop: Optional[ShouldStop]
+        self,
+        steps: list[Step],
+        on_breakpoint: Optional[OnBreakpoint],
+        should_stop: Optional[ShouldStop],
+        prefix: str = "",
     ) -> None:
-        for step in steps:
+        for position, step in enumerate(steps):
             if should_stop is not None and should_stop():
                 index = self._counter + 1
                 logger.info("Workflow abgebrochen vor Schritt %d", index)
                 raise WorkflowCancelled(index)
             self._counter += 1
             index = self._counter
+            # Where this step *sits* in the workflow definition ("3.then.0"),
+            # as opposed to `index`, which is how many steps have *run*. Only
+            # the path can be matched back to a card in the Studio canvas,
+            # which is rendered from the definition, not from the run.
+            path = f"{prefix}.{position}" if prefix else str(position)
 
             if step.breakpoint and on_breakpoint is not None:
-                logger.info("[%d] Haltepunkt bei '%s'", index, step.action)
-                on_breakpoint(index, step, self._redact_secrets(dict(self.variables)))
+                self._log("[%d] Haltepunkt bei '%s'", index, step.action)
+                on_breakpoint(index, step, self._redact_secrets(dict(self.variables)), path)
                 if should_stop is not None and should_stop():
                     logger.info("Workflow abgebrochen vor Schritt %d", index)
                     raise WorkflowCancelled(index)
 
             if step.action == "if":
-                self._run_if(step, index, on_breakpoint, should_stop)
+                self._run_if(step, index, path, on_breakpoint, should_stop)
             elif step.action == "switch":
-                self._run_switch(step, index, on_breakpoint, should_stop)
+                self._run_switch(step, index, path, on_breakpoint, should_stop)
             elif step.action == "for_each":
-                self._run_for_each(step, index, on_breakpoint, should_stop)
+                self._run_for_each(step, index, path, on_breakpoint, should_stop)
             elif step.action == "try":
-                self._run_try(step, index, on_breakpoint, should_stop)
+                self._run_try(step, index, path, on_breakpoint, should_stop)
             elif step.action == "assign":
                 self._run_assign(step, index)
             elif step.action == "increment":
@@ -166,19 +181,29 @@ class WorkflowEngine:
         return [Step.from_dict(dict(item)) for item in raw]
 
     def _run_if(
-        self, step: Step, index: int, on_breakpoint: Optional[OnBreakpoint], should_stop: Optional[ShouldStop]
+        self,
+        step: Step,
+        index: int,
+        path: str,
+        on_breakpoint: Optional[OnBreakpoint],
+        should_stop: Optional[ShouldStop],
     ) -> None:
         condition = step.params.get("condition", "False")
         try:
             result = bool(safe_eval(condition, self.variables))
         except ValueError as exc:
             raise StepError(index, step, exc) from exc
-        logger.info("[%d] if %s -> %s", index, condition, result)
-        branch = step.params.get("then") if result else step.params.get("else")
-        self._run_steps(self._sub_steps(branch), on_breakpoint, should_stop)
+        self._log("[%d] if %s -> %s", index, condition, result)
+        field = "then" if result else "else"
+        self._run_steps(self._sub_steps(step.params.get(field)), on_breakpoint, should_stop, f"{path}.{field}")
 
     def _run_switch(
-        self, step: Step, index: int, on_breakpoint: Optional[OnBreakpoint], should_stop: Optional[ShouldStop]
+        self,
+        step: Step,
+        index: int,
+        path: str,
+        on_breakpoint: Optional[OnBreakpoint],
+        should_stop: Optional[ShouldStop],
     ) -> None:
         expression = step.params.get("expression", "")
         try:
@@ -186,14 +211,22 @@ class WorkflowEngine:
         except ValueError as exc:
             raise StepError(index, step, exc) from exc
         cases = step.params.get("cases") or {}
-        branch = cases.get(str(value))
+        key = str(value)
+        branch = cases.get(key)
+        prefix = f"{path}.cases.{key}"
         if branch is None:
             branch = step.params.get("default")
-        logger.info("[%d] switch %s == %r", index, expression, value)
-        self._run_steps(self._sub_steps(branch), on_breakpoint, should_stop)
+            prefix = f"{path}.default"
+        self._log("[%d] switch %s == %r", index, expression, value)
+        self._run_steps(self._sub_steps(branch), on_breakpoint, should_stop, prefix)
 
     def _run_for_each(
-        self, step: Step, index: int, on_breakpoint: Optional[OnBreakpoint], should_stop: Optional[ShouldStop]
+        self,
+        step: Step,
+        index: int,
+        path: str,
+        on_breakpoint: Optional[OnBreakpoint],
+        should_stop: Optional[ShouldStop],
     ) -> None:
         items_expr = step.params.get("items", "[]")
         try:
@@ -208,30 +241,35 @@ class WorkflowEngine:
         item_var = step.params.get("item_var") or "item"
         index_var = step.params.get("index_var")
         body = self._sub_steps(step.params.get("steps"))
-        logger.info("[%d] for_each %s -> %d item(s)", index, items_expr, len(items))
+        self._log("[%d] for_each %s -> %d item(s)", index, items_expr, len(items))
         for i, value in enumerate(items):
             self.variables[item_var] = value
             if index_var:
                 self.variables[index_var] = i
-            self._run_steps(body, on_breakpoint, should_stop)
+            self._run_steps(body, on_breakpoint, should_stop, f"{path}.steps")
 
     def _run_try(
-        self, step: Step, index: int, on_breakpoint: Optional[OnBreakpoint], should_stop: Optional[ShouldStop]
+        self,
+        step: Step,
+        index: int,
+        path: str,
+        on_breakpoint: Optional[OnBreakpoint],
+        should_stop: Optional[ShouldStop],
     ) -> None:
         try_body = self._sub_steps(step.params.get("steps"))
         catch_body = self._sub_steps(step.params.get("catch"))
         error_var = step.params.get("error_var")
-        logger.info("[%d] try", index)
+        self._log("[%d] try", index)
         try:
-            self._run_steps(try_body, on_breakpoint, should_stop)
+            self._run_steps(try_body, on_breakpoint, should_stop, f"{path}.steps")
         except WorkflowCancelled:
             raise  # a user-requested stop must propagate, not be swallowed as a "handled" error
         except (StepError, ValueError) as exc:
             message = str(exc)
-            logger.info("[%d] try: caught error -> %s", index, message)
+            self._log("[%d] try: caught error -> %s", index, message)
             if error_var:
                 self.variables[error_var] = message
-            self._run_steps(catch_body, on_breakpoint, should_stop)
+            self._run_steps(catch_body, on_breakpoint, should_stop, f"{path}.catch")
 
     def _run_assign(self, step: Step, index: int) -> None:
         name = step.params.get("variable")
@@ -244,7 +282,7 @@ class WorkflowEngine:
                 raise StepError(index, step, exc) from exc
         else:
             value = substitute_variables(step.params.get("value", ""), self.variables)
-        logger.info("[%d] assign %s = %r", index, name, value)
+        self._log("[%d] assign %s = %r", index, name, value)
         self.variables[name] = value
 
     def _run_increment(self, step: Step, index: int) -> None:
@@ -257,7 +295,7 @@ class WorkflowEngine:
             raise StepError(index, step, exc) from exc
         if new_value == int(new_value):
             new_value = int(new_value)
-        logger.info("[%d] increment %s -> %s", index, name, new_value)
+        self._log("[%d] increment %s -> %s", index, name, new_value)
         self.variables[name] = new_value
 
     def _run_read_excel(self, step: Step, index: int) -> None:
@@ -271,7 +309,7 @@ class WorkflowEngine:
             rows = read_excel_rows(path, sheet=step.params.get("sheet"))
         except Exception as exc:  # noqa: BLE001 - wrap any openpyxl/file error with step context
             raise StepError(index, step, exc) from exc
-        logger.info("[%d] read_excel '%s' -> %d row(s) into '%s'", index, path, len(rows), save_as)
+        self._log("[%d] read_excel '%s' -> %d row(s) into '%s'", index, path, len(rows), save_as)
         self.variables[save_as] = rows
 
     def _run_write_excel(self, step: Step, index: int) -> None:
@@ -289,7 +327,7 @@ class WorkflowEngine:
             count = write_excel_rows(path, list(rows), sheet=step.params.get("sheet"))
         except Exception as exc:  # noqa: BLE001 - wrap any openpyxl/file error with step context
             raise StepError(index, step, exc) from exc
-        logger.info("[%d] write_excel '%s' -> %d row(s)", index, path, count)
+        self._log("[%d] write_excel '%s' -> %d row(s)", index, path, count)
         if step.save_as:
             self.variables[step.save_as] = count
 
@@ -312,7 +350,7 @@ class WorkflowEngine:
             )
         except Exception as exc:  # noqa: BLE001 - wrap any network/requests error with step context
             raise StepError(index, step, exc) from exc
-        logger.info("[%d] http_request %s %s -> %s", index, resolved.get("method", "GET"), url, result["status_code"])
+        self._log("[%d] http_request %s %s -> %s", index, resolved.get("method", "GET"), url, result["status_code"])
         if step.save_as:
             self.variables[step.save_as] = result
 
@@ -329,7 +367,7 @@ class WorkflowEngine:
         # Deliberately never logs `value` - see _redact_secrets, which uses this set to
         # mask later step-parameter logging (e.g. if the credential is used in a `type` step).
         self._secrets.add(value)
-        logger.info("[%d] get_credential '%s' -> stored in '%s'", index, name, step.save_as)
+        self._log("[%d] get_credential '%s' -> stored in '%s'", index, name, step.save_as)
         self.variables[step.save_as] = value
 
     def _run_send_email(self, step: Step, index: int) -> None:
@@ -350,7 +388,7 @@ class WorkflowEngine:
             )
         except Exception as exc:  # noqa: BLE001 - wrap any smtplib error with step context
             raise StepError(index, step, exc) from exc
-        logger.info("[%d] send_email -> %s", index, resolved.get("to"))
+        self._log("[%d] send_email -> %s", index, resolved.get("to"))
         if step.save_as:
             self.variables[step.save_as] = {"sent": True}
 
@@ -369,10 +407,11 @@ class WorkflowEngine:
                 limit=int(resolved.get("limit", 10)),
                 unseen_only=bool(resolved.get("unseen_only", True)),
                 use_ssl=bool(resolved.get("use_ssl", True)),
+                mark_as_read=bool(resolved.get("mark_as_read", False)),
             )
         except Exception as exc:  # noqa: BLE001 - wrap any imaplib error with step context
             raise StepError(index, step, exc) from exc
-        logger.info("[%d] read_emails -> %d message(s) into '%s'", index, len(messages), step.save_as)
+        self._log("[%d] read_emails -> %d message(s) into '%s'", index, len(messages), step.save_as)
         self.variables[step.save_as] = messages
 
     def _run_read_pdf(self, step: Step, index: int) -> None:
@@ -385,7 +424,7 @@ class WorkflowEngine:
             text = read_pdf_text(path, pages=step.params.get("pages"))
         except Exception as exc:  # noqa: BLE001 - wrap any pypdf/file error with step context
             raise StepError(index, step, exc) from exc
-        logger.info("[%d] read_pdf '%s' -> %d char(s) into '%s'", index, path, len(text), step.save_as)
+        self._log("[%d] read_pdf '%s' -> %d char(s) into '%s'", index, path, len(text), step.save_as)
         self.variables[step.save_as] = text
 
     def _run_ocr_image(self, step: Step, index: int) -> None:
@@ -398,8 +437,16 @@ class WorkflowEngine:
             text = ocr_image_text(path, lang=step.params.get("lang", "eng"))
         except Exception as exc:  # noqa: BLE001 - wrap any pytesseract/Tesseract-binary error with step context
             raise StepError(index, step, exc) from exc
-        logger.info("[%d] ocr_image '%s' -> %d char(s) into '%s'", index, path, len(text), step.save_as)
+        self._log("[%d] ocr_image '%s' -> %d char(s) into '%s'", index, path, len(text), step.save_as)
         self.variables[step.save_as] = text
+
+    def _log(self, message: str, *args: Any) -> None:
+        """Logs a step line with every interpolated argument run through
+        _redact_secrets first. Step runners log *values* (an assigned variable,
+        a switch subject, a resolved URL), any of which can carry a credential
+        that get_credential pulled in - so redaction belongs here, once, rather
+        than being remembered at each individual call site."""
+        logger.info(message, *(self._redact_secrets(arg) for arg in args))
 
     def _redact_secrets(self, value: Any) -> Any:
         """Masks any credential value pulled in via get_credential before it's
@@ -422,7 +469,7 @@ class WorkflowEngine:
         if not callable(handler):
             raise StepError(index, step, AttributeError(f"Backend has no action '{step.action}'"))
         resolved_params = substitute_variables(step.params, self.variables)
-        logger.info("[%d] %s(%s)", index, step.action, self._redact_secrets(resolved_params))
+        self._log("[%d] %s(%s)", index, step.action, resolved_params)
         try:
             result = handler(**resolved_params)
         except Exception as exc:  # noqa: BLE001 - wrap any backend failure with step context

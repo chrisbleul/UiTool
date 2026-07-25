@@ -90,6 +90,7 @@ _CONTROL_FLOW_AND_VARIABLES: dict[str, list[dict]] = {
         {"name": "limit", "label": "Max. Anzahl", "type": "number", "required": False},
         {"name": "unseen_only", "label": "Nur ungelesene", "type": "checkbox", "required": False},
         {"name": "use_ssl", "label": "SSL verwenden", "type": "checkbox", "required": False},
+        {"name": "mark_as_read", "label": "Gelesene Mails als gelesen markieren", "type": "checkbox", "required": False},
     ],
     "read_pdf": [
         {"name": "path", "label": "Datei-Pfad (.pdf)", "type": "text", "required": True},

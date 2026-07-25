@@ -210,7 +210,12 @@ function renderStepCard(step, index, actions, opts) {
   const onChange = opts.onChange || renderSteps;
   const card = document.createElement("div");
   card.className = "step-card" + (opts.isScope ? " scope-card" : "");
-  if (!opts.isNested) card.dataset.stepIndex = index + 1;
+  // Structural address of this card, matching the `path` the engine reports
+  // when it pauses (see engine.py's _run_steps). The engine's step *number*
+  // counts executed steps and so can't address a card inside a branch - only
+  // the path can, which is why the pause highlight keys off this.
+  const stepPath = opts.pathPrefix ? `${opts.pathPrefix}.${index}` : String(index);
+  card.dataset.stepPath = stepPath;
 
   // --- header: (drag handle,) breakpoint toggle, index, action select, move/delete buttons ---
   const head = document.createElement("div");
@@ -356,11 +361,13 @@ function renderStepCard(step, index, actions, opts) {
 
   for (const fieldDef of fieldDefs) {
     if (fieldDef.type === "steps") {
-      fieldsDiv.appendChild(renderNestedStepsField(step, fieldDef.name, fieldDef.label, actions, opts));
+      fieldsDiv.appendChild(
+        renderNestedStepsField(step, fieldDef.name, fieldDef.label, actions, opts, stepPath)
+      );
       continue;
     }
     if (fieldDef.type === "cases") {
-      fieldsDiv.appendChild(renderCasesField(step, fieldDef.name, fieldDef.label, actions, opts));
+      fieldsDiv.appendChild(renderCasesField(step, fieldDef.name, fieldDef.label, actions, opts, stepPath));
       continue;
     }
 
@@ -504,7 +511,7 @@ function renderStepCard(step, index, actions, opts) {
 // array and synced back on every change - see the onFieldMutate chaining
 // comment on renderStepCard for why a sync is needed on every keystroke, not
 // just on structural changes.
-function renderNestedStepsField(parentStep, fieldName, label, actions, opts) {
+function renderNestedStepsField(parentStep, fieldName, label, actions, opts, parentPath) {
   const wrap = document.createElement("div");
   wrap.className = "field-wide nested-steps-wrap";
 
@@ -526,6 +533,7 @@ function renderNestedStepsField(parentStep, fieldName, label, actions, opts) {
   const childOpts = {
     stepsArray: modelBranch,
     isNested: true,
+    pathPrefix: `${parentPath}.${fieldName}`,
     onChange: () => {
       sync();
       renderSteps();
@@ -562,7 +570,7 @@ function renderNestedStepsField(parentStep, fieldName, label, actions, opts) {
 // Same idea as renderNestedStepsField, but for switch's `cases` (a dict of
 // case-value -> step list rather than a single list) - each case gets its own
 // editable key plus a nested step list.
-function renderCasesField(parentStep, fieldName, label, actions, opts) {
+function renderCasesField(parentStep, fieldName, label, actions, opts, parentPath) {
   const wrap = document.createElement("div");
   wrap.className = "field-wide nested-cases-wrap";
 
@@ -626,6 +634,7 @@ function renderCasesField(parentStep, fieldName, label, actions, opts) {
     const childOpts = {
       stepsArray: entry.modelBranch,
       isNested: true,
+      pathPrefix: `${parentPath}.${fieldName}.${entry.key}`,
       onChange: () => {
         sync();
         renderSteps();
@@ -920,13 +929,29 @@ function currentWorkflowPayload() {
   };
 }
 
-async function saveWorkflow() {
-  const payload = currentWorkflowPayload();
-  const res = await fetch(`/api/workflows/${encodeURIComponent(payload.name)}`, {
+function saveWorkflowAs(name, payload, { overwrite }) {
+  return fetch(`/api/workflows/${encodeURIComponent(name)}?overwrite=${overwrite}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
+}
+
+async function saveWorkflow() {
+  const payload = currentWorkflowPayload();
+  // Saving back over the workflow that's open is the normal case and stays
+  // silent; saving under a name that belongs to a *different* workflow (the
+  // name field was edited) would otherwise destroy it without a word.
+  const isSaveOverOpenWorkflow = payload.name === el("wf-load").value;
+  let res = await saveWorkflowAs(payload.name, payload, { overwrite: isSaveOverOpenWorkflow });
+  if (res.status === 409) {
+    const confirmed = await confirmDialog(
+      `Es gibt bereits einen Workflow "${payload.name}". Soll er überschrieben werden?`,
+      "Überschreiben"
+    );
+    if (!confirmed) return;
+    res = await saveWorkflowAs(payload.name, payload, { overwrite: true });
+  }
   if (res.ok) {
     await loadWorkflowList();
     el("wf-load").value = payload.name;
@@ -945,6 +970,19 @@ function appendLog(line) {
 
 function clearPausedHighlight() {
   document.querySelectorAll(".step-card.paused-at").forEach((c) => c.classList.remove("paused-at"));
+}
+
+// Matched in JS rather than via an attribute selector because a path segment
+// can be a user-typed switch case value ("DE", but also `"` or `\`), which
+// would need escaping to be safe to interpolate into a selector string.
+function highlightPausedStep(path) {
+  if (!path) return; // job paused by an older build that didn't report a path
+  for (const card of document.querySelectorAll(".step-card")) {
+    if (card.dataset.stepPath === path) {
+      card.classList.add("paused-at");
+      return;
+    }
+  }
 }
 
 function renderVariablesWatch(variables) {
@@ -1010,14 +1048,13 @@ async function runWorkflow() {
   };
 
   source.addEventListener("paused", (event) => {
-    const { index: stepIndex, action, variables } = JSON.parse(event.data);
+    const { index: stepIndex, action, path, variables } = JSON.parse(event.data);
     appendLog(`>> Haltepunkt bei Schritt ${stepIndex} (${action})`);
     el("log-status").textContent = `Angehalten bei Schritt ${stepIndex}`;
     el("log-status").className = "status-paused";
     el("btn-continue").classList.remove("hidden");
     clearPausedHighlight();
-    const card = document.querySelector(`.step-card[data-step-index="${stepIndex}"]`);
-    if (card) card.classList.add("paused-at");
+    highlightPausedStep(path);
     renderVariablesWatch(variables);
   });
 
@@ -1373,11 +1410,18 @@ function startInlineRename(row, oldName, mode) {
     }
     const data = await (await fetch(`/api/workflows/${encodeURIComponent(oldName)}`)).json();
     data.name = newName;
-    const res = await fetch(`/api/workflows/${encodeURIComponent(newName)}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
-    });
+    // Never clobber a different workflow that happens to carry the target name:
+    // ask the server to refuse first, then let the user decide (the edit stays
+    // open on refusal, so they can just pick another name).
+    let res = await saveWorkflowAs(newName, data, { overwrite: false });
+    if (res.status === 409) {
+      const confirmed = await confirmDialog(
+        `Es gibt bereits einen Workflow "${newName}". Soll er überschrieben werden?`,
+        "Überschreiben"
+      );
+      if (!confirmed) return;
+      res = await saveWorkflowAs(newName, data, { overwrite: true });
+    }
     if (!res.ok) {
       const err = await res.json();
       toast("Fehlgeschlagen: " + (err.error || res.status), "error");

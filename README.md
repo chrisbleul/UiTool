@@ -160,8 +160,11 @@ GET  /api/queues/<name>/items       Items auflisten (Filter: ?status=...)
 Referenziert ein Job beim Einreihen eine Queue (`queue_name`), verarbeitet der Worker sie im
 "Process Transaction"-Muster: ein Workflow-Lauf pro Item, bis die Queue leer ist oder gestoppt wird.
 Fehlgeschlagene Items werden automatisch bis `max_retries` erneut versucht, bevor sie als `failed`
-markiert werden. Innerhalb der Step-Parameter stehen Platzhalter `{item.<feld>}` zur Verfügung, die
-pro Item aus dessen `payload` ersetzt werden:
+markiert werden — jeweils erst nach einer exponentiell wachsenden Wartezeit (5s, 10s, 20s, ...,
+gedeckelt auf 60s), damit ein Retry auch tatsächlich eine Chance hat, dass sich eine vorübergehende
+Störung legt. Ein einzelnes fehlgeschlagenes Item bricht den Job nicht ab, der Job endet danach aber
+im Status `error` statt `success`. Innerhalb der Step-Parameter stehen Platzhalter `{item.<feld>}`
+zur Verfügung, die pro Item aus dessen `payload` ersetzt werden:
 
 ```yaml
 name: Rechnung buchen
@@ -328,6 +331,7 @@ steps:
     folder: INBOX
     limit: 10
     unseen_only: true
+    mark_as_read: false             # Standard: Lesen lässt die Mails ungelesen (IMAP BODY.PEEK)
     save_as: eingang                # -> Liste von {subject, from, date, body}
 ```
 

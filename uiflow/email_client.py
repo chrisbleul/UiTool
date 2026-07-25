@@ -64,9 +64,17 @@ def read_emails(
     limit: int = 10,
     unseen_only: bool = True,
     use_ssl: bool = True,
+    mark_as_read: bool = False,
 ) -> list[dict[str, Any]]:
     import email as email_lib
     import imaplib
+
+    # A plain "(RFC822)" fetch is not read-only: the IMAP server sets \Seen on
+    # every message it returns. Reading a mailbox from a workflow would then
+    # silently mark the user's mail as read - and, with unseen_only, make the
+    # very messages just processed invisible to the next run. BODY.PEEK[] is
+    # the same fetch without that side effect; setting \Seen is opt-in.
+    fetch_spec = "(RFC822)" if mark_as_read else "(BODY.PEEK[])"
 
     client_cls = imaplib.IMAP4_SSL if use_ssl else imaplib.IMAP4
     client = client_cls(imap_host)
@@ -82,7 +90,7 @@ def read_emails(
 
         messages = []
         for msg_id in reversed(ids):
-            status, msg_data = client.fetch(msg_id, "(RFC822)")
+            status, msg_data = client.fetch(msg_id, fetch_spec)
             if status != "OK" or not msg_data or msg_data[0] is None:
                 continue
             raw = msg_data[0][1]

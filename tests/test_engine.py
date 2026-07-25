@@ -1,3 +1,5 @@
+import logging
+
 import pytest
 
 from uiflow.engine import StepError, WorkflowCancelled, WorkflowEngine, substitute_variables
@@ -69,7 +71,7 @@ def test_engine_invokes_on_breakpoint_before_the_flagged_step():
     backend = RecordingBackend()
     seen = []
 
-    def on_breakpoint(index, step, variables):
+    def on_breakpoint(index, step, variables, path):
         seen.append((index, step.action))
         assert backend.calls == [("navigate", "a")]  # not yet executed
 
@@ -87,7 +89,7 @@ def test_on_breakpoint_receives_a_snapshot_of_current_variables():
     )
     seen = {}
 
-    def on_breakpoint(index, step, variables):
+    def on_breakpoint(index, step, variables, path):
         seen.update(variables)
 
     WorkflowEngine(RecordingBackend()).run(workflow, on_breakpoint=on_breakpoint)
@@ -136,7 +138,7 @@ def test_engine_stops_immediately_after_a_breakpoint_if_requested():
     backend = RecordingBackend()
     stop_after_breakpoint = {"value": False}
 
-    def on_breakpoint(index, step, variables):
+    def on_breakpoint(index, step, variables, path):
         stop_after_breakpoint["value"] = True
 
     with pytest.raises(WorkflowCancelled):
@@ -631,3 +633,194 @@ def test_ocr_image_stores_text_via_save_as(monkeypatch):
     engine.run(workflow)
 
     assert engine.variables["text"] == "ocr text"
+
+
+def _run_capturing_logs(workflow, caplog, backend=None, **kwargs):
+    with caplog.at_level(logging.INFO, logger="uiflow"):
+        WorkflowEngine(backend or RecordingBackend()).run(workflow, **kwargs)
+    return caplog.text
+
+
+def test_assign_never_logs_a_credential_value(monkeypatch, caplog):
+    monkeypatch.setattr("keyring.get_password", lambda service, name: "hunter2")
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[
+            Step("get_credential", {"name": "pw"}, save_as="pw"),
+            Step("assign", {"variable": "copy", "expression": "pw"}),
+        ],
+    )
+
+    logs = _run_capturing_logs(workflow, caplog)
+
+    assert "hunter2" not in logs
+    assert "assign copy = '***'" in logs
+
+
+def test_switch_never_logs_a_credential_value(monkeypatch, caplog):
+    monkeypatch.setattr("keyring.get_password", lambda service, name: "hunter2")
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[
+            Step("get_credential", {"name": "pw"}, save_as="pw"),
+            Step("switch", {"expression": "pw", "cases": {"other": []}}),
+        ],
+    )
+
+    logs = _run_capturing_logs(workflow, caplog)
+
+    assert "hunter2" not in logs
+
+
+def test_breakpoint_variables_snapshot_masks_credentials(monkeypatch):
+    monkeypatch.setattr("keyring.get_password", lambda service, name: "hunter2")
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[
+            Step("get_credential", {"name": "pw"}, save_as="pw"),
+            Step("navigate", {"url": "a"}, breakpoint=True),
+        ],
+    )
+    seen = {}
+
+    def on_breakpoint(index, step, variables, path):
+        seen.update(variables)
+
+    WorkflowEngine(RecordingBackend()).run(workflow, on_breakpoint=on_breakpoint)
+
+    assert seen == {"pw": "***"}
+
+
+def test_breakpoint_reports_the_path_of_a_step_inside_a_branch():
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[
+            Step("navigate", {"url": "a"}),
+            Step(
+                "if",
+                {
+                    "condition": "True",
+                    "then": [{"action": "click", "selector": "#x", "breakpoint": True}],
+                },
+            ),
+        ],
+    )
+    seen = []
+
+    def on_breakpoint(index, step, variables, path):
+        seen.append((index, path))
+
+    WorkflowEngine(RecordingBackend()).run(workflow, on_breakpoint=on_breakpoint)
+
+    # The executed-step number (3) exceeds the two top-level steps, so only the
+    # path identifies which card in the Studio canvas is actually paused.
+    assert seen == [(3, "1.then.0")]
+
+
+def test_breakpoint_path_for_a_loop_body_is_stable_across_iterations():
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[
+            Step(
+                "for_each",
+                {
+                    "items": "[1, 2]",
+                    "steps": [{"action": "navigate", "url": "x", "breakpoint": True}],
+                },
+            )
+        ],
+    )
+    paths = []
+
+    def on_breakpoint(index, step, variables, path):
+        paths.append(path)
+
+    WorkflowEngine(RecordingBackend()).run(workflow, on_breakpoint=on_breakpoint)
+
+    assert paths == ["0.steps.0", "0.steps.0"]  # same card, two visits
+
+
+def test_breakpoint_path_for_a_matched_switch_case():
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[
+            Step(
+                "switch",
+                {
+                    "expression": "land",
+                    "cases": {"DE": [{"action": "navigate", "url": "de", "breakpoint": True}]},
+                    "default": [{"action": "navigate", "url": "other"}],
+                },
+            )
+        ],
+    )
+    paths = []
+
+    def on_breakpoint(index, step, variables, path):
+        paths.append(path)
+
+    WorkflowEngine(RecordingBackend()).run(workflow, on_breakpoint=on_breakpoint, variables={"land": "DE"})
+
+    assert paths == ["0.cases.DE.0"]
+
+
+def test_breakpoint_path_for_the_default_switch_branch():
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[
+            Step(
+                "switch",
+                {
+                    "expression": "land",
+                    "cases": {"DE": [{"action": "navigate", "url": "de"}]},
+                    "default": [{"action": "navigate", "url": "other", "breakpoint": True}],
+                },
+            )
+        ],
+    )
+    paths = []
+
+    def on_breakpoint(index, step, variables, path):
+        paths.append(path)
+
+    WorkflowEngine(RecordingBackend()).run(workflow, on_breakpoint=on_breakpoint, variables={"land": "FR"})
+
+    assert paths == ["0.default.0"]
+
+
+def test_breakpoint_path_for_a_catch_branch():
+    class FailingBackend:
+        def navigate(self, url):
+            raise RuntimeError("boom")
+
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[
+            Step(
+                "try",
+                {
+                    "steps": [{"action": "navigate", "url": "x"}],
+                    "catch": [{"action": "navigate", "url": "recover", "breakpoint": True}],
+                },
+            )
+        ],
+    )
+    paths = []
+
+    def on_breakpoint(index, step, variables, path):
+        paths.append(path)
+
+    try:
+        WorkflowEngine(FailingBackend()).run(workflow, on_breakpoint=on_breakpoint)
+    except RuntimeError:
+        pass
+
+    assert paths == ["0.catch.0"]

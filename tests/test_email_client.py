@@ -66,6 +66,7 @@ def test_send_email_uses_explicit_from_addr(monkeypatch):
 class _FakeImap:
     def __init__(self, host):
         self.host = host
+        self.fetch_specs = []
 
     def login(self, username, password):
         pass
@@ -77,6 +78,7 @@ class _FakeImap:
         return "OK", [b"1 2"]
 
     def fetch(self, msg_id, spec):
+        self.fetch_specs.append(spec)
         raw = (
             f"From: sender@example.com\r\n"
             f"Subject: Test {msg_id.decode()}\r\n"
@@ -100,3 +102,22 @@ def test_read_emails_parses_subject_and_body(monkeypatch):
     assert messages[0]["from"] == "sender@example.com"
     assert "Test" in messages[0]["subject"]
     assert "Body text" in messages[0]["body"]
+
+
+def test_read_emails_does_not_mark_messages_as_read_by_default(monkeypatch):
+    created = []
+    monkeypatch.setattr("imaplib.IMAP4_SSL", lambda host: created.append(_FakeImap(host)) or created[-1])
+
+    read_emails(imap_host="imap.example.com", username="u", password="p", limit=2)
+
+    # RFC822 would set \Seen on the server; BODY.PEEK[] is the read-only form.
+    assert created[0].fetch_specs == ["(BODY.PEEK[])", "(BODY.PEEK[])"]
+
+
+def test_read_emails_marks_messages_as_read_when_asked(monkeypatch):
+    created = []
+    monkeypatch.setattr("imaplib.IMAP4_SSL", lambda host: created.append(_FakeImap(host)) or created[-1])
+
+    read_emails(imap_host="imap.example.com", username="u", password="p", limit=1, mark_as_read=True)
+
+    assert created[0].fetch_specs == ["(RFC822)"]

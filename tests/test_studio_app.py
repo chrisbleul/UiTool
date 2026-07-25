@@ -80,6 +80,36 @@ def test_static_assets_are_reachable_without_auth(protected_client):
     assert res.status_code == 200
 
 
+def _workflow(name: str, url: str) -> dict:
+    return {"name": name, "backend": "web", "steps": [{"action": "navigate", "url": url}]}
+
+
+def test_saving_over_an_existing_workflow_is_refused_when_overwrite_is_false(client):
+    client.post("/api/workflows/report", json=_workflow("report", "https://original"))
+
+    res = client.post("/api/workflows/report?overwrite=false", json=_workflow("report", "https://other"))
+
+    assert res.status_code == 409
+    # the original must still be intact - a refused save may not have written
+    assert client.get("/api/workflows/report").get_json()["steps"][0]["url"] == "https://original"
+
+
+def test_saving_over_an_existing_workflow_is_allowed_by_default(client):
+    client.post("/api/workflows/report", json=_workflow("report", "https://original"))
+
+    res = client.post("/api/workflows/report", json=_workflow("report", "https://updated"))
+
+    assert res.status_code == 200
+    assert client.get("/api/workflows/report").get_json()["steps"][0]["url"] == "https://updated"
+
+
+def test_overwrite_false_still_creates_a_workflow_that_does_not_exist(client):
+    res = client.post("/api/workflows/fresh?overwrite=false", json=_workflow("fresh", "https://x"))
+
+    assert res.status_code == 200
+    assert client.get("/api/workflows/fresh").status_code == 200
+
+
 class _FakeKeyring:
     def __init__(self):
         self.store = {}
