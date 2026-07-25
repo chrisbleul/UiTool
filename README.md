@@ -202,6 +202,19 @@ die auch ein lokaler Worker letztlich anspricht (`orchestrator/worker.py` kennt 
 austauschbaren `store` — lokal `orchestrator/db.py` direkt, remote `orchestrator/remote_store.py` über
 HTTP; die Ausführungslogik selbst ist in beiden Fällen identisch).
 
+**Heartbeat & automatisches Requeuing bei einem abgestürzten Worker**: jeder laufende Job schreibt
+alle 15s einen Heartbeat (`--heartbeat-interval` bei `uiflow worker`), unabhängig davon, was der
+Workflow gerade tut — auch während er an einem Haltepunkt auf eine Person wartet, damit ein
+wartender Job nicht wie ein abgestürzter aussieht. `uiflow scheduler` prüft bei jedem Durchlauf, ob
+ein `running`-Job seit `--stale-job-timeout` (Standard 90s) keinen Heartbeat mehr geschrieben hat —
+sein Worker ist dann vermutlich abgestürzt (oder seine Maschine ausgefallen). So ein Job wird als
+`error` markiert; ein Queue-Item, das er noch `in_progress` hielt, geht dabei automatisch zurück in
+die Queue (`new`, ohne einen Retry zu verbrauchen — es wurde ja nie tatsächlich versucht-und-
+fehlgeschlagen, sein Worker ist nur verschwunden), sodass ein anderer Worker es aufgreifen kann.
+Ein einzelner, nicht queue-gesteuerter Job wird dabei bewusst **nicht** automatisch neu gestartet —
+seine Seiteneffekte bis zum Absturz sind unbekannt, "als Fehler markieren, damit ihn jemand bewusst
+erneut anstößt" ist die einzige sichere automatische Reaktion.
+
 **Jobs sind jetzt durable**: Status, Zeitstempel und die komplette Log-Historie überleben einen
 Neustart des Studio-Prozesses und sind über die API abrufbar, nicht nur live per SSE:
 
@@ -754,10 +767,10 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
   direkt zu öffnen — ein Worker auf einer anderen Maschine ohne jeden Datei-Zugriff auf diese Datenbank
   funktioniert damit genauso wie einer auf derselben Maschine. `uiflow scheduler` bleibt bewusst
   serverseitig (er *erzeugt* nur Jobs in derselben Queue, die dann ganz normal von jedem Worker —
-  lokal oder remote — abgeholt werden), ebenso wie Studios eingebetteter Scheduler-Thread. Was bewusst
-  fehlt: kein automatisches Requeuing, wenn ein Remote-Worker mitten in einem Job abstürzt (der Job
-  bleibt `running`, bis er manuell gestoppt oder von Hand erneut eingereiht wird) — dafür bräuchte es
-  ein Heartbeat/Lease-Verfahren, das es heute weder für lokale noch für Remote-Worker gibt.
+  lokal oder remote — abgeholt werden), ebenso wie Studios eingebetteter Scheduler-Thread. Ein
+  abgestürzter Worker (lokal oder remote) wird über den Heartbeat/Sweep-Mechanismus erkannt und sein
+  Job/Queue-Item automatisch abgeräumt bzw. requeued — siehe "Heartbeat & automatisches Requeuing"
+  oben.
 - ~~**Echtes Multi-User-/Rechte-System**~~ — erledigt: `uiflow create-user` legt einzelne Konten mit
   Rollen (`viewer`/`operator`/`admin`) an, siehe "Benutzer & Rollen (RBAC)" oben. Was bewusst fehlt: keine
   Gruppen/Teams, keine fein granularen Rechte pro Workflow oder Queue (nur die drei globalen Rollen), kein
@@ -804,11 +817,6 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
 Unten gesammelt, aber noch nicht bewertet oder gegen den tatsächlichen Bedarf geprüft — einfach
 Ideen, was als Nächstes sinnvoll sein könnte. Reihenfolge ist keine Priorität.
 
-- **Worker-Heartbeat & automatisches Requeuing**: stürzt ein Worker (lokal oder remote, siehe oben)
-  mitten in einem Job ab, bleibt der Job für immer auf `running` stehen — niemand markiert ihn als
-  abgebrochen oder reiht ihn erneut ein. Bräuchte einen periodischen Heartbeat pro laufendem Job
-  (`last_heartbeat_at`-Spalte) und einen Sweep, der Jobs ohne aktuellen Heartbeat nach einem Timeout
-  wieder auf `queued` zurücksetzt (oder als `error` markiert, je nach Retry-Semantik).
 - **Granulare Berechtigungen pro Workflow/Ordner/Queue**: RBAC kennt heute nur drei globale Rollen
   (viewer/operator/admin, siehe "Benutzer & Rollen" oben) — kein "Team A darf nur Workflows in Ordner
   X sehen/starten". Setzt vermutlich eine Ordner-/Projektstruktur (siehe unten) als Voraussetzung

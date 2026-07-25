@@ -112,7 +112,11 @@ def cmd_worker(args: argparse.Namespace) -> int:
     else:
         print(f"uiflow worker '{args.worker_id or '(auto)'}' polling for jobs (Ctrl+C to stop)")
 
-    kwargs: dict = {"worker_id": args.worker_id, "poll_interval": args.poll_interval}
+    kwargs: dict = {
+        "worker_id": args.worker_id,
+        "poll_interval": args.poll_interval,
+        "heartbeat_interval": args.heartbeat_interval,
+    }
     if store is not None:
         kwargs["store"] = store
     run_worker_loop(**kwargs)
@@ -120,11 +124,12 @@ def cmd_worker(args: argparse.Namespace) -> int:
 
 
 def cmd_scheduler(args: argparse.Namespace) -> int:
-    """Run a standalone scheduler that enqueues jobs for due cron schedules (see orchestrator/db.py)."""
+    """Run a standalone scheduler that enqueues jobs for due cron schedules and
+    sweeps jobs whose worker has gone silent (see orchestrator/db.py)."""
     from .orchestrator.worker import run_scheduler_loop
 
     print("uiflow scheduler polling for due schedules (Ctrl+C to stop)")
-    run_scheduler_loop(poll_interval=args.poll_interval)
+    run_scheduler_loop(poll_interval=args.poll_interval, stale_job_timeout=args.stale_job_timeout)
     return 0
 
 
@@ -213,10 +218,24 @@ def build_parser() -> argparse.ArgumentParser:
     worker_p.add_argument(
         "--remote-password", default=None, help="Prompted interactively if omitted (with --remote-url)"
     )
+    worker_p.add_argument(
+        "--heartbeat-interval",
+        type=float,
+        default=15.0,
+        help="Seconds between heartbeats while a job is running, so 'uiflow scheduler' can tell a crashed "
+        "worker apart from one still working (default: 15)",
+    )
     worker_p.set_defaults(func=cmd_worker)
 
     scheduler_p = sub.add_parser("scheduler", help="Run a standalone scheduler that enqueues jobs for due cron schedules")
     scheduler_p.add_argument("--poll-interval", type=float, default=20.0, help="Seconds between schedule checks")
+    scheduler_p.add_argument(
+        "--stale-job-timeout",
+        type=float,
+        default=90.0,
+        help="Seconds without a heartbeat before a running job is treated as orphaned (its worker likely "
+        "crashed): marked 'error', any queue item it still held is handed back to the queue (default: 90)",
+    )
     scheduler_p.set_defaults(func=cmd_scheduler)
 
     user_p = sub.add_parser(

@@ -120,12 +120,39 @@ def _run_workflow_once(
                     pass
 
 
-def _run_job(job: dict[str, Any], store: Any = db) -> None:
+# How often a job's heartbeat is refreshed while it runs (see _heartbeat_loop
+# below) and how long the sweep in db.sweep_stale_jobs waits before treating a
+# silent job as orphaned. The 4-6x margin between them is deliberate slack for
+# a slow DB write or a busy machine, not a tight deadline - this is meant to
+# catch a genuinely dead worker process, not penalize a merely slow one.
+HEARTBEAT_INTERVAL_SECONDS = 15.0
+
+
+def _heartbeat_loop(job_id: str, store: Any, interval: float, stop_event: threading.Event) -> None:
+    while not stop_event.wait(interval):
+        try:
+            store.heartbeat_job(job_id)
+        except Exception:  # noqa: BLE001 - a missed heartbeat must not crash the run itself
+            logger.warning("Heartbeat for job '%s' failed (will retry)", job_id, exc_info=True)
+
+
+def _run_job(job: dict[str, Any], store: Any = db, heartbeat_interval: float = HEARTBEAT_INTERVAL_SECONDS) -> None:
     job_id = job["id"]
     handler = _DbLogHandler(job_id, threading.get_ident(), store=store)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
+
+    # Keeps last_heartbeat_at fresh for as long as this job runs, independent of
+    # what the run itself is doing at any given moment - including sitting idle
+    # at a breakpoint waiting on a human, which must NOT look like a crashed
+    # worker to db.sweep_stale_jobs (see its docstring). Only this worker
+    # *process* dying stops the heartbeats.
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat_loop, args=(job_id, store, heartbeat_interval, heartbeat_stop), daemon=True
+    )
+    heartbeat_thread.start()
 
     workflow_dict = json.loads(job["workflow_json"])
     sub_workflows = {
@@ -159,6 +186,8 @@ def _run_job(job: dict[str, Any], store: Any = db) -> None:
         logger.error(str(exc))
         store.finish_job(job_id, "error", str(exc))
     finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=2.0)
         logger.removeHandler(handler)
 
 
@@ -245,7 +274,11 @@ def _run_queue_driven(
 
 
 def run_worker_loop(
-    worker_id: str | None = None, poll_interval: float = 1.0, stop_event=None, store: Any = db
+    worker_id: str | None = None,
+    poll_interval: float = 1.0,
+    stop_event=None,
+    store: Any = db,
+    heartbeat_interval: float = HEARTBEAT_INTERVAL_SECONDS,
 ) -> None:
     """Blocks, repeatedly claiming and running queued jobs, until `stop_event`
     is set (if given) - used both by the standalone `uiflow worker` CLI command
@@ -261,7 +294,7 @@ def run_worker_loop(
         if job is None:
             time.sleep(poll_interval)
             continue
-        _run_job(job, store=store)
+        _run_job(job, store=store, heartbeat_interval=heartbeat_interval)
 
 
 def _schedule_is_due(schedule: dict[str, Any]) -> bool:
@@ -273,12 +306,20 @@ def _schedule_is_due(schedule: dict[str, Any]) -> bool:
     return next_fire <= datetime.now(next_fire.tzinfo)
 
 
-def run_scheduler_loop(poll_interval: float = 20.0, stop_event=None) -> None:
-    """Blocks, periodically checking enabled schedules (see orchestrator/db.py's
-    `schedules` table) and enqueuing a job for any whose cron expression is due
-    - a lightweight cron trigger, separate from run_worker_loop (which executes
-    jobs) since a schedule only *creates* jobs, the regular worker loop (or a
-    standalone `uiflow worker` process) still claims and runs them."""
+def run_scheduler_loop(
+    poll_interval: float = 20.0, stop_event=None, stale_job_timeout: float = db.STALE_JOB_TIMEOUT_SECONDS
+) -> None:
+    """Blocks, periodically (a) checking enabled schedules (see
+    orchestrator/db.py's `schedules` table) and enqueuing a job for any whose
+    cron expression is due, and (b) sweeping jobs whose worker has gone silent
+    (see db.sweep_stale_jobs) - a lightweight maintenance loop, separate from
+    run_worker_loop (which executes jobs) since neither responsibility here
+    executes anything itself: a schedule only *creates* jobs and the sweep
+    only *settles* orphaned ones, the regular worker loop (or a standalone
+    `uiflow worker` process, local or remote) still claims and runs them.
+    Always uses the local `db` module directly - unlike run_worker_loop, this
+    loop is deliberately server-side only (see README's "Orchestrator über
+    eine Maschine hinaus")."""
     db.init_db()
     logger.info("Scheduler started")
     while stop_event is None or not stop_event.is_set():
@@ -301,6 +342,11 @@ def run_scheduler_loop(poll_interval: float = 20.0, stop_event=None) -> None:
             )
             db.mark_schedule_ran(schedule["id"])
             logger.info("Schedule '%s' fired -> new job enqueued", schedule["name"])
+
+        stale = db.sweep_stale_jobs(stale_job_timeout)
+        for job_id in stale:
+            logger.warning("Job '%s' had no heartbeat for %.0fs - marked as error", job_id, stale_job_timeout)
+
         if stop_event is not None:
             stop_event.wait(poll_interval)
         else:

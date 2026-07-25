@@ -117,13 +117,38 @@ def test_build_parser_accepts_worker_remote_flags():
     assert args.func is cli.cmd_worker
 
 
-def _worker_args(worker_id="robot-1", poll_interval=1.0, remote_url=None, remote_username=None, remote_password=None):
+def test_build_parser_worker_heartbeat_interval_defaults_to_15_seconds():
+    parser = cli.build_parser()
+
+    args = parser.parse_args(["worker"])
+
+    assert args.heartbeat_interval == 15.0
+
+
+def test_build_parser_accepts_scheduler_stale_job_timeout():
+    parser = cli.build_parser()
+
+    args = parser.parse_args(["scheduler", "--stale-job-timeout", "45"])
+
+    assert args.stale_job_timeout == 45.0
+    assert args.func is cli.cmd_scheduler
+
+
+def _worker_args(
+    worker_id="robot-1",
+    poll_interval=1.0,
+    remote_url=None,
+    remote_username=None,
+    remote_password=None,
+    heartbeat_interval=15.0,
+):
     return argparse.Namespace(
         worker_id=worker_id,
         poll_interval=poll_interval,
         remote_url=remote_url,
         remote_username=remote_username,
         remote_password=remote_password,
+        heartbeat_interval=heartbeat_interval,
     )
 
 
@@ -134,7 +159,7 @@ def test_cmd_worker_runs_locally_without_remote_url(monkeypatch):
     code = cli.cmd_worker(_worker_args())
 
     assert code == 0
-    assert calls == [{"worker_id": "robot-1", "poll_interval": 1.0}]
+    assert calls == [{"worker_id": "robot-1", "poll_interval": 1.0, "heartbeat_interval": 15.0}]
 
 
 def test_cmd_worker_logs_in_and_passes_a_remote_store_when_remote_url_is_given(monkeypatch):

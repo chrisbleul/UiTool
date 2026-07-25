@@ -173,6 +173,7 @@ def init_db() -> None:
                     ("job_controls", "paused_step_path", "TEXT"),
                     ("queue_items", "retry_after", "TEXT"),
                     ("jobs", "sub_workflows_json", "TEXT"),
+                    ("jobs", "last_heartbeat_at", "TEXT"),
                 ):
                     try:
                         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
@@ -213,10 +214,11 @@ def claim_next_job(worker_id: str) -> dict[str, Any] | None:
         if row is None:
             return None
         job_id = row["id"]
+        now = _now()
         cur = conn.execute(
-            "UPDATE jobs SET status='running', worker_id=?, started_at=? "
+            "UPDATE jobs SET status='running', worker_id=?, started_at=?, last_heartbeat_at=? "
             "WHERE id=? AND status='queued'",
-            (worker_id, _now(), job_id),
+            (worker_id, now, now, job_id),
         )
         if cur.rowcount == 0:
             return None  # another worker won the race
@@ -253,6 +255,54 @@ def finish_job(job_id: str, status: str, error_message: str | None = None) -> No
             "UPDATE jobs SET status=?, error_message=?, finished_at=? WHERE id=?",
             (status, error_message, _now(), job_id),
         )
+
+
+# Heartbeat is written every ~20s while a job runs (see worker.py's _run_job) -
+# not tied to any specific step timing, since a step can legitimately run much
+# longer than that (a slow page, a paused breakpoint waiting on a human). Only
+# a worker *process* dying stops the heartbeats; how long a single step takes
+# is irrelevant to it.
+STALE_JOB_TIMEOUT_SECONDS = 90.0
+
+
+def heartbeat_job(job_id: str) -> None:
+    with connect() as conn:
+        conn.execute("UPDATE jobs SET last_heartbeat_at=? WHERE id=? AND status='running'", (_now(), job_id))
+
+
+def sweep_stale_jobs(timeout_seconds: float = STALE_JOB_TIMEOUT_SECONDS) -> list[str]:
+    """Finds jobs whose worker has gone silent (no heartbeat within
+    `timeout_seconds`, e.g. the worker process crashed or its machine died) and
+    settles them: any queue item that job still held `in_progress` is handed
+    back to the queue exactly like release_queue_item does (no retry
+    consumed - the item itself was never actually attempted-and-failed, its
+    worker just vanished), and the job itself is marked 'error' so it stops
+    looking perpetually 'running'. A one-shot (non-queue-driven) job is *not*
+    silently re-run - its side effects up to the crash are unknown, so
+    "error, needs a human to re-trigger it" is the only safe automatic
+    outcome. Returns the swept job ids (for logging by the caller).
+
+    Called periodically from run_scheduler_loop (see worker.py) - the same
+    maintenance loop that already runs continuously, embedded in `uiflow
+    studio` by default or standalone via `uiflow scheduler`."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=timeout_seconds)).isoformat()
+    with connect() as conn:
+        stale = conn.execute(
+            "SELECT id FROM jobs WHERE status='running' AND last_heartbeat_at IS NOT NULL AND last_heartbeat_at <= ?",
+            (cutoff,),
+        ).fetchall()
+        job_ids = [row["id"] for row in stale]
+        for job_id in job_ids:
+            conn.execute(
+                "UPDATE queue_items SET status='new', locked_by=NULL, locked_at=NULL, started_at=NULL, "
+                "retry_after=NULL WHERE locked_by=? AND status='in_progress'",
+                (job_id,),
+            )
+            conn.execute(
+                "UPDATE jobs SET status='error', error_message=?, finished_at=? WHERE id=? AND status='running'",
+                ("Worker-Heartbeat-Timeout - der Worker ist vermutlich abgestürzt", _now(), job_id),
+            )
+        return job_ids
 
 
 # --- logs -------------------------------------------------------------------

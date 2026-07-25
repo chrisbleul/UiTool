@@ -54,6 +54,98 @@ def test_finish_job_sets_status_and_timestamp():
     assert job["finished_at"] is not None
 
 
+def test_claim_next_job_sets_an_initial_heartbeat():
+    db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+
+    claimed = db.claim_next_job("worker-1")
+
+    assert claimed["last_heartbeat_at"] is not None
+    assert claimed["last_heartbeat_at"] == claimed["started_at"]
+
+
+def test_heartbeat_job_updates_the_timestamp():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+    claimed = db.claim_next_job("worker-1")
+    original = claimed["last_heartbeat_at"]
+
+    with db.connect() as conn:
+        conn.execute("UPDATE jobs SET last_heartbeat_at=? WHERE id=?", ("2000-01-01T00:00:00+00:00", job_id))
+    db.heartbeat_job(job_id)
+
+    assert db.get_job(job_id)["last_heartbeat_at"] != "2000-01-01T00:00:00+00:00"
+    assert db.get_job(job_id)["last_heartbeat_at"] != original  # moved forward, not just restored
+
+
+def test_heartbeat_job_is_a_no_op_for_a_job_that_is_not_running():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})  # still 'queued'
+
+    db.heartbeat_job(job_id)
+
+    assert db.get_job(job_id)["last_heartbeat_at"] is None
+
+
+def _backdate_heartbeat(job_id: str, seconds_ago: float) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    stale_at = (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).isoformat()
+    with db.connect() as conn:
+        conn.execute("UPDATE jobs SET last_heartbeat_at=? WHERE id=?", (stale_at, job_id))
+
+
+def test_sweep_stale_jobs_marks_a_silent_one_shot_job_as_error():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+    db.claim_next_job("worker-1")
+    _backdate_heartbeat(job_id, seconds_ago=200)
+
+    swept = db.sweep_stale_jobs(timeout_seconds=90)
+
+    assert swept == [job_id]
+    job = db.get_job(job_id)
+    assert job["status"] == "error"
+    assert "Heartbeat" in job["error_message"]
+    assert job["finished_at"] is not None
+
+
+def test_sweep_stale_jobs_leaves_a_recently_heartbeating_job_alone():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+    db.claim_next_job("worker-1")  # heartbeat is "now" - well within any timeout
+
+    swept = db.sweep_stale_jobs(timeout_seconds=90)
+
+    assert swept == []
+    assert db.get_job(job_id)["status"] == "running"
+
+
+def test_sweep_stale_jobs_ignores_jobs_that_are_not_running():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})  # still 'queued', no heartbeat yet
+
+    swept = db.sweep_stale_jobs(timeout_seconds=0)
+
+    assert swept == []
+    assert db.get_job(job_id)["status"] == "queued"
+
+
+def test_sweep_stale_jobs_releases_its_in_progress_queue_item_without_consuming_a_retry():
+    queue_id = db.create_queue("invoices")
+    db.add_queue_items(queue_id, [{"payload": {"n": 1}, "max_retries": 3}])
+    job_id = db.create_job(
+        "process", {"name": "process", "backend": "web", "steps": []}, queue_name="invoices"
+    )
+    db.claim_next_job("worker-1")
+    item = db.claim_next_queue_item(queue_id, job_id)
+    assert item["status"] == "in_progress"
+    _backdate_heartbeat(job_id, seconds_ago=200)
+
+    db.sweep_stale_jobs(timeout_seconds=90)
+
+    [released] = db.list_queue_items(queue_id)
+    assert released["status"] == "new"  # handed back, not failed
+    assert released["retry_count"] == 0  # no retry consumed - it was never actually attempted-and-failed
+    assert released["locked_by"] is None
+    # and it's claimable again, by a fresh worker
+    assert db.claim_next_queue_item(queue_id, "worker-2") is not None
+
+
 def test_logs_are_persisted_and_fetchable_incrementally():
     job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
     db.add_log(job_id, "INFO", "first")
@@ -225,6 +317,99 @@ class _RecordingFakeBackend:
 
     def close(self):
         pass
+
+
+class _HeartbeatRecordingStore:
+    """A minimal fake `store` (see worker.py's Store note) covering only what
+    a one-shot _run_job needs, so the heartbeat thread can be exercised
+    without a real orchestrator.db at all - the same "fake the dependency"
+    approach test_remote_store.py uses for RemoteStore itself."""
+
+    def __init__(self):
+        self.heartbeats = []
+        self.finished = None
+
+    def is_stop_requested(self, job_id):
+        return False
+
+    def set_paused(self, job_id, index, action, variables=None, path=None):
+        pass
+
+    def wait_and_clear_resume(self, job_id):
+        return True
+
+    def get_global_variables(self):
+        return {}
+
+    def add_log(self, job_id, level, message):
+        pass
+
+    def heartbeat_job(self, job_id):
+        self.heartbeats.append(job_id)
+
+    def finish_job(self, job_id, status, error_message=None):
+        self.finished = (status, error_message)
+
+
+def test_run_job_heartbeats_periodically_while_a_step_is_slow(monkeypatch):
+    import time as time_module
+
+    from uiflow.orchestrator import worker
+
+    class _SlowBackend:
+        def navigate(self, url):
+            time_module.sleep(0.15)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(worker, "_make_backend", lambda wf: _SlowBackend())
+    store = _HeartbeatRecordingStore()
+    job = {
+        "id": "job-1",
+        "name": "demo",
+        "workflow_json": json.dumps(
+            {"name": "demo", "backend": "web", "steps": [{"action": "navigate", "url": "https://x"}]}
+        ),
+        "sub_workflows_json": "{}",
+        "queue_name": None,
+    }
+
+    worker._run_job(job, store=store, heartbeat_interval=0.02)
+
+    assert len(store.heartbeats) >= 2  # ~0.15s of run time / 0.02s interval
+    assert store.finished == ("success", None)
+
+
+def test_run_job_stops_heartbeating_once_the_job_finishes(monkeypatch):
+    import time as time_module
+
+    from uiflow.orchestrator import worker
+
+    class _FastBackend:
+        def navigate(self, url):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(worker, "_make_backend", lambda wf: _FastBackend())
+    store = _HeartbeatRecordingStore()
+    job = {
+        "id": "job-1",
+        "name": "demo",
+        "workflow_json": json.dumps(
+            {"name": "demo", "backend": "web", "steps": [{"action": "navigate", "url": "https://x"}]}
+        ),
+        "sub_workflows_json": "{}",
+        "queue_name": None,
+    }
+
+    worker._run_job(job, store=store, heartbeat_interval=0.02)
+    count_right_after = len(store.heartbeats)
+    time_module.sleep(0.1)  # several more intervals' worth of time
+
+    assert len(store.heartbeats) == count_right_after  # the thread really stopped, not just slowed
 
 
 def test_queue_driven_job_seeds_item_variables_end_to_end(monkeypatch):
@@ -557,6 +742,30 @@ def test_run_scheduler_loop_enqueues_a_job_for_a_due_schedule(monkeypatch):
     [job] = db.list_jobs()
     assert job["queue_name"] == "q1"
     assert db.get_schedule(schedule_id)["last_run_at"] is not None
+
+
+def test_run_scheduler_loop_sweeps_stale_jobs_each_iteration(monkeypatch):
+    import threading
+
+    from uiflow.orchestrator import worker
+
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+    db.claim_next_job("worker-1")
+    _backdate_heartbeat(job_id, seconds_ago=200)
+
+    stop_event = threading.Event()
+    original_sweep = db.sweep_stale_jobs
+
+    def sweep_and_stop(timeout_seconds):
+        result = original_sweep(timeout_seconds)
+        stop_event.set()
+        return result
+
+    monkeypatch.setattr(db, "sweep_stale_jobs", sweep_and_stop)
+
+    worker.run_scheduler_loop(poll_interval=0, stop_event=stop_event, stale_job_timeout=90)
+
+    assert db.get_job(job_id)["status"] == "error"
 
 
 # --- global variables -------------------------------------------------------

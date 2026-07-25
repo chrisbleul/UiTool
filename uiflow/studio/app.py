@@ -313,6 +313,11 @@ def create_app() -> Flask:
         db.add_log(job_id, data["level"], data["message"])
         return jsonify({"ok": True})
 
+    @app.post("/api/worker/jobs/<job_id>/heartbeat")
+    def worker_heartbeat(job_id: str) -> Response:
+        db.heartbeat_job(job_id)
+        return jsonify({"ok": True})
+
     @app.get("/api/worker/jobs/<job_id>/control")
     def worker_job_control(job_id: str) -> Response:
         return jsonify({"stop_requested": db.is_stop_requested(job_id)})

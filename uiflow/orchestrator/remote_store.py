@@ -76,6 +76,9 @@ class RemoteStore:
     def add_log(self, job_id: str, level: str, message: str) -> None:
         self._post(f"/api/worker/jobs/{quote(job_id)}/logs", {"level": level, "message": message})
 
+    def heartbeat_job(self, job_id: str) -> None:
+        self._post(f"/api/worker/jobs/{quote(job_id)}/heartbeat")
+
     def is_stop_requested(self, job_id: str) -> bool:
         return bool(self._get(f"/api/worker/jobs/{quote(job_id)}/control")["stop_requested"])
 
