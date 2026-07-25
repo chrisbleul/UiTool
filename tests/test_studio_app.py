@@ -12,8 +12,9 @@ def isolated_db(tmp_path, monkeypatch):
 
 @pytest.fixture
 def client(isolated_db, monkeypatch, tmp_path):
-    # one resolver for both the Studio and the engine's run_workflow action
+    # one resolver for the Studio, the engine's run_workflow action, and the object repository
     monkeypatch.setattr("uiflow.models.WORKFLOWS_DIR", tmp_path / "workflows")
+    monkeypatch.setattr("uiflow.object_repository.WORKFLOWS_DIR", tmp_path / "workflows")
     monkeypatch.delenv("UIFLOW_STUDIO_PASSWORD", raising=False)
     app = create_app()
     app.config.update(TESTING=True)
@@ -22,8 +23,9 @@ def client(isolated_db, monkeypatch, tmp_path):
 
 @pytest.fixture
 def protected_client(isolated_db, monkeypatch, tmp_path):
-    # one resolver for both the Studio and the engine's run_workflow action
+    # one resolver for the Studio, the engine's run_workflow action, and the object repository
     monkeypatch.setattr("uiflow.models.WORKFLOWS_DIR", tmp_path / "workflows")
+    monkeypatch.setattr("uiflow.object_repository.WORKFLOWS_DIR", tmp_path / "workflows")
     monkeypatch.setenv("UIFLOW_STUDIO_PASSWORD", "hunter2")
     app = create_app()
     app.config.update(TESTING=True)
@@ -135,6 +137,38 @@ def test_inspect_web_endpoint_reports_a_value_error_as_a_400(client, monkeypatch
 
     assert res.status_code == 400
     assert "Ungültiger Selector" in res.get_json()["error"]
+
+
+def test_repository_endpoints_add_list_and_delete_an_element(client):
+    res = client.post(
+        "/api/repository",
+        json={"scope": "MeineApp", "name": "Suchfeld", "fields": {"selector": "#search"}},
+    )
+    assert res.status_code == 200
+
+    entries = client.get("/api/repository").get_json()
+    assert entries == [{"scope": "MeineApp", "name": "Suchfeld", "fields": {"selector": "#search"}}]
+
+    res = client.delete("/api/repository/MeineApp/Suchfeld")
+    assert res.status_code == 200
+    assert client.get("/api/repository").get_json() == []
+
+
+def test_repository_endpoint_requires_scope_name_and_fields(client):
+    res = client.post("/api/repository", json={"scope": "MeineApp", "name": "", "fields": {"selector": "#x"}})
+    assert res.status_code == 400
+
+    res = client.post("/api/repository", json={"scope": "MeineApp", "name": "Feld", "fields": {}})
+    assert res.status_code == 400
+
+
+def test_repository_file_is_excluded_from_the_workflow_list(client):
+    client.post("/api/repository", json={"scope": "A", "name": "B", "fields": {"selector": "#x"}})
+    client.post("/api/workflows/echt", json={"name": "echt", "backend": "web", "steps": []})
+
+    names = client.get("/api/workflows").get_json()
+
+    assert names == ["echt"]
 
 
 def test_saving_over_an_existing_workflow_is_refused_when_overwrite_is_false(client):

@@ -1,4 +1,5 @@
 let schema = { web: {}, desktop: {} };
+let repositoryEntries = []; // Object Repository: [{scope, name, fields}, ...] - see /api/repository
 
 let state = {
   backend: "web",
@@ -131,6 +132,11 @@ function updateUndoButton() {
 async function loadSchema() {
   const res = await fetch("/api/schema");
   schema = await res.json();
+}
+
+async function loadRepository() {
+  const res = await fetch("/api/repository");
+  repositoryEntries = await res.json();
 }
 
 async function loadWorkflowList() {
@@ -983,9 +989,14 @@ function renderProperties() {
   body.appendChild(actionWrap);
 
   // Branch fields are structural: they are edited on the canvas as drop
-  // targets, not as form inputs, so the panel skips them.
+  // targets, not as form inputs, so the panel skips them. A step referencing
+  // an Object Repository element (step.params.element - see below) also skips
+  // its own selector/control_type/title/auto_id fields: the engine ignores
+  // them in favour of the referenced element's fields once `element` is set.
+  const _targetFieldNames = ["selector", "control_type", "title", "auto_id"];
   for (const fieldDef of actions[step.action] || []) {
     if (fieldDef.type === "steps" || fieldDef.type === "cases") continue;
+    if (step.params.element && _targetFieldNames.includes(fieldDef.name)) continue;
     body.appendChild(renderField(step, fieldDef));
   }
 
@@ -1010,26 +1021,136 @@ function renderProperties() {
   const hasSelectorField = fieldDefs.some((f) => f.name === "selector");
   const hasDesktopTargetFields = fieldDefs.some((f) => ["control_type", "title", "auto_id"].includes(f.name));
   if (hasSelectorField || hasDesktopTargetFields) {
-    const pickBtn = document.createElement("button");
-    pickBtn.type = "button";
-    pickBtn.className = "btn btn-pick";
-    pickBtn.innerHTML = ICONS.target + "<span>Element auf dem Bildschirm wählen</span>";
-    pickBtn.addEventListener("click", () => {
-      if (hasSelectorField) pickWebSelector(step);
-      else pickDesktopSelector(step);
-    });
-    body.appendChild(pickBtn);
-  }
+    body.appendChild(renderElementReferenceSection(step, hasSelectorField));
 
-  if (hasSelectorField) {
-    const inspectBtn = document.createElement("button");
-    inspectBtn.type = "button";
-    inspectBtn.className = "btn";
-    inspectBtn.textContent = "Selector prüfen";
-    inspectBtn.title = "Prüft, wie viele Elemente dieser Selector auf der Seite trifft";
-    inspectBtn.addEventListener("click", () => inspectWebSelector(step));
-    body.appendChild(inspectBtn);
+    if (!step.params.element) {
+      const pickBtn = document.createElement("button");
+      pickBtn.type = "button";
+      pickBtn.className = "btn btn-pick";
+      pickBtn.innerHTML = ICONS.target + "<span>Element auf dem Bildschirm wählen</span>";
+      pickBtn.addEventListener("click", () => {
+        if (hasSelectorField) pickWebSelector(step);
+        else pickDesktopSelector(step);
+      });
+      body.appendChild(pickBtn);
+
+      if (hasSelectorField) {
+        const inspectBtn = document.createElement("button");
+        inspectBtn.type = "button";
+        inspectBtn.className = "btn";
+        inspectBtn.textContent = "Selector prüfen";
+        inspectBtn.title = "Prüft, wie viele Elemente dieser Selector auf der Seite trifft";
+        inspectBtn.addEventListener("click", () => inspectWebSelector(step));
+        body.appendChild(inspectBtn);
+      }
+    }
   }
+}
+
+// Object Repository: lets a step reference a named, centrally stored element
+// ("Scope/Name") instead of carrying its own selector - see engine.py's
+// _resolve_element_reference. Picking a repository entry hides this step's
+// own selector/control_type/title/auto_id fields (see the skip in the field
+// loop above), since the engine ignores them in favour of the referenced
+// element's fields once `element` is set.
+function renderElementReferenceSection(step, hasSelectorField) {
+  const wrap = document.createElement("div");
+  wrap.className = "field element-reference";
+  const label = document.createElement("label");
+  label.textContent = "Object Repository";
+  wrap.appendChild(label);
+
+  const row = document.createElement("div");
+  row.className = "field-row";
+
+  const select = document.createElement("select");
+  const noneOpt = document.createElement("option");
+  noneOpt.value = "";
+  noneOpt.textContent = "(kein - eigener Selektor)";
+  select.appendChild(noneOpt);
+  for (const entry of repositoryEntries) {
+    const value = `${entry.scope}/${entry.name}`;
+    const opt = document.createElement("option");
+    opt.value = value;
+    opt.textContent = value;
+    if (step.params.element === value) opt.selected = true;
+    select.appendChild(opt);
+  }
+  select.addEventListener("change", () => {
+    pushUndo();
+    if (select.value) {
+      step.params.element = select.value;
+      // The engine ignores an inline selector once `element` is set - drop it
+      // so a saved workflow doesn't carry stale, unused fields alongside it.
+      for (const key of ["selector", "control_type", "title", "auto_id"]) delete step.params[key];
+    } else {
+      delete step.params.element;
+    }
+    renderSteps();
+  });
+  row.appendChild(select);
+
+  const saveBtn = document.createElement("button");
+  saveBtn.type = "button";
+  saveBtn.className = "btn-icon";
+  saveBtn.innerHTML = ICONS.copy;
+  saveBtn.title = "Aktuelle Felder als Element speichern";
+  saveBtn.setAttribute("aria-label", "Aktuelle Felder als Element speichern");
+  saveBtn.addEventListener("click", () => saveStepAsRepositoryElement(step, hasSelectorField));
+  row.appendChild(saveBtn);
+
+  wrap.appendChild(row);
+  return wrap;
+}
+
+function suggestScopeName() {
+  if (state.backend === "desktop") {
+    const scope = findDesktopScope();
+    if (scope) return scope.focus_path || scope.focus_title || "";
+    return "";
+  }
+  const url = findNavigateUrl();
+  if (!url) return "";
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url;
+  }
+}
+
+async function saveStepAsRepositoryElement(step, hasSelectorField) {
+  let fields = null;
+  if (hasSelectorField) {
+    if (step.params.selector) fields = { selector: step.params.selector };
+  } else {
+    const picked = {};
+    for (const key of ["control_type", "title", "auto_id"]) {
+      if (step.params[key]) picked[key] = step.params[key];
+    }
+    if (Object.keys(picked).length) fields = picked;
+  }
+  if (!fields) {
+    toast("Bitte zuerst ein Element auswählen (Selector bzw. Control-Felder ausfüllen).", "error");
+    return;
+  }
+  const scope = window.prompt("Anwendung/Scope (z.B. Editor oder example.com):", suggestScopeName());
+  if (!scope) return;
+  const name = window.prompt('Name für dieses Element (z.B. "Anmelden-Knopf"):', "");
+  if (!name) return;
+
+  const res = await fetch("/api/repository", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scope, name, fields }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    toast("Speichern fehlgeschlagen: " + (data.error || res.status), "error");
+    return;
+  }
+  await loadRepository();
+  toast(`Element "${scope}/${name}" gespeichert.`, "success");
+  renderSteps();
 }
 
 function renderRecordingControls() {
@@ -2279,7 +2400,7 @@ function init() {
 
   el("catalog-search").addEventListener("input", renderCatalog);
 
-  Promise.all([loadSchema(), loadCatalog()]).then(() => {
+  Promise.all([loadSchema(), loadCatalog(), loadRepository()]).then(() => {
     renderCatalog();
     initCatalogSortable();
     state.steps = [newStepFor(state.backend)];

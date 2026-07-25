@@ -654,6 +654,9 @@ body {
 .field-row { display: flex; gap: 10px; }
 .field-row .field { flex: 1; margin-bottom: 0; }
 .error-handling { padding-top: 10px; border-top: 1px solid var(--border); }
+.element-reference { padding-top: 10px; border-top: 1px solid var(--border); }
+.element-reference .field-row { align-items: center; }
+.element-reference .field-row select { flex: 1; }
 
 .field-wide { grid-column: 1 / -1; }
 

@@ -523,6 +523,57 @@ Vier Punkte dazu:
 **Keine Geheimnisse hier ablegen** — dafür gibt es Anmeldedaten, deren Werte gar nicht erst in dieser
 Datenbank landen:
 
+## Object Repository (wiederverwendbare Selektoren)
+
+Jede Aktivität trägt sonst ihren Selektor inline — bei Web das Feld `selector`, bei Desktop das Tripel
+`control_type`/`title`/`auto_id`. Ein Element, das an zehn Stellen angesprochen wird, steht damit
+zehnmal im Workflow: ändert die Zielanwendung ihre Oberfläche, müssen alle zehn Stellen gefunden und
+einzeln nachgezogen werden. Das **Object Repository** ist ein zentraler Speicher benannter Elemente,
+gruppiert nach Anwendung/Scope:
+
+```yaml
+# workflows/_object_repository.yaml - kein Workflow, wird aus der Werkzeugliste ausgeschlossen
+MeineApp:
+  Anmelden-Knopf:
+    control_type: Button
+    auto_id: btnOK
+  Rechnungsnummer-Feld:
+    control_type: Edit
+    auto_id: txtRechnung
+example.com:
+  Suchfeld:
+    selector: "#search"
+```
+
+Ein Step referenziert ein Element über `element: "Scope/Name"` statt eigener Selektor-Felder:
+
+```yaml
+steps:
+  - action: click
+    element: "MeineApp/Anmelden-Knopf"
+```
+
+Die Engine löst `element` auf, bevor der Step ans Backend geht (`_resolve_element_reference` in
+`engine.py`) — die Felder aus dem Repository ersetzen dabei jeden inline eingetragenen Selektor auf
+demselben Step vollständig, ein Step trägt also entweder eine Repository-Referenz oder einen eigenen
+Selektor, nie beide gleichzeitig. `element` erlaubt wie jeder andere Parameter auch `{var.x}` — eine
+Referenz kann also zur Laufzeit bestimmt werden, nicht nur wörtlich in der YAML stehen.
+
+Im Studio erscheint bei jedem Selector-/Control-Feld ein Abschnitt **Object Repository**: eine Auswahl
+vorhandener `Scope/Name`-Einträge (leer = eigener Selektor bleibt aktiv) sowie ein Button, der die
+aktuell eingetragenen Felder des Steps unter einem neuen Namen im Repository ablegt. Drei Punkte dazu:
+
+- **Ablage**: anders als Anmeldedaten ist ein Selektor kein Geheimnis und gehört versioniert neben die
+  Workflows (`workflows/_object_repository.yaml`), nicht in `orchestrator.db` — so lässt sich eine
+  Änderung an der Oberfläche mit den betroffenen Workflows zusammen reviewen und zurückrollen.
+- **Scope ist frei wählbar.** Für Desktop bietet sich der `launch`-Pfad oder `connect`-Titel an (der
+  Vorschlag im Speichern-Dialog übernimmt ihn automatisch), für Web mangels eines vergleichbaren
+  Scope-Begriffs meist die Domain — beides ist aber nur ein Vorschlag, kein erzwungenes Schema.
+- **Auflösung, nicht Textersatz.** Weil ein Desktop-Element auf *mehrere* Felder abbildet
+  (`control_type`/`title`/`auto_id`), reicht eine reine `{var.x}`-Textersetzung nicht — die Engine löst
+  die Referenz deshalb als eigenen Schritt vor dem Backend-Dispatch auf, nicht über das
+  Platzhalter-Muster.
+
 ## Anmeldedaten (Credentials)
 
 `get_credential` liest ein Geheimnis (Passwort, API-Key, ...) zur Laufzeit in eine Variable ein, ohne
@@ -616,34 +667,11 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
     bräuchte dafür eine gemeinsame Darstellung über beide Backends hinweg (Name, Typ, Eigenschaften,
     Kinder) — die erzeugt `picker.py` im Kern bereits, bisher nur nicht als Baum.
 
-  Zusammen mit dem nächsten Punkt ergäbe das den natürlichen Arbeitsablauf: im Explorer suchen und prüfen,
-  von dort als benanntes Element ins Repository speichern, in Aktivitäten wiederverwenden.
-- **Object Repository (wiederverwendbare Selektoren)**: Heute trägt jede Aktivität ihren Selektor
-  inline — bei Web das Feld `selector`, bei Desktop das Tripel `control_type`/`title`/`auto_id`.
-  "Element auf dem Bildschirm wählen" schreibt genau dorthin. Ein Element, das an zehn Stellen
-  angesprochen wird, steht damit zehnmal im Workflow: ändert die Zielanwendung ihre Oberfläche, müssen
-  alle zehn Stellen gefunden und einzeln nachgezogen werden — der Hauptgrund, warum RPA-Automatisierungen
-  im Betrieb brechen.
-  Gewünscht ist stattdessen ein zentraler Speicher benannter UI-Elemente ("Anmelden-Knopf",
-  "Rechnungsnummer-Feld"): einmal während der Entwicklung aufnehmen, danach in beliebigen Aktivitäten
-  per Name referenzieren, und bei einer UI-Änderung an genau einer Stelle korrigieren.
-  Drei Punkte, die den Zuschnitt bestimmen und deshalb vor der Umsetzung geklärt sein wollen:
-  - **Auflösung in der Engine**: `substitute_variables` ersetzt heute `{var.x}`/`{item.x}` rein
-    textuell in den Step-Parametern. Für ein Repository reicht das nicht, weil ein Desktop-Element auf
-    *drei* Felder abbildet, nicht auf einen String. Die Engine müsste eine Element-Referenz vor dem
-    Dispatch ans Backend zu den passenden Parametern auflösen — ein eigener Schritt in `_run_backend_step`,
-    kein zusätzliches Platzhalter-Muster.
-  - **Zuordnung zur Anwendung**: ein Selektor gilt nur innerhalb seiner Anwendung. Der bestehende
-    Scope-Begriff (`launch`/`connect` als erster Schritt) benennt diese Anwendung bereits — er ist der
-    naheliegende Schlüssel, unter dem Elemente gruppiert werden, analog zu UiPaths Aufteilung in
-    Anwendung → Screen → Element.
-  - **Ablage**: anders als Anmeldedaten sind Selektoren kein Geheimnis und gehören versioniert neben die
-    Workflows (eine Datei in `workflows/`), nicht in `orchestrator.db` — sonst lässt sich eine Änderung
-    an der Oberfläche nicht mit dem Workflow zusammen reviewen und zurückrollen.
-
-  Im Studio wären das zwei Ergänzungen: `picker.py` bekommt neben "Felder füllen" ein "als Element
-  speichern", und im Eigenschaften-Panel wird aus dem freien Selektor-Feld eine Auswahl über das
-  Repository plus "neu aufnehmen".
-- **Selectors robuster machen** (Fallback-Strategien, Bild-basierte Erkennung wie UiPath es
-  für Legacy-Apps anbietet). Greift ineinander mit dem Object Repository: sind die Selektoren erst
-  zentral, ist eine Fallback-Strategie eine Eigenschaft des Elements statt jeder einzelnen Aktivität.
+  Zusammen mit dem Object Repository (siehe oben) ergäbe das den natürlichen Arbeitsablauf: im Explorer
+  suchen und prüfen, von dort direkt als benanntes Element speichern, statt den Umweg über "Selector
+  prüfen" -> Feld ausfüllen -> "Als Element speichern" zu nehmen.
+- **Selectors robuster machen** (Fallback-Strategien, Bild-basierte Erkennung wie UiPath es für
+  Legacy-Apps anbietet). Das Object Repository (siehe oben) gibt dem jetzt einen natürlichen Ort: eine
+  Fallback-Strategie wäre eine Eigenschaft des dort gespeicherten Elements (z.B. mehrere alternative
+  Selektoren derselben Sache, der Reihe nach versucht) statt eine Eigenschaft jeder einzelnen Aktivität,
+  die es referenziert — noch nicht gebaut.

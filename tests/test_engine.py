@@ -938,8 +938,10 @@ def test_breakpoint_path_for_a_catch_branch():
 
 @pytest.fixture
 def workflows_dir(tmp_path, monkeypatch):
-    """Points name-based workflow lookup at a temp directory."""
+    """Points name-based workflow lookup - and the Object Repository, which
+    lives in the same directory - at a temp directory."""
     monkeypatch.setattr("uiflow.models.WORKFLOWS_DIR", tmp_path)
+    monkeypatch.setattr("uiflow.object_repository.WORKFLOWS_DIR", tmp_path)
     return tmp_path
 
 
@@ -1461,3 +1463,63 @@ def test_breakpoint_shows_globals_only_when_there_are_some():
         workflow, on_breakpoint=on_breakpoint, global_variables={"basis_url": "https://x"}
     )
     assert seen == [{"global": {"basis_url": "https://x"}}]
+
+
+# --- object repository (element references) ---------------------------------
+
+
+def test_element_reference_resolves_to_repository_fields(workflows_dir):
+    from uiflow import object_repository
+
+    object_repository.set_element("MeineApp", "Suchfeld", {"selector": "#search"})
+    workflow = Workflow(name="t", backend="web", steps=[Step("click", {"element": "MeineApp/Suchfeld"})])
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow)
+
+    assert backend.calls == [("click", "#search")]
+
+
+def test_element_reference_fields_override_any_inline_selector_on_the_same_step(workflows_dir):
+    from uiflow import object_repository
+
+    object_repository.set_element("MeineApp", "Suchfeld", {"selector": "#search"})
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[Step("click", {"selector": "#veraltet", "element": "MeineApp/Suchfeld"})],
+    )
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow)
+
+    assert backend.calls == [("click", "#search")]
+
+
+def test_element_reference_to_an_unknown_element_raises_a_clear_step_error(workflows_dir):
+    workflow = Workflow(name="t", backend="web", steps=[Step("click", {"element": "MeineApp/GibtsNicht"})])
+
+    with pytest.raises(StepError) as excinfo:
+        WorkflowEngine(RecordingBackend()).run(workflow)
+
+    assert "MeineApp" in str(excinfo.value)
+    assert "GibtsNicht" in str(excinfo.value)
+
+
+def test_element_reference_without_a_slash_raises_a_clear_step_error(workflows_dir):
+    workflow = Workflow(name="t", backend="web", steps=[Step("click", {"element": "keinslash"})])
+
+    with pytest.raises(StepError):
+        WorkflowEngine(RecordingBackend()).run(workflow)
+
+
+def test_element_reference_supports_a_variable_placeholder_in_the_reference(workflows_dir):
+    from uiflow import object_repository
+
+    object_repository.set_element("MeineApp", "Suchfeld", {"selector": "#search"})
+    workflow = Workflow(name="t", backend="web", steps=[Step("click", {"element": "{var.ref}"})])
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow, variables={"ref": "MeineApp/Suchfeld"})
+
+    assert backend.calls == [("click", "#search")]

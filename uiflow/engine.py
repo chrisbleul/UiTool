@@ -6,6 +6,7 @@ import re
 import time
 from typing import Any, Callable, Optional
 
+from . import object_repository
 from .models import Step, Workflow, load_workflow_by_name, parse_steps
 
 logger = logging.getLogger("uiflow")
@@ -679,11 +680,34 @@ class WorkflowEngine:
             return [self._redact_secrets(v) for v in value]
         return value
 
+    def _resolve_element_reference(self, params: dict[str, Any], step: Step, index: int) -> dict[str, Any]:
+        """Resolves an Object Repository reference (`element: "Scope/Name"`)
+        to the selector fields it names, in place of writing them inline on
+        every step that targets the same element - the one place a UI change
+        needs fixing instead of wherever that element happens to be used.
+        Repository fields replace any inline selector fields on the same step
+        (a step either references a repository element or carries its own
+        selector, not both) - `element` is consumed here and never reaches the
+        backend method itself."""
+        ref = params.pop("element", None)
+        if not ref:
+            return params
+        if "/" not in ref:
+            raise StepError(index, step, ValueError(f"Invalid element reference '{ref}', expected 'Scope/Name'"))
+        scope, name = ref.split("/", 1)
+        fields = object_repository.get_element(scope, name)
+        if fields is None:
+            raise StepError(
+                index, step, ValueError(f"No element '{name}' in scope '{scope}' in the object repository")
+            )
+        return {**params, **fields}
+
     def _run_backend_step(self, step: Step, index: int) -> None:
         handler = getattr(self.backend, step.action, None)
         if not callable(handler):
             raise StepError(index, step, AttributeError(f"Backend has no action '{step.action}'"))
         resolved_params = substitute_variables(step.params, self.variables)
+        resolved_params = self._resolve_element_reference(resolved_params, step, index)
         self._log("[%d] %s(%s)", index, step.action, resolved_params)
         try:
             result = handler(**resolved_params)

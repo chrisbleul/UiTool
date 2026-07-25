@@ -101,7 +101,11 @@ def create_app() -> Flask:
 
     @app.get("/api/workflows")
     def list_workflows() -> Response:
-        names = sorted(p.stem for p in models.WORKFLOWS_DIR.glob("*.yaml"))
+        from ..object_repository import REPOSITORY_FILENAME
+
+        names = sorted(
+            p.stem for p in models.WORKFLOWS_DIR.glob("*.yaml") if p.name != REPOSITORY_FILENAME
+        )
         return jsonify(names)
 
     @app.get("/api/workflows/<name>")
@@ -461,6 +465,34 @@ def create_app() -> Flask:
     def delete_global_route(name: str) -> Response:
         db.delete_global_variable(name)
         return jsonify({"deleted": name})
+
+    @app.get("/api/repository")
+    def list_repository_elements() -> Response:
+        from .. import object_repository
+
+        return jsonify(object_repository.list_elements())
+
+    @app.post("/api/repository")
+    def set_repository_element() -> Response:
+        from .. import object_repository
+
+        data = request.get_json(force=True) or {}
+        scope = (data.get("scope") or "").strip()
+        name = (data.get("name") or "").strip()
+        fields = data.get("fields") or {}
+        if not scope or not name:
+            return jsonify({"error": "scope and name required"}), 400
+        if not isinstance(fields, dict) or not fields:
+            return jsonify({"error": "fields must be a non-empty mapping"}), 400
+        object_repository.set_element(scope, name, fields)
+        return jsonify({"saved": {"scope": scope, "name": name}})
+
+    @app.delete("/api/repository/<scope>/<name>")
+    def delete_repository_element(scope: str, name: str) -> Response:
+        from .. import object_repository
+
+        object_repository.delete_element(scope, name)
+        return jsonify({"deleted": {"scope": scope, "name": name}})
 
     @app.get("/api/schedules")
     def list_schedules() -> Response:
