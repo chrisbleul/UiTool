@@ -12,8 +12,9 @@ def isolated_db(tmp_path, monkeypatch):
 
 @pytest.fixture
 def client(isolated_db, monkeypatch, tmp_path):
-    # one resolver for both the Studio and the engine's run_workflow action
+    # one resolver for the Studio, the engine's run_workflow action, and the object repository
     monkeypatch.setattr("uiflow.models.WORKFLOWS_DIR", tmp_path / "workflows")
+    monkeypatch.setattr("uiflow.object_repository.WORKFLOWS_DIR", tmp_path / "workflows")
     monkeypatch.delenv("UIFLOW_STUDIO_PASSWORD", raising=False)
     app = create_app()
     app.config.update(TESTING=True)
@@ -22,12 +23,32 @@ def client(isolated_db, monkeypatch, tmp_path):
 
 @pytest.fixture
 def protected_client(isolated_db, monkeypatch, tmp_path):
-    # one resolver for both the Studio and the engine's run_workflow action
+    # one resolver for the Studio, the engine's run_workflow action, and the object repository
     monkeypatch.setattr("uiflow.models.WORKFLOWS_DIR", tmp_path / "workflows")
+    monkeypatch.setattr("uiflow.object_repository.WORKFLOWS_DIR", tmp_path / "workflows")
     monkeypatch.setenv("UIFLOW_STUDIO_PASSWORD", "hunter2")
     app = create_app()
     app.config.update(TESTING=True)
     return app.test_client()
+
+
+@pytest.fixture
+def multiuser_app(isolated_db, monkeypatch, tmp_path):
+    from werkzeug.security import generate_password_hash
+
+    monkeypatch.setattr("uiflow.models.WORKFLOWS_DIR", tmp_path / "workflows")
+    monkeypatch.setattr("uiflow.object_repository.WORKFLOWS_DIR", tmp_path / "workflows")
+    monkeypatch.delenv("UIFLOW_STUDIO_PASSWORD", raising=False)
+    db.create_user("admin1", generate_password_hash("adminpass"), "admin")
+    db.create_user("op1", generate_password_hash("oppass"), "operator")
+    db.create_user("view1", generate_password_hash("viewpass"), "viewer")
+    app = create_app()
+    app.config.update(TESTING=True)
+    return app
+
+
+def _login(client, username, password):
+    return client.post("/login", data={"username": username, "password": password})
 
 
 def test_no_password_set_allows_unauthenticated_access(client):
@@ -82,6 +103,141 @@ def test_static_assets_are_reachable_without_auth(protected_client):
     assert res.status_code == 200
 
 
+# --- multi-user RBAC (see db.any_users_exist / studio/app.py's require_login) ---
+
+
+def test_multiuser_mode_blocks_unauthenticated_api_access(multiuser_app):
+    client = multiuser_app.test_client()
+
+    res = client.get("/api/schema")
+
+    assert res.status_code == 401
+
+
+def test_multiuser_login_sets_username_and_role(multiuser_app):
+    client = multiuser_app.test_client()
+
+    res = _login(client, "admin1", "adminpass")
+
+    assert res.status_code == 302 and res.headers["Location"] == "/"
+    me = client.get("/api/me").get_json()
+    assert me == {"username": "admin1", "role": "admin", "multiuser": True}
+
+
+def test_multiuser_login_with_wrong_password_is_rejected(multiuser_app):
+    client = multiuser_app.test_client()
+
+    res = _login(client, "admin1", "wrong")
+
+    assert "/login" in res.headers["Location"]
+    assert client.get("/api/schema").status_code == 401
+
+
+def test_api_me_reports_logged_out_state_in_multiuser_mode(multiuser_app):
+    client = multiuser_app.test_client()
+
+    assert client.get("/api/me").get_json() == {"username": None, "role": None, "multiuser": True}
+
+
+def test_api_me_reports_admin_in_single_user_mode(client):
+    assert client.get("/api/me").get_json() == {"username": None, "role": "admin", "multiuser": False}
+
+
+def test_viewer_can_read_but_not_write(multiuser_app):
+    client = multiuser_app.test_client()
+    _login(client, "view1", "viewpass")
+
+    assert client.get("/api/workflows").status_code == 200
+    res = client.post("/api/workflows/x", json=_workflow("x", "https://a"))
+    assert res.status_code == 403
+
+
+def test_operator_can_write_workflows_but_not_manage_users_or_credentials(multiuser_app):
+    client = multiuser_app.test_client()
+    _login(client, "op1", "oppass")
+
+    assert client.post("/api/workflows/x", json=_workflow("x", "https://a")).status_code == 200
+    assert client.get("/api/users").status_code == 403
+    assert client.post("/api/credentials", json={"name": "x", "value": "y"}).status_code == 403
+    assert client.post("/api/globals", json={"name": "x", "value": "1"}).status_code == 403
+
+
+def test_admin_can_manage_users(multiuser_app):
+    client = multiuser_app.test_client()
+    _login(client, "admin1", "adminpass")
+
+    res = client.post("/api/users", json={"username": "new1", "password": "pw", "role": "viewer"})
+    assert res.status_code == 200
+
+    names = {u["username"] for u in client.get("/api/users").get_json()}
+    assert names == {"admin1", "op1", "view1", "new1"}
+
+    res = client.delete("/api/users/new1")
+    assert res.status_code == 200
+    names = {u["username"] for u in client.get("/api/users").get_json()}
+    assert "new1" not in names
+
+
+def test_new_user_can_log_in_with_the_password_set_by_admin(multiuser_app):
+    admin_client = multiuser_app.test_client()
+    _login(admin_client, "admin1", "adminpass")
+    admin_client.post("/api/users", json={"username": "new1", "password": "pw", "role": "operator"})
+
+    new_client = multiuser_app.test_client()
+    _login(new_client, "new1", "pw")
+
+    assert new_client.get("/api/me").get_json()["role"] == "operator"
+
+
+def test_admin_cannot_demote_their_own_account(multiuser_app):
+    client = multiuser_app.test_client()
+    _login(client, "admin1", "adminpass")
+
+    res = client.patch("/api/users/admin1", json={"role": "viewer"})
+
+    assert res.status_code == 400
+    assert client.get("/api/me").get_json()["role"] == "admin"
+
+
+def test_admin_cannot_delete_their_own_account(multiuser_app):
+    client = multiuser_app.test_client()
+    _login(client, "admin1", "adminpass")
+
+    res = client.delete("/api/users/admin1")
+
+    assert res.status_code == 400
+    assert any(u["username"] == "admin1" for u in client.get("/api/users").get_json())
+
+
+def test_admin_can_update_another_users_role(multiuser_app):
+    client = multiuser_app.test_client()
+    _login(client, "admin1", "adminpass")
+
+    res = client.patch("/api/users/view1", json={"role": "operator"})
+
+    assert res.status_code == 200
+    roles = {u["username"]: u["role"] for u in client.get("/api/users").get_json()}
+    assert roles["view1"] == "operator"
+
+
+def test_create_user_endpoint_rejects_a_duplicate_username(multiuser_app):
+    client = multiuser_app.test_client()
+    _login(client, "admin1", "adminpass")
+
+    res = client.post("/api/users", json={"username": "op1", "password": "pw", "role": "viewer"})
+
+    assert res.status_code == 409
+
+
+def test_create_user_endpoint_rejects_an_unknown_role(multiuser_app):
+    client = multiuser_app.test_client()
+    _login(client, "admin1", "adminpass")
+
+    res = client.post("/api/users", json={"username": "new2", "password": "pw", "role": "superadmin"})
+
+    assert res.status_code == 400
+
+
 def _workflow(name: str, url: str) -> dict:
     return {"name": name, "backend": "web", "steps": [{"action": "navigate", "url": url}]}
 
@@ -102,6 +258,284 @@ def test_api_run_snapshots_referenced_sub_workflows_into_the_job(client):
 
     detail = client.get(f"/api/jobs/{job_id}").get_json()
     assert detail["sub_workflows"]["teilprozess"]["steps"] == [{"action": "navigate", "url": "sub"}]
+
+
+def test_worker_claim_endpoint_claims_the_oldest_queued_job(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+
+    res = client.post("/api/worker/claim", json={"worker_id": "remote-1"})
+
+    assert res.status_code == 200
+    claimed = res.get_json()
+    assert claimed["id"] == job_id
+    assert claimed["status"] == "running"
+    assert claimed["worker_id"] == "remote-1"
+
+
+def test_worker_claim_endpoint_returns_null_when_nothing_queued(client):
+    res = client.post("/api/worker/claim", json={"worker_id": "remote-1"})
+
+    assert res.status_code == 200
+    assert res.get_json() is None
+
+
+def test_worker_add_log_endpoint_persists_a_log_line(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+
+    res = client.post(f"/api/worker/jobs/{job_id}/logs", json={"level": "INFO", "message": "hallo"})
+
+    assert res.status_code == 200
+    logs = client.get(f"/api/jobs/{job_id}/logs").get_json()
+    assert any(log["message"] == "hallo" for log in logs)
+
+
+def test_worker_job_control_endpoint_reports_stop_requested(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+
+    assert client.get(f"/api/worker/jobs/{job_id}/control").get_json() == {"stop_requested": False}
+
+    client.post(f"/api/run/{job_id}/stop")
+
+    assert client.get(f"/api/worker/jobs/{job_id}/control").get_json() == {"stop_requested": True}
+
+
+def test_worker_job_resume_clear_endpoint_consumes_the_resume_flag(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+    db.request_resume(job_id)
+
+    res = client.post(f"/api/worker/jobs/{job_id}/resume_clear")
+    assert res.get_json() == {"resumed": True}
+
+    # a second call finds nothing left to clear - the flag was consumed
+    res = client.post(f"/api/worker/jobs/{job_id}/resume_clear")
+    assert res.get_json() == {"resumed": False}
+
+
+def test_worker_job_pause_endpoint_stores_breakpoint_state(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+
+    res = client.post(
+        f"/api/worker/jobs/{job_id}/pause",
+        json={"index": 1, "action": "click", "variables": {"x": 1}, "path": "1"},
+    )
+
+    assert res.status_code == 200
+    controls = db.get_controls(job_id)
+    assert controls["paused_step_index"] == 1
+    assert controls["paused_step_action"] == "click"
+
+
+def test_worker_job_finish_endpoint_marks_the_job_done(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+
+    res = client.post(f"/api/worker/jobs/{job_id}/finish", json={"status": "error", "error_message": "boom"})
+
+    assert res.status_code == 200
+    detail = client.get(f"/api/jobs/{job_id}").get_json()
+    assert detail["status"] == "error"
+    assert detail["error_message"] == "boom"
+
+
+def test_worker_globals_endpoint_matches_the_studio_globals(client):
+    client.post("/api/globals", json={"name": "basis_url", "value": "https://intern"})
+
+    res = client.get("/api/worker/globals")
+
+    assert res.get_json() == {"basis_url": "https://intern"}
+
+
+def test_worker_queue_by_name_endpoint_returns_the_queue_or_null(client):
+    client.post("/api/queues", json={"name": "rechnungen"})
+
+    found = client.get("/api/worker/queues/by-name?name=rechnungen").get_json()
+    assert found["name"] == "rechnungen"
+
+    missing = client.get("/api/worker/queues/by-name?name=nope").get_json()
+    assert missing is None
+
+
+def test_worker_queue_claim_process_and_release_roundtrip(client):
+    queue_id = client.post("/api/queues", json={"name": "rechnungen"}).get_json()["id"]
+    client.post("/api/queues/rechnungen/items", json={"items": [{"payload": {"betrag": 42}}]})
+
+    item = client.post(f"/api/worker/queues/{queue_id}/claim", json={"locked_by": "job-1"}).get_json()
+    assert item["payload"] == '{"betrag": 42}'
+
+    # nothing else left to claim right now, and nothing awaiting a retry either
+    assert client.post(f"/api/worker/queues/{queue_id}/claim", json={"locked_by": "job-1"}).get_json() is None
+    assert client.get(f"/api/worker/queues/{queue_id}/next_retry_wait").get_json() == {"seconds": None}
+
+    res = client.post(f"/api/worker/queue_items/{item['id']}/complete", json={"success": True, "output": {}})
+    assert res.get_json() == {"status": "success"}
+
+
+def test_worker_queue_item_release_endpoint_hands_it_back_unprocessed(client):
+    queue_id = client.post("/api/queues", json={"name": "rechnungen"}).get_json()["id"]
+    client.post("/api/queues/rechnungen/items", json={"items": [{"payload": {}}]})
+    item = client.post(f"/api/worker/queues/{queue_id}/claim", json={"locked_by": "job-1"}).get_json()
+
+    res = client.post(f"/api/worker/queue_items/{item['id']}/release")
+
+    assert res.status_code == 200
+    items = client.get("/api/queues/rechnungen/items").get_json()
+    assert items[0]["status"] == "new"
+
+
+def test_worker_queue_item_complete_endpoint_marks_a_business_error_permanent(client):
+    queue_id = client.post("/api/queues", json={"name": "rechnungen"}).get_json()["id"]
+    client.post("/api/queues/rechnungen/items", json={"items": [{"payload": {}}]})
+    item = client.post(f"/api/worker/queues/{queue_id}/claim", json={"locked_by": "job-1"}).get_json()
+
+    res = client.post(
+        f"/api/worker/queue_items/{item['id']}/complete",
+        json={"success": False, "error_message": "ungueltig", "permanent": True},
+    )
+
+    assert res.get_json() == {"status": "failed"}
+    items = client.get("/api/queues/rechnungen/items").get_json()
+    assert items[0]["status"] == "failed"
+    assert items[0]["retry_count"] == 0  # a permanent failure must not consume a retry
+
+
+def test_worker_api_requires_at_least_operator_in_multiuser_mode(multiuser_app):
+    viewer = multiuser_app.test_client()
+    _login(viewer, "view1", "viewpass")
+    assert viewer.post("/api/worker/claim", json={"worker_id": "w"}).status_code == 403
+
+    operator = multiuser_app.test_client()
+    _login(operator, "op1", "oppass")
+    assert operator.post("/api/worker/claim", json={"worker_id": "w"}).status_code == 200
+
+
+def test_inspect_web_endpoint_reports_match_count(client, monkeypatch):
+    monkeypatch.setattr(
+        "uiflow.studio.picker.inspect_web_selector",
+        lambda url, selector: {"count": 2, "matches": [{"tag": "button", "text": "Absenden", "visible": True}]},
+    )
+
+    res = client.post("/api/inspect/web", json={"url": "https://example.com", "selector": "button"})
+
+    assert res.status_code == 200
+    data = res.get_json()
+    assert data["ok"] is True
+    assert data["count"] == 2
+
+
+def test_inspect_web_endpoint_requires_url_and_selector(client):
+    res = client.post("/api/inspect/web", json={"url": "https://example.com"})
+
+    assert res.status_code == 400
+    assert res.get_json()["ok"] is False
+
+
+def test_inspect_web_endpoint_reports_a_value_error_as_a_400(client, monkeypatch):
+    def raise_value_error(url, selector):
+        raise ValueError("Ungültiger Selector: boom")
+
+    monkeypatch.setattr("uiflow.studio.picker.inspect_web_selector", raise_value_error)
+
+    res = client.post("/api/inspect/web", json={"url": "https://example.com", "selector": "$bad"})
+
+    assert res.status_code == 400
+    assert "Ungültiger Selector" in res.get_json()["error"]
+
+
+def test_inspect_desktop_endpoint_reports_match_count(client, monkeypatch):
+    captured = {}
+
+    def fake_inspect(**kwargs):
+        captured.update(kwargs)
+        return {"count": 1, "matches": [{"control_type": "Button", "title": "OK", "auto_id": "btnOK"}]}
+
+    monkeypatch.setattr("uiflow.studio.picker.inspect_desktop_selector", fake_inspect)
+
+    res = client.post(
+        "/api/inspect/desktop",
+        json={"focus_title": "Editor", "selector": {"control_type": "Button", "title": ""}},
+    )
+
+    assert res.status_code == 200
+    data = res.get_json()
+    assert data["ok"] is True
+    assert data["count"] == 1
+    assert captured == {"focus_title": "Editor", "focus_path": None, "control_type": "Button"}
+
+
+def test_inspect_desktop_endpoint_requires_a_focus_title_or_path(client):
+    res = client.post("/api/inspect/desktop", json={"selector": {"control_type": "Button"}})
+
+    assert res.status_code == 400
+    assert res.get_json()["ok"] is False
+
+
+def test_inspect_desktop_endpoint_reports_a_value_error_as_a_400(client, monkeypatch):
+    def raise_value_error(**kwargs):
+        raise ValueError("Anwendung nicht erreichbar")
+
+    monkeypatch.setattr("uiflow.studio.picker.inspect_desktop_selector", raise_value_error)
+
+    res = client.post("/api/inspect/desktop", json={"focus_title": "Editor", "selector": {}})
+
+    assert res.status_code == 400
+    assert "Anwendung nicht erreichbar" in res.get_json()["error"]
+
+
+def test_repository_endpoints_add_list_and_delete_an_element(client):
+    res = client.post(
+        "/api/repository",
+        json={"scope": "MeineApp", "name": "Suchfeld", "fields": {"selector": "#search"}},
+    )
+    assert res.status_code == 200
+
+    entries = client.get("/api/repository").get_json()
+    assert entries == [
+        {
+            "scope": "MeineApp",
+            "name": "Suchfeld",
+            "fields": {"selector": "#search"},
+            "candidates": [{"selector": "#search"}],
+        }
+    ]
+
+    res = client.delete("/api/repository/MeineApp/Suchfeld")
+    assert res.status_code == 200
+    assert client.get("/api/repository").get_json() == []
+
+
+def test_repository_fallback_endpoint_appends_a_candidate(client):
+    client.post("/api/repository", json={"scope": "MeineApp", "name": "Suchfeld", "fields": {"selector": "#a"}})
+
+    res = client.post("/api/repository/MeineApp/Suchfeld/fallback", json={"fields": {"selector": "#b"}})
+
+    assert res.status_code == 200
+    assert res.get_json()["candidates"] == [{"selector": "#a"}, {"selector": "#b"}]
+    entries = client.get("/api/repository").get_json()
+    assert entries[0]["candidates"] == [{"selector": "#a"}, {"selector": "#b"}]
+
+
+def test_repository_fallback_endpoint_requires_non_empty_fields(client):
+    client.post("/api/repository", json={"scope": "MeineApp", "name": "Suchfeld", "fields": {"selector": "#a"}})
+
+    res = client.post("/api/repository/MeineApp/Suchfeld/fallback", json={"fields": {}})
+
+    assert res.status_code == 400
+
+
+def test_repository_endpoint_requires_scope_name_and_fields(client):
+    res = client.post("/api/repository", json={"scope": "MeineApp", "name": "", "fields": {"selector": "#x"}})
+    assert res.status_code == 400
+
+    res = client.post("/api/repository", json={"scope": "MeineApp", "name": "Feld", "fields": {}})
+    assert res.status_code == 400
+
+
+def test_repository_file_is_excluded_from_the_workflow_list(client):
+    client.post("/api/repository", json={"scope": "A", "name": "B", "fields": {"selector": "#x"}})
+    client.post("/api/workflows/echt", json={"name": "echt", "backend": "web", "steps": []})
+
+    names = client.get("/api/workflows").get_json()
+
+    assert names == ["echt"]
 
 
 def test_saving_over_an_existing_workflow_is_refused_when_overwrite_is_false(client):

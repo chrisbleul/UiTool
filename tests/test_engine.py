@@ -2,7 +2,7 @@ import logging
 
 import pytest
 
-from uiflow.engine import StepError, WorkflowCancelled, WorkflowEngine, substitute_variables
+from uiflow.engine import BusinessError, StepError, WorkflowCancelled, WorkflowEngine, substitute_variables
 from uiflow.models import Step, Workflow
 
 
@@ -938,8 +938,10 @@ def test_breakpoint_path_for_a_catch_branch():
 
 @pytest.fixture
 def workflows_dir(tmp_path, monkeypatch):
-    """Points name-based workflow lookup at a temp directory."""
+    """Points name-based workflow lookup - and the Object Repository, which
+    lives in the same directory - at a temp directory."""
     monkeypatch.setattr("uiflow.models.WORKFLOWS_DIR", tmp_path)
+    monkeypatch.setattr("uiflow.object_repository.WORKFLOWS_DIR", tmp_path)
     return tmp_path
 
 
@@ -1461,3 +1463,255 @@ def test_breakpoint_shows_globals_only_when_there_are_some():
         workflow, on_breakpoint=on_breakpoint, global_variables={"basis_url": "https://x"}
     )
     assert seen == [{"global": {"basis_url": "https://x"}}]
+
+
+# --- object repository (element references) ---------------------------------
+
+
+def test_element_reference_resolves_to_repository_fields(workflows_dir):
+    from uiflow import object_repository
+
+    object_repository.set_element("MeineApp", "Suchfeld", {"selector": "#search"})
+    workflow = Workflow(name="t", backend="web", steps=[Step("click", {"element": "MeineApp/Suchfeld"})])
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow)
+
+    assert backend.calls == [("click", "#search")]
+
+
+def test_element_reference_fields_override_any_inline_selector_on_the_same_step(workflows_dir):
+    from uiflow import object_repository
+
+    object_repository.set_element("MeineApp", "Suchfeld", {"selector": "#search"})
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[Step("click", {"selector": "#veraltet", "element": "MeineApp/Suchfeld"})],
+    )
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow)
+
+    assert backend.calls == [("click", "#search")]
+
+
+def test_element_reference_to_an_unknown_element_raises_a_clear_step_error(workflows_dir):
+    workflow = Workflow(name="t", backend="web", steps=[Step("click", {"element": "MeineApp/GibtsNicht"})])
+
+    with pytest.raises(StepError) as excinfo:
+        WorkflowEngine(RecordingBackend()).run(workflow)
+
+    assert "MeineApp" in str(excinfo.value)
+    assert "GibtsNicht" in str(excinfo.value)
+
+
+def test_element_reference_without_a_slash_raises_a_clear_step_error(workflows_dir):
+    workflow = Workflow(name="t", backend="web", steps=[Step("click", {"element": "keinslash"})])
+
+    with pytest.raises(StepError):
+        WorkflowEngine(RecordingBackend()).run(workflow)
+
+
+def test_element_reference_supports_a_variable_placeholder_in_the_reference(workflows_dir):
+    from uiflow import object_repository
+
+    object_repository.set_element("MeineApp", "Suchfeld", {"selector": "#search"})
+    workflow = Workflow(name="t", backend="web", steps=[Step("click", {"element": "{var.ref}"})])
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow, variables={"ref": "MeineApp/Suchfeld"})
+
+    assert backend.calls == [("click", "#search")]
+
+
+class _ExistsAwareBackend:
+    """A RecordingBackend that also answers element_exists(), for testing
+    fallback-candidate selection - only the selectors in `existing` are
+    reported as present."""
+
+    def __init__(self, existing):
+        self.calls = []
+        self._existing = existing
+
+    def click(self, selector):
+        self.calls.append(("click", selector))
+
+    def element_exists(self, selector):
+        return selector in self._existing
+
+
+def test_element_reference_tries_fallback_candidates_in_order(workflows_dir):
+    from uiflow import object_repository
+
+    object_repository.set_element("MeineApp", "Suchfeld", {"selector": "#alt-1"})
+    object_repository.add_fallback("MeineApp", "Suchfeld", {"selector": "#alt-2"})
+    object_repository.add_fallback("MeineApp", "Suchfeld", {"selector": "#alt-3"})
+    workflow = Workflow(name="t", backend="web", steps=[Step("click", {"element": "MeineApp/Suchfeld"})])
+    # Only the second candidate currently matches - the engine must skip the
+    # first (absent) and use it instead of just taking the first one blindly.
+    backend = _ExistsAwareBackend(existing={"#alt-2"})
+
+    WorkflowEngine(backend).run(workflow)
+
+    assert backend.calls == [("click", "#alt-2")]
+
+
+def test_element_reference_falls_back_to_the_first_candidate_when_none_match(workflows_dir):
+    from uiflow import object_repository
+
+    object_repository.set_element("MeineApp", "Suchfeld", {"selector": "#alt-1"})
+    object_repository.add_fallback("MeineApp", "Suchfeld", {"selector": "#alt-2"})
+    workflow = Workflow(name="t", backend="web", steps=[Step("click", {"element": "MeineApp/Suchfeld"})])
+    backend = _ExistsAwareBackend(existing=set())  # nothing currently matches
+
+    WorkflowEngine(backend).run(workflow)
+
+    # Falls through to the first candidate so the real click still runs (and
+    # would raise its own normal "not found" error), instead of silently
+    # skipping the step because no fallback matched.
+    assert backend.calls == [("click", "#alt-1")]
+
+
+def test_element_reference_uses_the_first_candidate_when_backend_cannot_check_existence(workflows_dir):
+    from uiflow import object_repository
+
+    object_repository.set_element("MeineApp", "Suchfeld", {"selector": "#alt-1"})
+    object_repository.add_fallback("MeineApp", "Suchfeld", {"selector": "#alt-2"})
+    workflow = Workflow(name="t", backend="web", steps=[Step("click", {"element": "MeineApp/Suchfeld"})])
+    backend = RecordingBackend()  # no element_exists method at all
+
+    WorkflowEngine(backend).run(workflow)
+
+    assert backend.calls == [("click", "#alt-1")]
+
+
+# --- fail (business vs. technical errors) ------------------------------------
+
+
+def test_fail_with_type_business_raises_business_error_not_step_error():
+    workflow = Workflow(
+        name="t", backend="web", steps=[Step("fail", {"message": "Ungültige Rechnung", "type": "business"})]
+    )
+
+    with pytest.raises(BusinessError) as excinfo:
+        WorkflowEngine(RecordingBackend()).run(workflow)
+
+    assert "Ungültige Rechnung" in str(excinfo.value)
+
+
+def test_fail_with_type_technical_raises_a_normal_step_error():
+    workflow = Workflow(
+        name="t", backend="web", steps=[Step("fail", {"message": "Timeout", "type": "technical"})]
+    )
+
+    with pytest.raises(StepError) as excinfo:
+        WorkflowEngine(RecordingBackend()).run(workflow)
+
+    assert "Timeout" in str(excinfo.value)
+
+
+def test_fail_defaults_to_technical_when_type_is_omitted():
+    workflow = Workflow(name="t", backend="web", steps=[Step("fail", {"message": "x"})])
+
+    with pytest.raises(StepError):
+        WorkflowEngine(RecordingBackend()).run(workflow)
+
+
+def test_fail_rejects_an_unknown_type():
+    workflow = Workflow(name="t", backend="web", steps=[Step("fail", {"message": "x", "type": "oops"})])
+
+    with pytest.raises(StepError):
+        WorkflowEngine(RecordingBackend()).run(workflow)
+
+
+def test_fail_message_substitutes_variables():
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[Step("fail", {"message": "Betrag {var.betrag} ungültig", "type": "business"})],
+    )
+
+    with pytest.raises(BusinessError) as excinfo:
+        WorkflowEngine(RecordingBackend()).run(workflow, variables={"betrag": -5})
+
+    assert "Betrag -5 ungültig" in str(excinfo.value)
+
+
+def test_try_catches_a_business_fail_like_any_other_error():
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[
+            Step(
+                "try",
+                {
+                    "steps": [{"action": "fail", "message": "ungültig", "type": "business"}],
+                    "catch": [{"action": "navigate", "url": "recovered"}],
+                    "error_var": "err",
+                },
+            )
+        ],
+    )
+    backend = RecordingBackend()
+    engine = WorkflowEngine(backend)
+
+    engine.run(workflow)
+
+    assert backend.calls == [("navigate", "recovered")]
+    assert "ungültig" in engine.variables["err"]
+
+
+def _load_shipped_workflow(name: str) -> Workflow:
+    """Loads a workflow shipped in the repo's own workflows/ directory - by
+    path relative to this test file, not the current working directory, so
+    the test doesn't depend on where pytest happens to be invoked from."""
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parent.parent
+    return Workflow.load(repo_root / "workflows" / name)
+
+
+def test_shipped_reframework_example_validates_business_rules_before_the_try_block():
+    workflow = _load_shipped_workflow("beispiel_reframework.yaml")
+    backend = RecordingBackend()
+
+    with pytest.raises(BusinessError):
+        WorkflowEngine(backend).run(
+            workflow,
+            variables={"item": {"betrag": -5, "rechnungsnummer": "R1"}},
+            global_variables={"basis_url": "https://erp.example.com"},
+        )
+
+    # the business check ran before the automation - the try block never started
+    assert backend.calls == [("navigate", "https://erp.example.com/anmelden")]
+
+
+def test_shipped_reframework_example_re_raises_a_technical_failure_after_the_catch_block():
+    class _FailingBackend:
+        def __init__(self):
+            self.calls = []
+
+        def navigate(self, url):
+            self.calls.append(("navigate", url))
+            if "rechnung" in url:
+                raise RuntimeError("Seite nicht erreichbar")
+
+        def screenshot(self, path):
+            self.calls.append(("screenshot", path))
+
+    workflow = _load_shipped_workflow("beispiel_reframework.yaml")
+    backend = _FailingBackend()
+
+    with pytest.raises(StepError) as excinfo:
+        WorkflowEngine(backend).run(
+            workflow,
+            variables={"item": {"betrag": 500, "rechnungsnummer": "R1"}},
+            global_variables={"basis_url": "https://erp.example.com"},
+        )
+
+    # the catch block ran (screenshot taken) before the error was re-raised as
+    # technical - a queue-driven job must still see this as a normal, retryable
+    # failure, not a silently swallowed one.
+    assert ("screenshot", "fehler_R1.png") in backend.calls
+    assert "Seite nicht erreichbar" in str(excinfo.value)

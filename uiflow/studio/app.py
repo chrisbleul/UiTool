@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from flask import Flask, Response, jsonify, redirect, request, send_from_directory, session
+from werkzeug.security import check_password_hash
 
 from .. import models
 from ..models import Workflow, resolve_sub_workflows
@@ -23,6 +24,29 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 # called either would be unreachable as {global.item} resolves against the
 # namespace, not the value (see engine.py's _NAMESPACE_KEYS).
 _RESERVED_GLOBAL_NAMES = ("global", "item", "var")
+
+# Multi-user RBAC (see require_login/db.any_users_exist): viewer < operator <
+# admin. Only consulted once at least one user account exists - the default,
+# frictionless single-user mode has no notion of roles at all.
+_ROLE_ORDER = {"viewer": 0, "operator": 1, "admin": 2}
+
+
+def _required_role(method: str, path: str) -> str:
+    """Minimum role a request needs, once multi-user mode is active.
+    Installation-wide, sensitive configuration (accounts, credentials, global
+    variables) is admin-only; any other state-changing request needs at least
+    "operator"; a plain read (GET) only needs to be logged in at all
+    ("viewer")."""
+    if path.startswith("/api/users") or path.startswith("/api/credentials") or path.startswith("/api/globals"):
+        return "admin"
+    if path.startswith("/api/worker/"):
+        # A remote worker executes workflows and reads global variables via
+        # this namespace (see remote_store.RemoteStore) - operational access,
+        # not a plain read, regardless of HTTP method.
+        return "operator"
+    if method == "GET":
+        return "viewer"
+    return "operator"
 
 # One entry per in-flight recording session (unaffected by the orchestrator -
 # a recording is a live interactive picking session tied to one browser tab,
@@ -44,18 +68,33 @@ def create_app() -> Flask:
     db.init_db()
 
     # Login is entirely opt-in: this Studio is a local single-user MVP tool by
-    # default (zero friction, matching every earlier session), and a real
-    # multi-user/RBAC system is out of scope here. Setting UIFLOW_STUDIO_PASSWORD
-    # adds a single shared-password gate in front of it - e.g. for the case
-    # where the Studio is bound to a non-loopback host and reachable by others.
+    # default (zero friction, matching every earlier session). Setting
+    # UIFLOW_STUDIO_PASSWORD adds a single shared-password gate in front of it -
+    # e.g. for the case where the Studio is bound to a non-loopback host and
+    # reachable by others. The moment `uiflow create-user` has created at least
+    # one account (db.any_users_exist), per-account login and role checks
+    # (_required_role/_ROLE_ORDER) take over from *both* of the above - a real
+    # multi-user/RBAC system, opted into the same way credentials/globals are:
+    # by using the feature, not by an env var toggle.
     studio_password = os.environ.get("UIFLOW_STUDIO_PASSWORD")
     app.secret_key = os.environ.get("UIFLOW_STUDIO_SECRET_KEY") or secrets.token_hex(32)
 
     @app.before_request
     def require_login() -> Response | None:
-        if not studio_password:
+        if request.path in ("/login", "/logout", "/api/me") or request.path.startswith("/static/"):
             return None
-        if request.path in ("/login", "/logout") or request.path.startswith("/static/"):
+        if db.any_users_exist():
+            username = session.get("username")
+            if not username:
+                if request.path.startswith("/api/"):
+                    return jsonify({"error": "unauthenticated"}), 401
+                return redirect("/login")
+            role = session.get("role", "viewer")
+            required = _required_role(request.method, request.path)
+            if _ROLE_ORDER.get(role, -1) < _ROLE_ORDER[required]:
+                return jsonify({"error": "forbidden"}), 403
+            return None
+        if not studio_password:
             return None
         if session.get("authenticated"):
             return None
@@ -70,6 +109,14 @@ def create_app() -> Flask:
     @app.post("/login")
     def login_submit() -> Response:
         data = request.form or request.get_json(silent=True) or {}
+        if db.any_users_exist():
+            username = (data.get("username") or "").strip()
+            user = db.get_user(username)
+            if user and check_password_hash(user["password_hash"], data.get("password", "")):
+                session["username"] = username
+                session["role"] = user["role"]
+                return redirect("/")
+            return redirect("/login?error=1")
         if studio_password and secrets.compare_digest(data.get("password", ""), studio_password):
             session["authenticated"] = True
             return redirect("/")
@@ -78,7 +125,17 @@ def create_app() -> Flask:
     @app.post("/logout")
     def logout() -> Response:
         session.pop("authenticated", None)
-        return redirect("/login" if studio_password else "/")
+        session.pop("username", None)
+        session.pop("role", None)
+        return redirect("/login" if (studio_password or db.any_users_exist()) else "/")
+
+    @app.get("/api/me")
+    def whoami() -> Response:
+        if db.any_users_exist():
+            username = session.get("username")
+            return jsonify({"username": username, "role": session.get("role") if username else None, "multiuser": True})
+        logged_in = (not studio_password) or bool(session.get("authenticated"))
+        return jsonify({"username": None, "role": "admin" if logged_in else None, "multiuser": False})
 
     @app.get("/")
     def index() -> Response:
@@ -101,7 +158,11 @@ def create_app() -> Flask:
 
     @app.get("/api/workflows")
     def list_workflows() -> Response:
-        names = sorted(p.stem for p in models.WORKFLOWS_DIR.glob("*.yaml"))
+        from ..object_repository import REPOSITORY_FILENAME
+
+        names = sorted(
+            p.stem for p in models.WORKFLOWS_DIR.glob("*.yaml") if p.name != REPOSITORY_FILENAME
+        )
         return jsonify(names)
 
     @app.get("/api/workflows/<name>")
@@ -230,6 +291,86 @@ def create_app() -> Flask:
             return jsonify({"error": "not found"}), 404
         return jsonify(db.get_logs(job_id))
 
+    # --- remote worker API (see orchestrator/remote_store.py) ---------------
+    #
+    # Mirrors, one HTTP call each, the exact subset of orchestrator/db.py that
+    # orchestrator/worker.py calls on its `store` parameter - so a worker
+    # process with no filesystem access to orchestrator.db (a different
+    # machine than this Studio server) can still claim jobs/queue items, log,
+    # report breakpoints, and finish work, via RemoteStore instead of direct
+    # imports of this module. Requires "operator" (see _required_role); a
+    # remote worker authenticates the same way any other client does - see
+    # RemoteStore.login - by logging in first and keeping the session cookie.
+
+    @app.post("/api/worker/claim")
+    def worker_claim_job() -> Response:
+        data = request.get_json(force=True)
+        return jsonify(db.claim_next_job(data["worker_id"]))
+
+    @app.post("/api/worker/jobs/<job_id>/logs")
+    def worker_add_log(job_id: str) -> Response:
+        data = request.get_json(force=True)
+        db.add_log(job_id, data["level"], data["message"])
+        return jsonify({"ok": True})
+
+    @app.get("/api/worker/jobs/<job_id>/control")
+    def worker_job_control(job_id: str) -> Response:
+        return jsonify({"stop_requested": db.is_stop_requested(job_id)})
+
+    @app.post("/api/worker/jobs/<job_id>/resume_clear")
+    def worker_job_resume_clear(job_id: str) -> Response:
+        return jsonify({"resumed": db.wait_and_clear_resume(job_id)})
+
+    @app.post("/api/worker/jobs/<job_id>/pause")
+    def worker_job_pause(job_id: str) -> Response:
+        data = request.get_json(force=True)
+        db.set_paused(job_id, data.get("index"), data.get("action"), data.get("variables"), data.get("path"))
+        return jsonify({"ok": True})
+
+    @app.post("/api/worker/jobs/<job_id>/finish")
+    def worker_job_finish(job_id: str) -> Response:
+        data = request.get_json(force=True)
+        db.finish_job(job_id, data["status"], data.get("error_message"))
+        return jsonify({"ok": True})
+
+    @app.get("/api/worker/globals")
+    def worker_globals() -> Response:
+        return jsonify(db.get_global_variables())
+
+    @app.get("/api/worker/queues/by-name")
+    def worker_get_queue_by_name() -> Response:
+        # null (not 404) when missing, like /api/worker/claim's "no job queued" -
+        # this mirrors db.get_queue_by_name's own contract exactly, since
+        # worker.py's _run_queue_driven only checks `queue is None`, never a
+        # status code.
+        return jsonify(db.get_queue_by_name(request.args.get("name", "")))
+
+    @app.post("/api/worker/queues/<int:queue_id>/claim")
+    def worker_claim_queue_item(queue_id: int) -> Response:
+        data = request.get_json(force=True)
+        return jsonify(db.claim_next_queue_item(queue_id, data["locked_by"]))
+
+    @app.get("/api/worker/queues/<int:queue_id>/next_retry_wait")
+    def worker_next_retry_wait(queue_id: int) -> Response:
+        return jsonify({"seconds": db.seconds_until_next_retry(queue_id)})
+
+    @app.post("/api/worker/queue_items/<int:item_id>/complete")
+    def worker_complete_queue_item(item_id: int) -> Response:
+        data = request.get_json(force=True)
+        status = db.complete_queue_item(
+            item_id,
+            data["success"],
+            output=data.get("output"),
+            error_message=data.get("error_message"),
+            permanent=data.get("permanent", False),
+        )
+        return jsonify({"status": status})
+
+    @app.post("/api/worker/queue_items/<int:item_id>/release")
+    def worker_release_queue_item(item_id: int) -> Response:
+        db.release_queue_item(item_id)
+        return jsonify({"ok": True})
+
     @app.post("/api/queues")
     def create_queue() -> Response:
         data = request.get_json(force=True)
@@ -315,6 +456,41 @@ def create_app() -> Flask:
         except Exception as exc:  # noqa: BLE001 - surface any picker failure to the UI
             return jsonify({"ok": False, "error": str(exc)}), 500
 
+    @app.post("/api/inspect/web")
+    def inspect_web() -> Response:
+        data = request.get_json(force=True) or {}
+        url = data.get("url")
+        selector = data.get("selector")
+        if not url or not selector:
+            return jsonify({"ok": False, "error": "url and selector required"}), 400
+        from .picker import inspect_web_selector
+
+        try:
+            result = inspect_web_selector(url, selector)
+            return jsonify({"ok": True, **result})
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001 - surface any picker failure to the UI
+            return jsonify({"ok": False, "error": str(exc)}), 500
+
+    @app.post("/api/inspect/desktop")
+    def inspect_desktop() -> Response:
+        data = request.get_json(force=True) or {}
+        focus_title = data.get("focus_title")
+        focus_path = data.get("focus_path")
+        selector = {k: v for k, v in (data.get("selector") or {}).items() if v not in (None, "")}
+        if not focus_title and not focus_path:
+            return jsonify({"ok": False, "error": "focus_title or focus_path required"}), 400
+        from .picker import inspect_desktop_selector
+
+        try:
+            result = inspect_desktop_selector(focus_title=focus_title, focus_path=focus_path, **selector)
+            return jsonify({"ok": True, **result})
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001 - surface any picker failure to the UI
+            return jsonify({"ok": False, "error": str(exc)}), 500
+
     @app.post("/api/pick/desktop")
     def pick_desktop() -> Response:
         data = request.get_json(silent=True) or {}
@@ -382,6 +558,54 @@ def create_app() -> Flask:
 
         return Response(generate(), mimetype="text/event-stream")
 
+    @app.get("/api/users")
+    def list_users_route() -> Response:
+        return jsonify(db.list_users())
+
+    @app.post("/api/users")
+    def create_user_route() -> Response:
+        from werkzeug.security import generate_password_hash
+
+        data = request.get_json(force=True) or {}
+        username = (data.get("username") or "").strip()
+        password = data.get("password") or ""
+        role = data.get("role") or "viewer"
+        if not username or not password:
+            return jsonify({"error": "username and password required"}), 400
+        if role not in db.VALID_ROLES:
+            return jsonify({"error": f"role must be one of {db.VALID_ROLES}"}), 400
+        if db.get_user(username):
+            return jsonify({"error": f"User '{username}' existiert bereits"}), 409
+        db.create_user(username, generate_password_hash(password), role)
+        return jsonify({"created": username, "role": role})
+
+    @app.patch("/api/users/<username>")
+    def update_user_route(username: str) -> Response:
+        data = request.get_json(force=True) or {}
+        if not db.get_user(username):
+            return jsonify({"error": "not found"}), 404
+        if "role" in data:
+            if data["role"] not in db.VALID_ROLES:
+                return jsonify({"error": f"role must be one of {db.VALID_ROLES}"}), 400
+            if username == session.get("username") and data["role"] != "admin":
+                # Refused, not just discouraged: an admin demoting themselves
+                # could leave the installation with no admin account left to
+                # undo it, locking everyone out of user management for good.
+                return jsonify({"error": "Kann die eigene Admin-Rolle nicht selbst herabstufen"}), 400
+            db.set_user_role(username, data["role"])
+        if data.get("password"):
+            from werkzeug.security import generate_password_hash
+
+            db.set_user_password(username, generate_password_hash(data["password"]))
+        return jsonify({"updated": username})
+
+    @app.delete("/api/users/<username>")
+    def delete_user_route(username: str) -> Response:
+        if username == session.get("username"):
+            return jsonify({"error": "Kann den eigenen Account nicht selbst löschen"}), 400
+        db.delete_user(username)
+        return jsonify({"deleted": username})
+
     @app.get("/api/credentials")
     def list_credentials() -> Response:
         return jsonify(db.list_credential_names())
@@ -444,6 +668,46 @@ def create_app() -> Flask:
     def delete_global_route(name: str) -> Response:
         db.delete_global_variable(name)
         return jsonify({"deleted": name})
+
+    @app.get("/api/repository")
+    def list_repository_elements() -> Response:
+        from .. import object_repository
+
+        return jsonify(object_repository.list_elements())
+
+    @app.post("/api/repository")
+    def set_repository_element() -> Response:
+        from .. import object_repository
+
+        data = request.get_json(force=True) or {}
+        scope = (data.get("scope") or "").strip()
+        name = (data.get("name") or "").strip()
+        fields = data.get("fields") or {}
+        if not scope or not name:
+            return jsonify({"error": "scope and name required"}), 400
+        if not isinstance(fields, dict) or not fields:
+            return jsonify({"error": "fields must be a non-empty mapping"}), 400
+        object_repository.set_element(scope, name, fields)
+        return jsonify({"saved": {"scope": scope, "name": name}})
+
+    @app.delete("/api/repository/<scope>/<name>")
+    def delete_repository_element(scope: str, name: str) -> Response:
+        from .. import object_repository
+
+        object_repository.delete_element(scope, name)
+        return jsonify({"deleted": {"scope": scope, "name": name}})
+
+    @app.post("/api/repository/<scope>/<name>/fallback")
+    def add_repository_fallback(scope: str, name: str) -> Response:
+        from .. import object_repository
+
+        data = request.get_json(force=True) or {}
+        fields = data.get("fields") or {}
+        if not isinstance(fields, dict) or not fields:
+            return jsonify({"error": "fields must be a non-empty mapping"}), 400
+        object_repository.add_fallback(scope, name, fields)
+        candidates = object_repository.get_element_candidates(scope, name)
+        return jsonify({"saved": {"scope": scope, "name": name}, "candidates": candidates})
 
     @app.get("/api/schedules")
     def list_schedules() -> Response:

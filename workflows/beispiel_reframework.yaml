@@ -1,0 +1,26 @@
+name: Beispiel REFramework - Rechnungen verarbeiten
+backend: web
+variables:
+  max_betrag: 10000
+steps:
+- action: navigate
+  url: '{global.basis_url}/anmelden'
+- action: if
+  condition: item['betrag'] <= 0 or item['betrag'] > max_betrag
+  then:
+  - action: fail
+    message: 'Rechnung {item.rechnungsnummer}: Betrag außerhalb des zulässigen Bereichs'
+    type: business
+- action: try
+  steps:
+  - action: navigate
+    url: '{global.basis_url}/rechnung/{item.rechnungsnummer}'
+  - action: click
+    selector: '#buchen'
+  catch:
+  - action: screenshot
+    path: 'fehler_{item.rechnungsnummer}.png'
+  - action: fail
+    message: '{var.fehler}'
+    type: technical
+  error_var: fehler

@@ -60,6 +60,16 @@ _CONTROL_FLOW_AND_VARIABLES: dict[str, list[dict]] = {
         {"name": "catch", "label": "Bei Fehler", "type": "steps", "required": False},
         {"name": "error_var", "label": "Fehlermeldung speichern als (optional)", "type": "variable", "required": False},
     ],
+    "fail": [
+        {"name": "message", "label": "Meldung", "type": "text", "required": True},
+        {
+            "name": "type",
+            "label": "Art (fachlich wird nie wiederholt, technisch wie gewohnt)",
+            "type": "select",
+            "options": ["technical", "business"],
+            "required": False,
+        },
+    ],
     "run_workflow": [
         {"name": "workflow", "label": "Workflow", "type": "workflow", "required": True},
         {
@@ -302,21 +312,21 @@ ACTION_META: dict[str, dict] = {
         "category": "UI-Interaktion",
         "description": "Klickt das angegebene Element an.",
         "keywords": ["maus", "button", "schaltfläche", "drücken", "rechtsklick"],
-        "primary": ["selector", "title", "auto_id"],
+        "primary": ["element", "selector", "title", "auto_id"],
     },
     "drag": {
         "label": "Ziehen (Drag & Drop)",
         "category": "UI-Interaktion",
         "description": "Zieht das angegebene Element per Maus an eine Bildschirmposition.",
         "keywords": ["drag", "ziehen", "verschieben", "drop"],
-        "primary": ["title", "auto_id"],
+        "primary": ["element", "title", "auto_id"],
     },
     "scroll": {
         "label": "Scrollen",
         "category": "UI-Interaktion",
         "description": "Bewegt das Mausrad über dem angegebenen Element.",
         "keywords": ["scrollen", "mausrad", "wheel", "runter", "hoch"],
-        "primary": ["title", "auto_id"],
+        "primary": ["element", "title", "auto_id"],
     },
     "type": {
         "label": "Text eingeben",
@@ -330,7 +340,7 @@ ACTION_META: dict[str, dict] = {
         "category": "UI-Interaktion",
         "description": "Liest den Text eines Elements in eine Variable.",
         "keywords": ["lesen", "auslesen", "scrapen", "inhalt"],
-        "primary": ["selector", "title", "auto_id"],
+        "primary": ["element", "selector", "title", "auto_id"],
     },
     "send_hotkey": {
         "label": "Tastenkombination senden",
@@ -358,14 +368,14 @@ ACTION_META: dict[str, dict] = {
         "category": "Warten",
         "description": "Wartet, bis ein Element auf der Seite erscheint.",
         "keywords": ["laden", "erscheinen", "timeout", "sichtbar"],
-        "primary": ["selector"],
+        "primary": ["element", "selector"],
     },
     "wait_for_element": {
         "label": "Auf Element warten",
         "category": "Warten",
         "description": "Wartet, bis ein Fenster-Element verfügbar ist.",
         "keywords": ["laden", "erscheinen", "timeout", "sichtbar"],
-        "primary": ["title", "auto_id"],
+        "primary": ["element", "title", "auto_id"],
     },
     "if": {
         "label": "Wenn / Sonst",
@@ -394,6 +404,13 @@ ACTION_META: dict[str, dict] = {
         "description": "Fängt Fehler der enthaltenen Schritte ab und behandelt sie.",
         "keywords": ["fehler", "catch", "exception", "absichern"],
         "primary": ["error_var"],
+    },
+    "fail": {
+        "label": "Fehler auslösen",
+        "category": "Ablaufsteuerung",
+        "description": "Bricht mit einer Meldung ab - fachlich wird nie wiederholt, technisch wie ein normaler Fehler.",
+        "keywords": ["fehler", "abbrechen", "fachlich", "technisch", "business", "invalid"],
+        "primary": ["message"],
     },
     "run_workflow": {
         "label": "Unterprozess ausführen",

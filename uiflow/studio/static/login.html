@@ -46,9 +46,11 @@
 <body>
 <form class="login-box" method="post" action="/login">
   <h1><span style="color:var(--accent)">uiflow</span> studio</h1>
+  <label for="login-username">Benutzername</label>
+  <input id="login-username" type="text" name="username" placeholder="nur bei mehreren Konten nötig" autocomplete="username" autofocus>
   <label for="login-password">Passwort</label>
-  <input id="login-password" type="password" name="password" placeholder="Passwort" autocomplete="current-password" autofocus>
-  <div class="login-error hidden" id="login-error" role="alert">Falsches Passwort.</div>
+  <input id="login-password" type="password" name="password" placeholder="Passwort" autocomplete="current-password">
+  <div class="login-error hidden" id="login-error" role="alert">Falscher Benutzername oder falsches Passwort.</div>
   <button type="submit" class="btn btn-primary">Anmelden</button>
 </form>
 <script>

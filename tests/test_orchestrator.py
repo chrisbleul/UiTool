@@ -130,6 +130,21 @@ def test_queue_item_retries_before_failing(no_retry_backoff):
     assert after_second_failure["status"] == "failed"  # retry_count(2) > max_retries(1)
 
 
+def test_complete_queue_item_permanent_fails_immediately_without_a_retry(no_retry_backoff):
+    queue_id = db.create_queue("invoices")
+    db.add_queue_items(queue_id, [{"payload": {"n": 1}, "max_retries": 3}])
+    item = db.claim_next_queue_item(queue_id, "job-1")
+
+    status = db.complete_queue_item(item["id"], False, error_message="ungültig", permanent=True)
+
+    assert status == "failed"
+    [stored] = db.list_queue_items(queue_id)
+    assert stored["status"] == "failed"
+    assert stored["retry_count"] == 0  # no retry was consumed
+    assert stored["error_message"] == "ungültig"
+    assert db.claim_next_queue_item(queue_id, "job-2") is None  # not reclaimable
+
+
 def test_failed_item_is_not_immediately_reclaimable():
     queue_id = db.create_queue("invoices")
     db.add_queue_items(queue_id, [{"payload": {"n": 1}, "max_retries": 3}])
@@ -288,6 +303,37 @@ def test_queue_job_reports_error_when_an_item_fails_permanently(monkeypatch):
     assert "1 of 2" in job["error_message"]
     by_status = {i["status"] for i in db.list_queue_items(queue_id)}
     assert by_status == {"success", "failed"}  # the good item was still processed
+
+
+def test_business_error_marks_an_item_failed_immediately_without_consuming_a_retry():
+    from uiflow.orchestrator import worker
+
+    queue_id = db.create_queue("invoices")
+    db.add_queue_items(queue_id, [{"payload": {"betrag": -5}, "max_retries": 3}])
+    job_id = db.create_job(
+        "invoices",
+        {
+            "name": "invoices",
+            "backend": "web",
+            "steps": [
+                {
+                    "action": "if",
+                    "condition": "item['betrag'] < 0",
+                    "then": [{"action": "fail", "message": "Ungültiger Betrag", "type": "business"}],
+                }
+            ],
+        },
+        queue_name="invoices",
+    )
+
+    worker._run_job(db.claim_next_job("test-worker"))
+
+    job = db.get_job(job_id)
+    assert job["status"] == "error"
+    [item] = db.list_queue_items(queue_id)
+    assert item["status"] == "failed"
+    assert item["retry_count"] == 0  # a business error must not consume a retry
+    assert "Ungültiger Betrag" in item["error_message"]
 
 
 def test_queue_job_reports_success_when_a_retry_eventually_succeeds(monkeypatch, no_retry_backoff):
@@ -566,3 +612,78 @@ def test_a_job_run_sees_the_global_variables(monkeypatch):
 
     assert db.get_job(job_id)["status"] == "success"
     assert seen["url"] == "https://erp.example.com/x"
+
+
+# --- users (opt-in multi-user/RBAC, see studio/app.py) -----------------------
+
+
+def test_any_users_exist_is_false_until_one_is_created():
+    assert db.any_users_exist() is False
+
+    db.create_user("alice", "hash", "admin")
+
+    assert db.any_users_exist() is True
+
+
+def test_create_and_get_user():
+    db.create_user("alice", "hashed-pw", "admin")
+
+    user = db.get_user("alice")
+
+    assert user["username"] == "alice"
+    assert user["password_hash"] == "hashed-pw"
+    assert user["role"] == "admin"
+
+
+def test_get_user_returns_none_for_an_unknown_username():
+    assert db.get_user("nobody") is None
+
+
+def test_create_user_rejects_an_unknown_role():
+    with pytest.raises(ValueError):
+        db.create_user("alice", "hash", "superadmin")
+
+
+def test_list_users_never_includes_the_password_hash():
+    db.create_user("bob", "super-secret-hash", "viewer")
+    db.create_user("alice", "another-hash", "admin")
+
+    users = db.list_users()
+
+    assert users == [
+        {"username": "alice", "role": "admin", "created_at": users[0]["created_at"]},
+        {"username": "bob", "role": "viewer", "created_at": users[1]["created_at"]},
+    ]
+    assert all("password_hash" not in u for u in users)
+
+
+def test_set_user_role_updates_it():
+    db.create_user("alice", "hash", "viewer")
+
+    db.set_user_role("alice", "admin")
+
+    assert db.get_user("alice")["role"] == "admin"
+
+
+def test_set_user_role_rejects_an_unknown_role():
+    db.create_user("alice", "hash", "viewer")
+
+    with pytest.raises(ValueError):
+        db.set_user_role("alice", "superadmin")
+
+
+def test_set_user_password_updates_the_hash():
+    db.create_user("alice", "old-hash", "viewer")
+
+    db.set_user_password("alice", "new-hash")
+
+    assert db.get_user("alice")["password_hash"] == "new-hash"
+
+
+def test_delete_user_removes_it():
+    db.create_user("alice", "hash", "admin")
+
+    db.delete_user("alice")
+
+    assert db.get_user("alice") is None
+    assert db.any_users_exist() is False

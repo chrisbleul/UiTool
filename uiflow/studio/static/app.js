@@ -1,4 +1,6 @@
 let schema = { web: {}, desktop: {} };
+let repositoryEntries = []; // Object Repository: [{scope, name, fields}, ...] - see /api/repository
+let currentUser = { username: null, role: null, multiuser: false };
 
 let state = {
   backend: "web",
@@ -131,6 +133,11 @@ function updateUndoButton() {
 async function loadSchema() {
   const res = await fetch("/api/schema");
   schema = await res.json();
+}
+
+async function loadRepository() {
+  const res = await fetch("/api/repository");
+  repositoryEntries = await res.json();
 }
 
 async function loadWorkflowList() {
@@ -983,9 +990,14 @@ function renderProperties() {
   body.appendChild(actionWrap);
 
   // Branch fields are structural: they are edited on the canvas as drop
-  // targets, not as form inputs, so the panel skips them.
+  // targets, not as form inputs, so the panel skips them. A step referencing
+  // an Object Repository element (step.params.element - see below) also skips
+  // its own selector/control_type/title/auto_id fields: the engine ignores
+  // them in favour of the referenced element's fields once `element` is set.
+  const _targetFieldNames = ["selector", "control_type", "title", "auto_id"];
   for (const fieldDef of actions[step.action] || []) {
     if (fieldDef.type === "steps" || fieldDef.type === "cases") continue;
+    if (step.params.element && _targetFieldNames.includes(fieldDef.name)) continue;
     body.appendChild(renderField(step, fieldDef));
   }
 
@@ -1010,16 +1022,179 @@ function renderProperties() {
   const hasSelectorField = fieldDefs.some((f) => f.name === "selector");
   const hasDesktopTargetFields = fieldDefs.some((f) => ["control_type", "title", "auto_id"].includes(f.name));
   if (hasSelectorField || hasDesktopTargetFields) {
-    const pickBtn = document.createElement("button");
-    pickBtn.type = "button";
-    pickBtn.className = "btn btn-pick";
-    pickBtn.innerHTML = ICONS.target + "<span>Element auf dem Bildschirm wählen</span>";
-    pickBtn.addEventListener("click", () => {
-      if (hasSelectorField) pickWebSelector(step);
-      else pickDesktopSelector(step);
-    });
-    body.appendChild(pickBtn);
+    body.appendChild(renderElementReferenceSection(step, hasSelectorField));
+
+    if (!step.params.element) {
+      const pickBtn = document.createElement("button");
+      pickBtn.type = "button";
+      pickBtn.className = "btn btn-pick";
+      pickBtn.innerHTML = ICONS.target + "<span>Element auf dem Bildschirm wählen</span>";
+      pickBtn.addEventListener("click", () => {
+        if (hasSelectorField) pickWebSelector(step);
+        else pickDesktopSelector(step);
+      });
+      body.appendChild(pickBtn);
+
+      const inspectBtn = document.createElement("button");
+      inspectBtn.type = "button";
+      inspectBtn.className = "btn";
+      inspectBtn.textContent = "Selector prüfen";
+      inspectBtn.title = hasSelectorField
+        ? "Prüft, wie viele Elemente dieser Selector auf der Seite trifft"
+        : "Prüft, wie viele Elemente dieser Selector in der Zielanwendung trifft";
+      inspectBtn.addEventListener("click", () => {
+        if (hasSelectorField) inspectWebSelector(step);
+        else inspectDesktopSelector(step);
+      });
+      body.appendChild(inspectBtn);
+    }
   }
+}
+
+// Object Repository: lets a step reference a named, centrally stored element
+// ("Scope/Name") instead of carrying its own selector - see engine.py's
+// _resolve_element_reference. Picking a repository entry hides this step's
+// own selector/control_type/title/auto_id fields (see the skip in the field
+// loop above), since the engine ignores them in favour of the referenced
+// element's fields once `element` is set.
+function renderElementReferenceSection(step, hasSelectorField) {
+  const wrap = document.createElement("div");
+  wrap.className = "field element-reference";
+  const label = document.createElement("label");
+  label.textContent = "Object Repository";
+  wrap.appendChild(label);
+
+  const row = document.createElement("div");
+  row.className = "field-row";
+
+  const select = document.createElement("select");
+  const noneOpt = document.createElement("option");
+  noneOpt.value = "";
+  noneOpt.textContent = "(kein - eigener Selektor)";
+  select.appendChild(noneOpt);
+  for (const entry of repositoryEntries) {
+    const value = `${entry.scope}/${entry.name}`;
+    const opt = document.createElement("option");
+    opt.value = value;
+    opt.textContent = value;
+    if (step.params.element === value) opt.selected = true;
+    select.appendChild(opt);
+  }
+  select.addEventListener("change", () => {
+    pushUndo();
+    if (select.value) {
+      step.params.element = select.value;
+      // The engine ignores an inline selector once `element` is set - drop it
+      // so a saved workflow doesn't carry stale, unused fields alongside it.
+      for (const key of ["selector", "control_type", "title", "auto_id"]) delete step.params[key];
+    } else {
+      delete step.params.element;
+    }
+    renderSteps();
+  });
+  row.appendChild(select);
+
+  if (step.params.element) {
+    // A reference is already active - offer a fallback candidate for it
+    // instead of "save as new element" (the step's own fields are hidden/
+    // cleared while a reference is active, so there'd be nothing to save).
+    const fallbackBtn = document.createElement("button");
+    fallbackBtn.type = "button";
+    fallbackBtn.className = "btn-icon";
+    fallbackBtn.innerHTML = ICONS.target;
+    fallbackBtn.title = "Alternative aufnehmen (Fallback, falls das Element nicht gefunden wird)";
+    fallbackBtn.setAttribute("aria-label", "Alternative für dieses Element aufnehmen");
+    fallbackBtn.addEventListener("click", () => addFallbackForReferencedElement(step, hasSelectorField));
+    row.appendChild(fallbackBtn);
+  } else {
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.className = "btn-icon";
+    saveBtn.innerHTML = ICONS.copy;
+    saveBtn.title = "Aktuelle Felder als Element speichern";
+    saveBtn.setAttribute("aria-label", "Aktuelle Felder als Element speichern");
+    saveBtn.addEventListener("click", () => saveStepAsRepositoryElement(step, hasSelectorField));
+    row.appendChild(saveBtn);
+  }
+
+  wrap.appendChild(row);
+  return wrap;
+}
+
+function suggestScopeName() {
+  if (state.backend === "desktop") {
+    const scope = findDesktopScope();
+    if (scope) return scope.focus_path || scope.focus_title || "";
+    return "";
+  }
+  const url = findNavigateUrl();
+  if (!url) return "";
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url;
+  }
+}
+
+async function saveStepAsRepositoryElement(step, hasSelectorField) {
+  let fields = null;
+  if (hasSelectorField) {
+    if (step.params.selector) fields = { selector: step.params.selector };
+  } else {
+    const picked = {};
+    for (const key of ["control_type", "title", "auto_id"]) {
+      if (step.params[key]) picked[key] = step.params[key];
+    }
+    if (Object.keys(picked).length) fields = picked;
+  }
+  if (!fields) {
+    toast("Bitte zuerst ein Element auswählen (Selector bzw. Control-Felder ausfüllen).", "error");
+    return;
+  }
+  const scope = window.prompt("Anwendung/Scope (z.B. Editor oder example.com):", suggestScopeName());
+  if (!scope) return;
+  const name = window.prompt('Name für dieses Element (z.B. "Anmelden-Knopf"):', "");
+  if (!name) return;
+
+  const res = await fetch("/api/repository", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scope, name, fields }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    toast("Speichern fehlgeschlagen: " + (data.error || res.status), "error");
+    return;
+  }
+  await loadRepository();
+  toast(`Element "${scope}/${name}" gespeichert.`, "success");
+  renderSteps();
+}
+
+// Adds another candidate field-set to an already-referenced Object Repository
+// element (see engine.py's _resolve_element_reference / add_fallback) - the
+// fallback-selector strategy a flaky or legacy-app element needs, picked at
+// run time by trying each candidate in order until one actually matches.
+async function addFallbackForReferencedElement(step, hasSelectorField) {
+  const ref = step.params.element;
+  if (!ref) return;
+  const [scope, name] = ref.split("/");
+
+  const fields = await pickRawFields(hasSelectorField);
+  if (!fields) return;
+
+  const res = await fetch(`/api/repository/${encodeURIComponent(scope)}/${encodeURIComponent(name)}/fallback`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ fields }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    toast("Speichern fehlgeschlagen: " + (data.error || res.status), "error");
+    return;
+  }
+  await loadRepository();
+  toast(`Alternative für "${ref}" gespeichert (${data.candidates.length} Kandidaten insgesamt).`, "success");
 }
 
 function renderRecordingControls() {
@@ -1099,43 +1274,40 @@ function recordHotkey(input, step, fieldName) {
   window.addEventListener("keydown", handler, true);
 }
 
-async function pickWebSelector(step) {
-  let url = findNavigateUrl();
-  if (!url) {
-    url = window.prompt("URL der Seite, auf der ausgewählt werden soll:", "https://");
-    if (!url) return;
-  }
-  const banner = showPickStatus("Browser öffnet sich – bitte im Fenster auf das gewünschte Element klicken...");
-  try {
-    const res = await fetch("/api/pick/web", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url }),
-    });
-    const data = await res.json();
-    if (data.ok) {
-      pushUndo();
-      step.params.selector = data.selector;
-      renderSteps();
-    } else {
-      toast("Auswahl fehlgeschlagen: " + data.error, "error");
+// Runs the click-to-pick flow (web or desktop) and returns the raw fields it
+// produced ({selector} or {control_type, title, auto_id}, only the ones
+// actually present), or null on cancel/failure - shared by pickWebSelector/
+// pickDesktopSelector (write the result into the step) and
+// addFallbackForReferencedElement (saves it into the Object Repository
+// instead, see engine.py's _resolve_element_reference fallback support).
+async function pickRawFields(hasSelectorField) {
+  if (hasSelectorField) {
+    let url = findNavigateUrl();
+    if (!url) {
+      url = window.prompt("URL der Seite, auf der ausgewählt werden soll:", "https://");
+      if (!url) return null;
     }
-  } catch (err) {
-    toast("Auswahl fehlgeschlagen: " + err, "error");
-  } finally {
-    hidePickStatus(banner);
+    const banner = showPickStatus("Browser öffnet sich – bitte im Fenster auf das gewünschte Element klicken...");
+    try {
+      const res = await fetch("/api/pick/web", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url }),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        toast("Auswahl fehlgeschlagen: " + data.error, "error");
+        return null;
+      }
+      return { selector: data.selector };
+    } catch (err) {
+      toast("Auswahl fehlgeschlagen: " + err, "error");
+      return null;
+    } finally {
+      hidePickStatus(banner);
+    }
   }
-}
 
-function findDesktopScope() {
-  const launchStep = state.steps.find((s) => s.action === "launch" && s.params.path);
-  if (launchStep) return { focus_path: launchStep.params.path };
-  const connectStep = state.steps.find((s) => s.action === "connect" && s.params.title);
-  if (connectStep) return { focus_title: connectStep.params.title };
-  return null;
-}
-
-async function pickDesktopSelector(step) {
   const scope = findDesktopScope();
   const raw = window.prompt(
     scope
@@ -1143,9 +1315,8 @@ async function pickDesktopSelector(step) {
       : "Kein Scope (launch/connect-Schritt) im Workflow gefunden. Timeout (Sekunden), um manuell zur Zielanwendung zu wechseln:",
     scope ? "0" : "3"
   );
-  if (raw === null) return;
+  if (raw === null) return null;
   const delay = Math.max(0, Number(raw) || 0);
-
   const banner = showPickStatus(
     delay > 0
       ? `Wechsle jetzt zur Zielanwendung – Aufnahme startet in ${delay}s...`
@@ -1158,20 +1329,134 @@ async function pickDesktopSelector(step) {
       body: JSON.stringify({ delay, ...(scope || {}) }),
     });
     const data = await res.json();
-    if (data.ok) {
-      pushUndo();
-      if (data.control_type) step.params.control_type = data.control_type;
-      if (data.auto_id) step.params.auto_id = data.auto_id;
-      if (data.title) step.params.title = data.title;
-      renderSteps();
-    } else {
+    if (!data.ok) {
       toast("Auswahl fehlgeschlagen: " + data.error, "error");
+      return null;
     }
+    const fields = {};
+    if (data.control_type) fields.control_type = data.control_type;
+    if (data.auto_id) fields.auto_id = data.auto_id;
+    if (data.title) fields.title = data.title;
+    return fields;
   } catch (err) {
     toast("Auswahl fehlgeschlagen: " + err, "error");
+    return null;
   } finally {
     hidePickStatus(banner);
   }
+}
+
+async function pickWebSelector(step) {
+  const fields = await pickRawFields(true);
+  if (!fields) return;
+  pushUndo();
+  step.params.selector = fields.selector;
+  renderSteps();
+}
+
+// Read-only counterpart to pickWebSelector: checks the selector already in
+// the field against the running page instead of waiting for a click - a
+// selector matching more than one element is the classic reason a bot ends up
+// clicking the wrong one, so that case is flagged rather than just reported.
+async function inspectWebSelector(step) {
+  const selector = step.params.selector;
+  if (!selector) {
+    toast("Bitte zuerst einen Selector eintragen.", "error");
+    return;
+  }
+  let url = findNavigateUrl();
+  if (!url) {
+    url = window.prompt("URL der Seite, gegen die geprüft werden soll:", "https://");
+    if (!url) return;
+  }
+  let data;
+  try {
+    const res = await fetch("/api/inspect/web", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, selector }),
+    });
+    data = await res.json();
+  } catch (err) {
+    toast("Prüfung fehlgeschlagen: " + err, "error");
+    return;
+  }
+  if (!data.ok) {
+    toast("Prüfung fehlgeschlagen: " + data.error, "error");
+    return;
+  }
+  const first = data.matches[0];
+  const preview = first ? ` (z.B. <${first.tag}>${first.text ? ` "${first.text}"` : ""})` : "";
+  if (data.count === 0) {
+    toast(`Kein Element gefunden für "${selector}".`, "error");
+  } else if (data.count === 1) {
+    toast(`1 Treffer für "${selector}"${preview}.`, "success");
+  } else {
+    // More than one match is flagged, not just reported: an ambiguous
+    // selector is the classic reason a bot ends up clicking the wrong element.
+    toast(`${data.count} Treffer für "${selector}" - mehrdeutig${preview}.`, "error");
+  }
+}
+
+// Desktop counterpart to inspectWebSelector: checks the control_type/title/
+// auto_id already in the field against the scope application's current
+// element tree instead of waiting for a click.
+async function inspectDesktopSelector(step) {
+  const selector = {};
+  for (const key of ["control_type", "title", "auto_id"]) {
+    if (step.params[key]) selector[key] = step.params[key];
+  }
+  if (Object.keys(selector).length === 0) {
+    toast("Bitte zuerst Control-Felder eintragen.", "error");
+    return;
+  }
+  const scope = findDesktopScope();
+  if (!scope) {
+    toast("Kein Scope (launch/connect-Schritt) im Workflow gefunden.", "error");
+    return;
+  }
+  let data;
+  try {
+    const res = await fetch("/api/inspect/desktop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...scope, selector }),
+    });
+    data = await res.json();
+  } catch (err) {
+    toast("Prüfung fehlgeschlagen: " + err, "error");
+    return;
+  }
+  if (!data.ok) {
+    toast("Prüfung fehlgeschlagen: " + data.error, "error");
+    return;
+  }
+  const first = data.matches[0];
+  const preview = first ? ` (z.B. ${first.control_type}${first.title ? ` "${first.title}"` : ""})` : "";
+  const describe = Object.entries(selector).map(([k, v]) => `${k}=${v}`).join(", ");
+  if (data.count === 0) {
+    toast(`Kein Element gefunden für ${describe}.`, "error");
+  } else if (data.count === 1) {
+    toast(`1 Treffer für ${describe}${preview}.`, "success");
+  } else {
+    toast(`${data.count} Treffer für ${describe} - mehrdeutig${preview}.`, "error");
+  }
+}
+
+function findDesktopScope() {
+  const launchStep = state.steps.find((s) => s.action === "launch" && s.params.path);
+  if (launchStep) return { focus_path: launchStep.params.path };
+  const connectStep = state.steps.find((s) => s.action === "connect" && s.params.title);
+  if (connectStep) return { focus_title: connectStep.params.title };
+  return null;
+}
+
+async function pickDesktopSelector(step) {
+  const fields = await pickRawFields(false);
+  if (!fields) return;
+  pushUndo();
+  Object.assign(step.params, fields);
+  renderSteps();
 }
 
 async function startRecording() {
@@ -1607,6 +1892,131 @@ async function addGlobal() {
   toast(`Globale Variable "${name}" gespeichert.`, "success");
 }
 
+// --- users (opt-in multi-user/RBAC - admin-only panel, see studio/app.py) --
+
+const ROLE_LABELS = { viewer: "Viewer", operator: "Operator", admin: "Admin" };
+
+async function renderUsersPanel() {
+  const container = el("users-list");
+  container.innerHTML = "Lädt...";
+  const res = await fetch("/api/users");
+  if (!res.ok) {
+    container.innerHTML = '<p style="color:var(--muted)">Nur für Admins sichtbar.</p>';
+    return;
+  }
+  const users = await res.json();
+  if (users.length === 0) {
+    container.innerHTML = '<p style="color:var(--muted)">Noch keine Benutzer angelegt.</p>';
+    return;
+  }
+  container.innerHTML = "";
+  for (const user of users) {
+    const row = document.createElement("div");
+    row.className = "list-row";
+
+    const info = document.createElement("div");
+    info.style.flex = "1";
+    info.style.minWidth = "0";
+    const label = document.createElement("div");
+    label.className = "list-row-name";
+    label.textContent = user.username + (user.username === currentUser.username ? " (du)" : "");
+    const meta = document.createElement("div");
+    meta.className = "list-row-meta";
+    meta.textContent = ROLE_LABELS[user.role] || user.role;
+    info.append(label, meta);
+
+    const roleSelect = document.createElement("select");
+    for (const [value, roleLabel] of Object.entries(ROLE_LABELS)) {
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = roleLabel;
+      if (value === user.role) opt.selected = true;
+      roleSelect.appendChild(opt);
+    }
+    roleSelect.addEventListener("change", async () => {
+      const res2 = await fetch(`/api/users/${encodeURIComponent(user.username)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role: roleSelect.value }),
+      });
+      const data = await res2.json();
+      if (!res2.ok) {
+        toast("Ändern fehlgeschlagen: " + (data.error || res2.status), "error");
+        renderUsersPanel();
+        return;
+      }
+      toast(`Rolle von "${user.username}" geändert.`, "success");
+    });
+
+    const delBtn = document.createElement("button");
+    delBtn.className = "btn-icon danger";
+    delBtn.textContent = "✕";
+    delBtn.title = "Löschen";
+    delBtn.setAttribute("aria-label", `Benutzer "${user.username}" löschen`);
+    delBtn.disabled = user.username === currentUser.username;
+    delBtn.addEventListener("click", async () => {
+      if (!(await confirmDialog(`Benutzer "${user.username}" wirklich löschen?`))) return;
+      const res2 = await fetch(`/api/users/${encodeURIComponent(user.username)}`, { method: "DELETE" });
+      const data = await res2.json();
+      if (!res2.ok) {
+        toast("Löschen fehlgeschlagen: " + (data.error || res2.status), "error");
+        return;
+      }
+      renderUsersPanel();
+      toast(`Benutzer "${user.username}" gelöscht.`, "success");
+    });
+
+    row.append(info, roleSelect, delBtn);
+    container.appendChild(row);
+  }
+}
+
+async function addUser() {
+  const username = el("user-name").value.trim();
+  const password = el("user-password").value;
+  const role = el("user-role").value;
+  if (!username || !password) {
+    toast("Bitte Benutzername und Passwort angeben.", "error");
+    return;
+  }
+  const res = await fetch("/api/users", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password, role }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    toast("Anlegen fehlgeschlagen: " + (data.error || res.status), "error");
+    return;
+  }
+  el("user-name").value = "";
+  el("user-password").value = "";
+  renderUsersPanel();
+  toast(`Benutzer "${username}" angelegt.`, "success");
+}
+
+async function loadCurrentUser() {
+  const res = await fetch("/api/me");
+  if (!res.ok) return;
+  currentUser = await res.json();
+  applyRoleVisibility();
+}
+
+function applyRoleVisibility() {
+  const isAdmin = !currentUser.multiuser || currentUser.role === "admin";
+  el("tab-btn-credentials").classList.toggle("hidden", !isAdmin);
+  el("tab-btn-globals").classList.toggle("hidden", !isAdmin);
+  el("tab-btn-users").classList.toggle("hidden", !currentUser.multiuser || !isAdmin);
+
+  const userBox = el("current-user");
+  if (currentUser.multiuser && currentUser.username) {
+    userBox.innerHTML = `Angemeldet als <strong>${escapeHtml(currentUser.username)}</strong> (${ROLE_LABELS[currentUser.role] || currentUser.role})`;
+    userBox.classList.remove("hidden");
+  } else {
+    userBox.classList.add("hidden");
+  }
+}
+
 // --- declared workflow variables (per-workflow, saved as part of its own
 // YAML - see models.Workflow.variables - not the installation-wide globals
 // above, which live in orchestrator.db instead) ------------------------------
@@ -1715,6 +2125,187 @@ function openVariablesOverlay() {
 
 function closeVariablesOverlay() {
   el("variables-overlay").classList.add("hidden");
+}
+
+// --- flowchart view (read-only visualization of the sequential builder tree) -
+//
+// The builder edits a strictly sequential/nested step list (see the "model <->
+// wire format" comment above) - there is no independent node/edge/coordinate
+// format to maintain alongside it. This renders that same `state.steps` tree
+// as boxes-and-arrows instead of a nested card list, which makes branching
+// control flow (if/switch/for_each/try) easier to see at a glance. It is
+// read-only: editing still happens in the card list, a click here only
+// selects the step there.
+
+const FLOW_NODE_WIDTH = 190;
+const FLOW_NODE_HEIGHT = 56;
+const FLOW_V_GAP = 36;
+const FLOW_H_GAP = 32;
+const FLOW_BRANCH_LABEL_HEIGHT = 22;
+
+// Pure layout pass: turns a list of steps (top-level or one branch's `.steps`)
+// into relative positions, without touching the DOM, so the render pass below
+// can center parents over children without a second measuring pass.
+function flowMeasureList(steps) {
+  let y = 0;
+  let width = FLOW_NODE_WIDTH;
+  const items = [];
+  for (const step of steps) {
+    const branches = (step.slots || []).map((slot) => ({ slot, layout: flowMeasureList(slot.steps) }));
+    let itemWidth = FLOW_NODE_WIDTH;
+    let extraHeight = 0;
+    if (branches.length) {
+      itemWidth = Math.max(
+        FLOW_NODE_WIDTH,
+        branches.reduce((sum, b) => sum + Math.max(b.layout.width, FLOW_NODE_WIDTH), 0) + FLOW_H_GAP * (branches.length - 1)
+      );
+      const branchesHeight = Math.max(FLOW_NODE_HEIGHT, ...branches.map((b) => Math.max(b.layout.height, FLOW_NODE_HEIGHT)));
+      extraHeight = FLOW_V_GAP + FLOW_BRANCH_LABEL_HEIGHT + branchesHeight + FLOW_V_GAP;
+    }
+    items.push({ step, y, width: itemWidth, height: FLOW_NODE_HEIGHT + extraHeight, branches });
+    width = Math.max(width, itemWidth);
+    y += FLOW_NODE_HEIGHT + extraHeight + FLOW_V_GAP;
+  }
+  return { width, height: items.length ? y - FLOW_V_GAP : 0, items };
+}
+
+function renderFlowchart() {
+  const container = el("flowchart-canvas");
+  container.innerHTML = "";
+
+  const layout = flowMeasureList(state.steps);
+  if (layout.items.length === 0) {
+    container.innerHTML = '<p class="flow-empty">Keine Schritte vorhanden.</p>';
+    return;
+  }
+
+  const width = layout.width + FLOW_H_GAP * 2;
+  const height = layout.height + FLOW_V_GAP * 2;
+
+  const stage = document.createElement("div");
+  stage.className = "flow-stage";
+  stage.style.width = `${width}px`;
+  stage.style.height = `${height}px`;
+
+  const svgNS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(svgNS, "svg");
+  svg.setAttribute("width", String(width));
+  svg.setAttribute("height", String(height));
+  svg.classList.add("flow-svg");
+  svg.innerHTML =
+    '<defs><marker id="flow-arrow" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">' +
+    '<path d="M0,0 L8,4 L0,8 Z" fill="var(--muted)"></path></marker></defs>';
+  stage.appendChild(svg);
+  container.appendChild(stage);
+
+  function addLine(x1, y1, x2, y2, arrow) {
+    const line = document.createElementNS(svgNS, "line");
+    line.setAttribute("x1", x1);
+    line.setAttribute("y1", y1);
+    line.setAttribute("x2", x2);
+    line.setAttribute("y2", y2);
+    line.classList.add("flow-edge");
+    if (arrow) line.setAttribute("marker-end", "url(#flow-arrow)");
+    svg.appendChild(line);
+  }
+
+  function addNode(x, y, step) {
+    const box = document.createElement("div");
+    box.className = "flow-node" + (step === state.selected ? " selected" : "");
+    box.style.left = `${x}px`;
+    box.style.top = `${y}px`;
+    box.style.width = `${FLOW_NODE_WIDTH}px`;
+    box.style.height = `${FLOW_NODE_HEIGHT}px`;
+    const meta = activityMeta(step.action);
+    const title = document.createElement("div");
+    title.className = "flow-node-title";
+    title.textContent = meta.label || step.action;
+    const sub = document.createElement("div");
+    sub.className = "flow-node-sub";
+    sub.textContent = stepSummary(step);
+    box.append(title, sub);
+    box.addEventListener("click", () => {
+      selectStep(step);
+      closeFlowchartOverlay();
+      switchView("builder");
+    });
+    stage.appendChild(box);
+  }
+
+  function addBranchLabel(x, y, width, text) {
+    const label = document.createElement("div");
+    label.className = "flow-branch-label";
+    label.style.left = `${x}px`;
+    label.style.top = `${y}px`;
+    label.style.width = `${width}px`;
+    label.textContent = text;
+    stage.appendChild(label);
+  }
+
+  function renderList(listLayout, originX, originY) {
+    const centerX = originX + listLayout.width / 2;
+    let prevBottom = null;
+    for (const item of listLayout.items) {
+      const boxX = centerX - FLOW_NODE_WIDTH / 2;
+      const boxY = originY + item.y;
+      if (prevBottom !== null) addLine(centerX, prevBottom, centerX, boxY, true);
+      addNode(boxX, boxY, item.step);
+
+      let bottom = boxY + FLOW_NODE_HEIGHT;
+      if (item.branches.length) {
+        const forkY = bottom + FLOW_V_GAP / 2;
+        const branchTopY = bottom + FLOW_V_GAP + FLOW_BRANCH_LABEL_HEIGHT;
+        const mergeY = boxY + item.height - FLOW_V_GAP / 2;
+        const groupWidth =
+          item.branches.reduce((sum, b) => sum + Math.max(b.layout.width, FLOW_NODE_WIDTH), 0) +
+          FLOW_H_GAP * (item.branches.length - 1);
+        let colX = centerX - groupWidth / 2;
+        const colCenters = [];
+        for (const branch of item.branches) {
+          const colWidth = Math.max(branch.layout.width, FLOW_NODE_WIDTH);
+          const colCenterX = colX + colWidth / 2;
+          colCenters.push(colCenterX);
+
+          const label =
+            branch.slot.kind === "case" ? `Fall: ${branch.slot.label}` : branch.slot.label || branch.slot.name;
+          addBranchLabel(colX, bottom + FLOW_V_GAP, colWidth, label);
+          addLine(colCenterX, forkY, colCenterX, branchTopY);
+
+          if (branch.layout.items.length === 0) {
+            const placeholder = document.createElement("div");
+            placeholder.className = "flow-branch-empty";
+            placeholder.style.left = `${colX}px`;
+            placeholder.style.top = `${branchTopY}px`;
+            placeholder.style.width = `${colWidth}px`;
+            placeholder.textContent = "leer";
+            stage.appendChild(placeholder);
+            addLine(colCenterX, branchTopY, colCenterX, mergeY);
+          } else {
+            renderList(branch.layout, colX + (colWidth - branch.layout.width) / 2, branchTopY);
+            addLine(colCenterX, branchTopY + branch.layout.height, colCenterX, mergeY);
+          }
+          colX += colWidth + FLOW_H_GAP;
+        }
+        addLine(centerX, bottom, centerX, forkY);
+        addLine(colCenters[0], forkY, colCenters[colCenters.length - 1], forkY);
+        addLine(colCenters[0], mergeY, colCenters[colCenters.length - 1], mergeY);
+        addLine(centerX, mergeY, centerX, boxY + item.height, true);
+        bottom = boxY + item.height;
+      }
+      prevBottom = bottom;
+    }
+  }
+
+  renderList(layout, FLOW_H_GAP, FLOW_V_GAP);
+}
+
+function openFlowchartOverlay() {
+  renderFlowchart();
+  el("flowchart-overlay").classList.remove("hidden");
+}
+
+function closeFlowchartOverlay() {
+  el("flowchart-overlay").classList.add("hidden");
 }
 
 async function addCredential() {
@@ -2129,6 +2720,7 @@ function switchTab(name) {
   if (name === "credentials") renderCredentialsPanel();
   if (name === "globals") renderGlobalsPanel();
   if (name === "schedules") renderSchedulesPanel();
+  if (name === "users") renderUsersPanel();
 }
 
 function startNewWorkflow() {
@@ -2173,6 +2765,11 @@ function init() {
   el("variables-overlay").addEventListener("click", (e) => {
     if (e.target === el("variables-overlay")) closeVariablesOverlay();
   });
+  el("btn-flowchart").addEventListener("click", openFlowchartOverlay);
+  el("btn-close-flowchart").addEventListener("click", closeFlowchartOverlay);
+  el("flowchart-overlay").addEventListener("click", (e) => {
+    if (e.target === el("flowchart-overlay")) closeFlowchartOverlay();
+  });
   el("btn-logout").addEventListener("click", async () => {
     await fetch("/logout", { method: "POST" });
     location.href = "/";
@@ -2185,6 +2782,7 @@ function init() {
   el("btn-add-credential").addEventListener("click", addCredential);
   el("btn-add-global").addEventListener("click", addGlobal);
   el("btn-add-schedule").addEventListener("click", addSchedule);
+  el("btn-add-user").addEventListener("click", addUser);
   el("btn-refresh-runs").addEventListener("click", renderRunsView);
   el("btn-quick-new-workflow").addEventListener("click", () => {
     startNewWorkflow();
@@ -2225,7 +2823,7 @@ function init() {
 
   el("catalog-search").addEventListener("input", renderCatalog);
 
-  Promise.all([loadSchema(), loadCatalog()]).then(() => {
+  Promise.all([loadSchema(), loadCatalog(), loadRepository()]).then(() => {
     renderCatalog();
     initCatalogSortable();
     state.steps = [newStepFor(state.backend)];
@@ -2233,6 +2831,7 @@ function init() {
   });
   loadWorkflowList();
   loadQueueNames();
+  loadCurrentUser();
   updateUndoButton();
   updateBrowserChannelVisibility();
   switchView("dashboard");

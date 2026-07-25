@@ -123,8 +123,22 @@ python -m uiflow.cli studio
     manuell zur Zielanwendung zu wechseln.
   - **Live-Umrandung (nur Desktop)**: während der Aufnahme wird das Element unter dem Mauszeiger
     laufend mit einem roten Rahmen markiert (wie UiPaths "Auf Bildschirm anzeigen"), bevor geklickt wird.
+- **Selector prüfen** (neben jedem Selector-/Control-Feld): prüft die bereits eingetragenen Felder gegen
+  die laufende Anwendung und meldet, wie viele Elemente sie treffen und als was. Bei Web geschieht das
+  gegen die (per vorherigem `navigate`-Schritt bekannte) Seite in einem unsichtbaren Browser (Tag,
+  sichtbarer Text, sichtbar/unsichtbar); bei Desktop gegen den Element-Baum der per Scope
+  (`launch`/`connect`) bekannten Anwendung (Control-Type, Title, Auto-ID) — in beiden Fällen, ohne dass
+  der Workflow dafür erst laufen muss. Ein einzelner Treffer wird bestätigt, kein Treffer und mehr als
+  ein Treffer werden ausdrücklich als Problem markiert: ein mehrdeutiger Selector ist die klassische
+  Ursache dafür, dass ein Bot später das falsche Element anklickt.
 - **↶ Rückgängig** (oder Strg+Z) macht die letzte Änderung rückgängig — Schritt hinzugefügt/gelöscht/
   verschoben, Haltepunkt umgeschaltet, Feld bearbeitet, Backend gewechselt, Selektor übernommen.
+- **Flowchart** (Button neben "Variablen"): zeigt den aktuell geöffneten Workflow als Kästchen-und-
+  Pfeile-Diagramm statt als verschachtelte Kartenliste — reine Nur-Ansicht desselben Ablaufs, kein
+  eigenes Format. Verzweigende Aktivitäten (`if`s Dann/Sonst, `switch`s Fälle/Standard-Fall,
+  `for_each`s Schleifenkörper, `try`s Versuchen/Bei Fehler) laufen dabei als eigene Spalten nach unten
+  auseinander und danach wieder in der Hauptspalte zusammen. Ein Klick auf ein Kästchen schließt das
+  Flowchart und wählt den Schritt im Builder aus, um ihn dort zu bearbeiten.
 - **Anwendungs-Scope**: Ist der erste Schritt eines Desktop-Workflows `launch` oder `connect`, gilt er
   als Scope des Workflows — analog zu UiPaths "Use Application/Browser"-Aktivität. Er ist als erste
   Karte fixiert: nicht verschiebbar, und es lässt sich nichts darüber ablegen, weil alle folgenden
@@ -166,9 +180,27 @@ auch von einem eigenständigen Worker-Prozess bedient werden:
 python -m uiflow.cli worker --worker-id robot-1
 ```
 
-Mehrere Worker (auf derselben oder später verteilt auf anderen Maschinen) können parallel gegen
-dieselbe Queue arbeiten — `claim_next_job`/`claim_next_queue_item` beanspruchen Zeilen atomar
+Mehrere Worker (auf derselben oder verteilt auf anderen Maschinen) können parallel gegen dieselbe
+Queue arbeiten — `claim_next_job`/`claim_next_queue_item` beanspruchen Zeilen atomar
 (`UPDATE ... WHERE status='queued'`), sodass zwei Worker nie denselben Job doppelt ausführen.
+
+**Remote-Worker (andere Maschine, kein Datei-Zugriff auf `orchestrator.db`)**: mit `--remote-url`
+spricht `uiflow worker` die Job-Queue über HTTP an (`/api/worker/*` auf dem Studio-Server) statt
+`orchestrator.db` direkt zu öffnen — für einen Worker, der auf einer anderen Maschine läuft und die
+Datei gar nicht sehen kann (z.B. kein gemeinsames Netzlaufwerk):
+
+```powershell
+python -m uiflow.cli worker --remote-url http://studio-host:8787 --worker-id robot-1
+```
+
+Meldet sich genauso an wie jeder andere Client (siehe Login oben): ohne `--remote-username` mit dem
+gemeinsamen `UIFLOW_STUDIO_PASSWORD`, mit `--remote-username` über ein per `uiflow create-user
+robot1 --role operator` angelegtes Konto — kein separater API-Key-Mechanismus, sondern dieselbe
+Session/Rollenprüfung wie im Browser. Ohne `--remote-password` wird das Passwort interaktiv abgefragt.
+Claiming, Logging, Haltepunkte, Queue-Items und Job-Abschluss laufen dabei über dieselben Endpunkte,
+die auch ein lokaler Worker letztlich anspricht (`orchestrator/worker.py` kennt intern nur noch einen
+austauschbaren `store` — lokal `orchestrator/db.py` direkt, remote `orchestrator/remote_store.py` über
+HTTP; die Ausführungslogik selbst ist in beiden Fällen identisch).
 
 **Jobs sind jetzt durable**: Status, Zeitstempel und die komplette Log-Historie überleben einen
 Neustart des Studio-Prozesses und sind über die API abrufbar, nicht nur live per SSE:
@@ -341,6 +373,56 @@ Container (`if`, `for_each`, `try`, ...), wiederholt bzw. überspringt `on_error
 bei `for_each` also den kompletten Schleifendurchlauf, nicht nur das zuletzt fehlgeschlagene Element
 (dafür bleibt weiterhin das eigene, unabhängige `max_retries` der Queue-Items zuständig, siehe
 "Orchestrator" unten).
+
+#### Fachlicher vs. technischer Fehler (`fail`)
+
+`complete_queue_item` (siehe "Orchestrator" unten) behandelte bisher jeden Fehler eines Queue-Items
+gleich und versuchte ihn bis `max_retries` erneut — eine ungültige Rechnung wurde dadurch mehrfach
+ungültig verarbeitet, obwohl schon der erste Versuch abschließend war. `fail` löst einen Fehler
+ausdrücklich als einen von zwei Typen aus:
+
+```yaml
+steps:
+  - action: fail
+    message: "Rechnung {item.rechnungsnummer}: Betrag außerhalb des zulässigen Bereichs"
+    type: business       # wird bei einem Queue-Item NIE wiederholt
+
+  - action: fail
+    message: "Zielseite nicht erreichbar"
+    type: technical       # Standard - verhält sich wie jeder andere Step-Fehler
+```
+
+`type: business` markiert das Queue-Item sofort als `failed`, ohne einen Versuch von `max_retries` zu
+verbrauchen und ohne Backoff-Wartezeit — genau richtig für einen Fehler, der beim nächsten Versuch
+identisch wäre. `type: technical` (auch der Standard, wenn `type` weggelassen wird) verhält sich wie
+ein gewöhnlicher Step-Fehler: bei einem Queue-Item zählt er normal gegen `max_retries`. Ein `try` fängt
+beide Arten gleichermaßen ab (unverändert gegenüber jedem anderen Fehler); `on_error` an genau diesem
+`fail`-Step dagegen nicht — "wiederholen" oder "fortsetzen" an einem bewusst ausgelösten Fehler
+anzubringen wäre widersprüchlich.
+
+#### REFramework-Vorlage
+
+Ein Vorbild ist UiPaths REFramework: Initialisierung, Transaktion holen, Transaktion verarbeiten,
+Abschluss, mit fachlicher/technischer Fehlerunterscheidung. Drei der vier Bausteine gibt es hier
+bereits, aus vorhandenen Teilen zusammengesetzt statt als zweite Engine:
+
+- **"Transaktion holen"** übernimmt der Orchestrator selbst (`claim_next_queue_item`) — kein
+  Workflow-Schritt dafür nötig.
+- **Aufräumen zwischen Versuchen** passiert automatisch: ein Queue-Item bekommt bei jedem Versuch
+  (erster Versuch wie Retry gleichermaßen) eine frische Backend-Instanz — `_run_workflow_once` öffnet
+  sie vor dem Lauf und schließt sie danach, ganz gleich ob der Lauf erfolgreich war, fehlgeschlagen ist
+  oder gerade dabei fehlgeschlagen ist. Der nächste Versuch startet also nie auf einem vom vorigen
+  Versuch kaputt hinterlassenen Bildschirmzustand.
+- **Konfiguration statt Werte in den Schritten**: dafür gibt es bereits **Globale Variablen** (Basis-URL,
+  Postfach, Schwellwerte — installationsweit) und **Deklarierte Workflow-Variablen** (Startwerte, die zu
+  genau diesem Workflow gehören) — siehe beide Abschnitte unten.
+- **Fachlich vs. technisch**: siehe `fail` oben.
+
+`workflows/beispiel_reframework.yaml` zeigt das komponiert an einem Rechnungs-Beispiel: Anmeldung,
+fachliche Prüfung *vor* jeder Automatisierung (schlägt sie fehl, startet die eigentliche Automatisierung
+gar nicht erst), die Automatisierung selbst in `try`/`catch` (nimmt bei einem Fehler einen Screenshot auf
+und löst ihn danach ausdrücklich erneut als `type: technical` aus, damit die Queue ihn trotz `try`/`catch`
+weiterhin als Fehlversuch sieht und normal wiederholt).
 
 #### Unterprozesse (`run_workflow`)
 
@@ -517,6 +599,81 @@ Vier Punkte dazu:
 **Keine Geheimnisse hier ablegen** — dafür gibt es Anmeldedaten, deren Werte gar nicht erst in dieser
 Datenbank landen:
 
+## Object Repository (wiederverwendbare Selektoren)
+
+Jede Aktivität trägt sonst ihren Selektor inline — bei Web das Feld `selector`, bei Desktop das Tripel
+`control_type`/`title`/`auto_id`. Ein Element, das an zehn Stellen angesprochen wird, steht damit
+zehnmal im Workflow: ändert die Zielanwendung ihre Oberfläche, müssen alle zehn Stellen gefunden und
+einzeln nachgezogen werden. Das **Object Repository** ist ein zentraler Speicher benannter Elemente,
+gruppiert nach Anwendung/Scope:
+
+```yaml
+# workflows/_object_repository.yaml - kein Workflow, wird aus der Werkzeugliste ausgeschlossen
+MeineApp:
+  Anmelden-Knopf:
+    control_type: Button
+    auto_id: btnOK
+  Rechnungsnummer-Feld:
+    control_type: Edit
+    auto_id: txtRechnung
+example.com:
+  Suchfeld:
+    selector: "#search"
+```
+
+Ein Step referenziert ein Element über `element: "Scope/Name"` statt eigener Selektor-Felder:
+
+```yaml
+steps:
+  - action: click
+    element: "MeineApp/Anmelden-Knopf"
+```
+
+Die Engine löst `element` auf, bevor der Step ans Backend geht (`_resolve_element_reference` in
+`engine.py`) — die Felder aus dem Repository ersetzen dabei jeden inline eingetragenen Selektor auf
+demselben Step vollständig, ein Step trägt also entweder eine Repository-Referenz oder einen eigenen
+Selektor, nie beide gleichzeitig. `element` erlaubt wie jeder andere Parameter auch `{var.x}` — eine
+Referenz kann also zur Laufzeit bestimmt werden, nicht nur wörtlich in der YAML stehen.
+
+Im Studio erscheint bei jedem Selector-/Control-Feld ein Abschnitt **Object Repository**: eine Auswahl
+vorhandener `Scope/Name`-Einträge (leer = eigener Selektor bleibt aktiv) sowie ein Button, der die
+aktuell eingetragenen Felder des Steps unter einem neuen Namen im Repository ablegt. Drei Punkte dazu:
+
+- **Ablage**: anders als Anmeldedaten ist ein Selektor kein Geheimnis und gehört versioniert neben die
+  Workflows (`workflows/_object_repository.yaml`), nicht in `orchestrator.db` — so lässt sich eine
+  Änderung an der Oberfläche mit den betroffenen Workflows zusammen reviewen und zurückrollen.
+- **Scope ist frei wählbar.** Für Desktop bietet sich der `launch`-Pfad oder `connect`-Titel an (der
+  Vorschlag im Speichern-Dialog übernimmt ihn automatisch), für Web mangels eines vergleichbaren
+  Scope-Begriffs meist die Domain — beides ist aber nur ein Vorschlag, kein erzwungenes Schema.
+- **Auflösung, nicht Textersatz.** Weil ein Desktop-Element auf *mehrere* Felder abbildet
+  (`control_type`/`title`/`auto_id`), reicht eine reine `{var.x}`-Textersetzung nicht — die Engine löst
+  die Referenz deshalb als eigenen Schritt vor dem Backend-Dispatch auf, nicht über das
+  Platzhalter-Muster.
+
+### Fallback-Selektoren
+
+Ein Element im Repository kann mehrere alternative Feldsätze tragen, der Reihe nach versucht, bis
+einer tatsächlich passt — die Fallback-Strategie, die UiPath für Legacy- oder instabile Oberflächen
+anbietet:
+
+```yaml
+MeineApp:
+  Suchfeld:
+    - selector: "#search"          # zuerst versucht
+    - selector: "input[name=q]"    # Fallback, falls #search nicht (mehr) existiert
+```
+
+Kann das Backend prüfen, ob ein Kandidat gerade existiert (`element_exists` — für Web per Playwright-
+Selektor, für Desktop per `pywinauto child_window(...).exists()`), probiert die Engine die Kandidaten
+der Reihe nach durch und nimmt den ersten, der zutrifft. Passt keiner (oder kann das Backend das nicht
+prüfen), wird trotzdem der erste Kandidat verwendet — der eigentliche Schritt läuft dann normal weiter
+und meldet einen gewohnten, klaren Fehler, statt dass der Schritt still übersprungen wird.
+
+Im Studio erscheint der Button **+ Alternative aufnehmen** (dasselbe Auswahl-Symbol wie beim normalen
+Picker) anstelle von "Als Element speichern", sobald eine Repository-Referenz aktiv ist — er startet
+denselben Klick-zu-Auswählen-Ablauf, hängt das Ergebnis aber als zusätzlichen Kandidaten an, statt es
+zu überschreiben.
+
 ## Anmeldedaten (Credentials)
 
 `get_credential` liest ein Geheimnis (Passwort, API-Key, ...) zur Laufzeit in eine Variable ein, ohne
@@ -546,9 +703,39 @@ python -m uiflow.cli scheduler
 `uiflow studio` läuft standardmäßig ohne Anmeldung — als lokales Single-User-Tool auf `127.0.0.1`.
 Setzt man vor dem Start die Umgebungsvariable `UIFLOW_STUDIO_PASSWORD`, verlangt die Studio-Oberfläche
 ein gemeinsames Passwort, bevor UI und API erreichbar sind (z.B. wenn `--host` auf mehr als Loopback
-gebunden wird). Das ist bewusst ein einfaches Shared-Password-Gate, **kein** vollständiges
-Multi-User-/Rechte-System (siehe Roadmap) — für mehrere Personen mit getrennten Konten/Berechtigungen
-wäre mehr nötig.
+gebunden wird). Das ist ein einfaches Shared-Password-Gate ohne einzelne Konten oder Rollen — für mehrere
+Personen mit getrennten Konten und Berechtigungen siehe den nächsten Abschnitt.
+
+## Benutzer & Rollen (RBAC)
+
+Sobald mindestens ein Benutzer angelegt wurde, schaltet die Studio-Oberfläche automatisch von der
+einfachen Passwort-Anmeldung auf individuelle Konten um — kein Neustart und keine zusätzliche
+Umgebungsvariable nötig, es reicht:
+
+```powershell
+python -m uiflow.cli create-user alice --role admin
+```
+
+`--role` ist `viewer`, `operator` oder `admin` (Standard `admin` für den allerersten Account). Ohne
+`--password` fragt der Befehl das Passwort interaktiv ab (mit Wiederholung). Ein bestehendes Konto lässt
+sich mit `--update` neu setzen (Passwort und/oder Rolle):
+
+```powershell
+python -m uiflow.cli create-user alice --update --role operator
+```
+
+Die drei Rollen sind hierarchisch (`viewer` < `operator` < `admin`):
+
+- **viewer** — nur lesen: Workflows, Runs und Queues ansehen, aber nichts ausführen oder speichern.
+- **operator** — zusätzlich Workflows bauen/speichern, Runs starten/stoppen, Queues befüllen, Zeitpläne
+  anlegen. Kein Zugriff auf Anmeldedaten, globale Variablen oder die Benutzerverwaltung selbst.
+- **admin** — alles, inklusive Anmeldedaten, globale Variablen und Benutzerverwaltung (Tab **Benutzer**,
+  nur für Admins sichtbar).
+
+Ein Admin kann sich selbst weder die Admin-Rolle entziehen noch das eigene Konto löschen (schützt davor,
+dass sich eine Installation versehentlich aussperrt). Solange kein einziger Benutzer angelegt wurde,
+verhält sich `uiflow studio` exakt wie zuvor (kein Login oder das einfache `UIFLOW_STUDIO_PASSWORD`-Gate)
+— die Umstellung ist rein additiv und ändert nichts an bestehenden Installationen.
 
 ## Tests
 
@@ -562,78 +749,101 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
 
 ## Was fehlt bis zu einem "echten" Tool (Roadmap)
 
-- **Orchestrator über eine Maschine hinaus**: `uiflow worker`/`uiflow scheduler` können heute schon
-  mehrfach gegen dieselbe `orchestrator.db` laufen, aber nur, wenn alle Prozesse Zugriff auf dieselbe
-  Datei haben (z.B. Netzlaufwerk). Für echte Remote-Worker fehlt noch ein Netzwerk-Layer (Worker
-  registrieren sich per HTTP statt direktem DB-Zugriff).
-- **Echtes Multi-User-/Rechte-System**: das optionale Login (`UIFLOW_STUDIO_PASSWORD`) ist ein
-  einzelnes geteiltes Passwort ohne einzelne Konten, Rollen oder Berechtigungen — bewusst minimal
-  gehalten, kein Ersatz für echtes RBAC.
-- **Framework-Vorlage nach Vorbild des UiPath REFramework**: Die Kernschleife gibt es bereits —
-  `_run_queue_driven` ist das "Process Transaction"-Muster, mit Retry samt Backoff, Status je Item und
-  Job-Logs. Was fehlt, ist der Rahmen darum herum, den man heute in jedem Projekt neu baut:
-  - **Zustände**: Initialisierung (Konfiguration lesen, Anwendungen öffnen), Transaktion holen,
-    Transaktion verarbeiten, Abschluss (Anwendungen schließen, Abschlussbericht) als vorgegebenes
-    Gerüst statt als handgebauter Ablauf.
-  - **Konfiguration**: eine Einstellungsdatei bzw. ein Konfigurationsblatt, aus dem der Prozess seine
-    Parameter zieht, statt sie in die Schritte zu schreiben.
-  - **Fachlicher vs. technischer Fehler**: der wichtigste Punkt, weil er die bestehende Retry-Logik
-    betrifft. `complete_queue_item` behandelt heute *jeden* Fehler gleich und versucht es bis
-    `max_retries` erneut. Eine ungültige Rechnung wird dadurch dreimal ungültig verarbeitet, obwohl
-    schon der erste Versuch abschließend war — ein fachlicher Fehler darf nie wiederholt werden, nur
-    ein technischer. Dafür müsste die Engine beide Arten unterscheiden können und die Queue die
-    Unterscheidung mitführen.
-  - **Aufräumen zwischen Fehlversuchen**: Zielanwendung nach einem Fehler schließen und neu öffnen,
-    statt den nächsten Versuch auf einem kaputten Bildschirmzustand starten zu lassen.
-
-  Sinnvollerweise als Vorlage, die aus den vorhandenen Bausteinen erzeugt wird — keine zweite Engine
-  neben der bestehenden.
-- **Flowchart-Ansicht** (frei platzierte Knoten mit Verbindungspfeilen, wie UiPaths Flowchart oder
-  n8n). Der Builder ist ein Sequenz-Designer — er bildet den Ablauf als verschachtelte Kartenliste ab,
-  passend zum sequenziellen YAML-Format. Eine Flowchart-Ansicht bräuchte ein eigenes Format mit Knoten,
-  Kanten und Koordinaten und ist deshalb bewusst noch nicht gebaut.
-- **UI Explorer (Oberflächen analysieren)**: Zum Erkunden einer Zielanwendung gibt es heute zwei
+- ~~**Orchestrator über eine Maschine hinaus**~~ — erledigt: `uiflow worker --remote-url ...` spricht
+  die Job-Queue über HTTP an (`/api/worker/*`, siehe "Remote-Worker" oben), statt `orchestrator.db`
+  direkt zu öffnen — ein Worker auf einer anderen Maschine ohne jeden Datei-Zugriff auf diese Datenbank
+  funktioniert damit genauso wie einer auf derselben Maschine. `uiflow scheduler` bleibt bewusst
+  serverseitig (er *erzeugt* nur Jobs in derselben Queue, die dann ganz normal von jedem Worker —
+  lokal oder remote — abgeholt werden), ebenso wie Studios eingebetteter Scheduler-Thread. Was bewusst
+  fehlt: kein automatisches Requeuing, wenn ein Remote-Worker mitten in einem Job abstürzt (der Job
+  bleibt `running`, bis er manuell gestoppt oder von Hand erneut eingereiht wird) — dafür bräuchte es
+  ein Heartbeat/Lease-Verfahren, das es heute weder für lokale noch für Remote-Worker gibt.
+- ~~**Echtes Multi-User-/Rechte-System**~~ — erledigt: `uiflow create-user` legt einzelne Konten mit
+  Rollen (`viewer`/`operator`/`admin`) an, siehe "Benutzer & Rollen (RBAC)" oben. Was bewusst fehlt: keine
+  Gruppen/Teams, keine fein granularen Rechte pro Workflow oder Queue (nur die drei globalen Rollen), kein
+  SSO/OAuth — für den Einsatz durch mehrere Personen mit unterschiedlichen Berechtigungsstufen reicht das
+  aktuell.
+- **REFramework-Vorlage im Studio erzeugen**: Die Bausteine (fachlich/technischer Fehler via `fail`,
+  Konfiguration via globale/deklarierte Variablen, "Transaktion holen" via Orchestrator, Aufräumen
+  zwischen Versuchen via frischer Backend-Instanz pro Item) gibt es inzwischen alle — siehe
+  "REFramework-Vorlage" oben und `workflows/beispiel_reframework.yaml`. Was fehlt, ist ein Komfort im
+  Studio selbst: ein Button "Neu aus REFramework-Vorlage" (analog zu "+ Neuer Workflow"), der einen neuen
+  Workflow direkt mit diesem Gerüst vorausfüllt, statt dass man die Beispieldatei von Hand kopiert.
+- ~~**Flowchart-Ansicht**~~ — teilweise erledigt: der Button **Flowchart** (siehe oben) zeigt den
+  Ablauf als automatisch angeordnetes Kästchen-und-Pfeile-Diagramm mit Verzweigungsspalten für
+  `if`/`switch`/`for_each`/`try`. Das ist bewusst eine reine *Visualisierung* des bestehenden
+  sequenziellen YAML-Formats (read-only, automatisches Layout), **nicht** UiPaths/n8ns freies
+  Flowchart mit unabhängig platzierbaren Knoten, beliebiger Kantenführung und einem eigenen
+  Graph-Format als Speicherformat — dafür bräuchte es eine eigene, editierbare Graph-Repräsentation
+  samt eigenem Ausführungsmodell (auch für Zyklen), was ein deutlich größerer, separater Umbau wäre.
+- **UI Explorer (Oberflächen analysieren)**: Zum Erkunden einer Zielanwendung gibt es heute drei
   Teilstücke — `uiflow inspect-desktop "Fenstertitel" --depth 4` druckt den UI-Automation-Baum als Text
-  in die Konsole, und der Picker markiert während der Aufnahme das Element unter dem Mauszeiger. Was
-  fehlt, ist das Werkzeug dazwischen: den Baum interaktiv durchklicken, alle Eigenschaften eines Elements
-  sehen und vor allem **einen Selektor ausprobieren, bevor er in einem Workflow landet**. Drei Lücken:
-  - **Wie viele Treffer?** Ein mehrdeutiger Selektor ist die klassische Ursache dafür, dass ein Bot das
-    falsche Element anklickt — und genau das zeigt heute nichts an. Ein Explorer sollte einen Selektor
-    gegen die laufende Anwendung prüfen und melden, wie viele Elemente passen und welche.
-  - **Web fehlt komplett**: `inspect-desktop` hat kein Gegenstück für den Browser. Playwright kann einen
-    Selektor auswerten und die Treffer hervorheben — die Grundlage dafür ist also schon im Projekt.
-  - **Zwei Element-Modelle**: pywinauto-Eigenschaften auf der einen, DOM plus Playwright-Selektor auf der
-    anderen Seite. Der Explorer bräuchte eine gemeinsame Darstellung (Name, Typ, Eigenschaften, Kinder) —
-    die erzeugt `picker.py` im Kern bereits, bisher nur nicht als durchsuchbaren Baum.
+  in die Konsole, der Picker markiert während der Aufnahme das Element unter dem Mauszeiger, und der
+  Button **Selector prüfen** (Web *und* Desktop, siehe oben) beantwortet die wichtigste Einzelfrage
+  direkt im Eigenschaften-Panel: wie viele Elemente die bereits eingetragenen Felder auf der Seite bzw.
+  in der Zielanwendung treffen, und als was — ein mehrdeutiger Treffer wird dabei ausdrücklich als
+  solcher geflaggt, nicht nur gezählt, weil das die klassische Ursache dafür ist, dass ein Bot das
+  falsche Element anklickt. Was fehlt, ist das Werkzeug *dazwischen*: den Baum interaktiv durchklicken
+  und alle Eigenschaften eines Elements sehen, statt nur bereits eingetragene Felder zu prüfen. Weder
+  `inspect-desktop` (nur Text in der Konsole) noch der Prüfen-Button (nur bereits eingetragene Felder)
+  lassen sich interaktiv durchklicken. Der Explorer bräuchte dafür eine gemeinsame Darstellung über
+  beide Backends hinweg (Name, Typ, Eigenschaften, Kinder) — die erzeugt `picker.py` im Kern bereits,
+  bisher nur nicht als Baum.
 
-  Zusammen mit dem nächsten Punkt ergibt das den natürlichen Arbeitsablauf: im Explorer suchen und prüfen,
-  von dort als benanntes Element ins Repository speichern, in Aktivitäten wiederverwenden.
-- **Object Repository (wiederverwendbare Selektoren)**: Heute trägt jede Aktivität ihren Selektor
-  inline — bei Web das Feld `selector`, bei Desktop das Tripel `control_type`/`title`/`auto_id`.
-  "Element auf dem Bildschirm wählen" schreibt genau dorthin. Ein Element, das an zehn Stellen
-  angesprochen wird, steht damit zehnmal im Workflow: ändert die Zielanwendung ihre Oberfläche, müssen
-  alle zehn Stellen gefunden und einzeln nachgezogen werden — der Hauptgrund, warum RPA-Automatisierungen
-  im Betrieb brechen.
-  Gewünscht ist stattdessen ein zentraler Speicher benannter UI-Elemente ("Anmelden-Knopf",
-  "Rechnungsnummer-Feld"): einmal während der Entwicklung aufnehmen, danach in beliebigen Aktivitäten
-  per Name referenzieren, und bei einer UI-Änderung an genau einer Stelle korrigieren.
-  Drei Punkte, die den Zuschnitt bestimmen und deshalb vor der Umsetzung geklärt sein wollen:
-  - **Auflösung in der Engine**: `substitute_variables` ersetzt heute `{var.x}`/`{item.x}` rein
-    textuell in den Step-Parametern. Für ein Repository reicht das nicht, weil ein Desktop-Element auf
-    *drei* Felder abbildet, nicht auf einen String. Die Engine müsste eine Element-Referenz vor dem
-    Dispatch ans Backend zu den passenden Parametern auflösen — ein eigener Schritt in `_run_backend_step`,
-    kein zusätzliches Platzhalter-Muster.
-  - **Zuordnung zur Anwendung**: ein Selektor gilt nur innerhalb seiner Anwendung. Der bestehende
-    Scope-Begriff (`launch`/`connect` als erster Schritt) benennt diese Anwendung bereits — er ist der
-    naheliegende Schlüssel, unter dem Elemente gruppiert werden, analog zu UiPaths Aufteilung in
-    Anwendung → Screen → Element.
-  - **Ablage**: anders als Anmeldedaten sind Selektoren kein Geheimnis und gehören versioniert neben die
-    Workflows (eine Datei in `workflows/`), nicht in `orchestrator.db` — sonst lässt sich eine Änderung
-    an der Oberfläche nicht mit dem Workflow zusammen reviewen und zurückrollen.
+  Zusammen mit dem Object Repository (siehe oben) ergäbe das den natürlichen Arbeitsablauf: im Explorer
+  suchen und prüfen, von dort direkt als benanntes Element speichern, statt den Umweg über "Selector
+  prüfen" -> Feld ausfüllen -> "Als Element speichern" zu nehmen.
+- **Bild-basierte Elementerkennung** (wie UiPath es für Legacy-Apps ohne brauchbare UI-Automation-Baum
+  anbietet). Fallback-Selektoren für das Object Repository gibt es inzwischen (siehe oben, mehrere
+  alternative `control_type`/`title`/`auto_id`- bzw. `selector`-Kandidaten, der Reihe nach versucht) —
+  eine Erkennung rein über ein Bildmuster auf dem Bildschirm, unabhängig von jedem Automation-Baum, ist
+  davon unabhängig und fehlt weiterhin.
 
-  Im Studio wären das zwei Ergänzungen: `picker.py` bekommt neben "Felder füllen" ein "als Element
-  speichern", und im Eigenschaften-Panel wird aus dem freien Selektor-Feld eine Auswahl über das
-  Repository plus "neu aufnehmen".
-- **Selectors robuster machen** (Fallback-Strategien, Bild-basierte Erkennung wie UiPath es
-  für Legacy-Apps anbietet). Greift ineinander mit dem Object Repository: sind die Selektoren erst
-  zentral, ist eine Fallback-Strategie eine Eigenschaft des Elements statt jeder einzelnen Aktivität.
+### Weitere Ideen (unpriorisiert, unvalidiert)
+
+Unten gesammelt, aber noch nicht bewertet oder gegen den tatsächlichen Bedarf geprüft — einfach
+Ideen, was als Nächstes sinnvoll sein könnte. Reihenfolge ist keine Priorität.
+
+- **Worker-Heartbeat & automatisches Requeuing**: stürzt ein Worker (lokal oder remote, siehe oben)
+  mitten in einem Job ab, bleibt der Job für immer auf `running` stehen — niemand markiert ihn als
+  abgebrochen oder reiht ihn erneut ein. Bräuchte einen periodischen Heartbeat pro laufendem Job
+  (`last_heartbeat_at`-Spalte) und einen Sweep, der Jobs ohne aktuellen Heartbeat nach einem Timeout
+  wieder auf `queued` zurücksetzt (oder als `error` markiert, je nach Retry-Semantik).
+- **Granulare Berechtigungen pro Workflow/Ordner/Queue**: RBAC kennt heute nur drei globale Rollen
+  (viewer/operator/admin, siehe "Benutzer & Rollen" oben) — kein "Team A darf nur Workflows in Ordner
+  X sehen/starten". Setzt vermutlich eine Ordner-/Projektstruktur (siehe unten) als Voraussetzung
+  voraus, bevor sich Rechte überhaupt sinnvoll darauf beziehen lassen.
+- **Audit-Log**: wer hat wann welchen Workflow gespeichert, gestartet, gestoppt, ein Credential
+  geändert oder einen Benutzer angelegt? Mit RBAC gibt es jetzt einzelne Konten, aber keine Historie
+  ihrer Aktionen — relevant, sobald mehr als eine Person an derselben Installation arbeitet.
+- **Proaktive Fehlerbenachrichtigung** (E-Mail/Slack/Webhook, wenn ein Job oder Queue-Item endgültig
+  fehlschlägt): heute muss man aktiv die Runs-Ansicht oder `/api/jobs?status=error` abfragen. Die
+  Bausteine (`send_email`-Aktion, `http_request`) existieren im Workflow selbst bereits — hier ginge es
+  um eine Orchestrator-seitige Benachrichtigung, unabhängig vom Workflow-Inhalt.
+- **Workflow-Versionierung**: "Speichern" überschreibt die YAML-Datei ohne Historie — kein Diff
+  zwischen zwei Ständen, kein Zurückrollen auf eine ältere Version direkt im Studio. Ließe sich
+  entweder über echtes Git im Hintergrund lösen oder über eine einfache eigene Versions-Tabelle
+  (ähnlich den Job-Snapshots, die es für einzelne Läufe schon gibt).
+- **Testbarkeit von Workflows**: ein "Dry-Run"-Modus, der Ausdrücke/Variablen/Selektoren gegen einen
+  Fake-Backend validiert, ohne den echten Browser/Desktop anzufassen — würde Tippfehler in Python-
+  Ausdrücken oder fehlende Variablen schon beim Speichern statt erst beim echten Lauf auffangen.
+- **Business-Kalender für Zeitpläne**: Cron-Ausdrücke allein kennen keine Feiertage oder "nur an
+  Werktagen" — ein Zeitplan, der z.B. jeden Monatsersten läuft, feuert damit auch an einem Feiertag
+  oder Wochenende, falls der auf den Ersten fällt.
+- **Human-in-the-loop / Action Center**: ein Schritt-Typ, der auf eine menschliche Entscheidung wartet
+  (z.B. "Rechnung > 10.000€ manuell freigeben") über ein Web-Formular — nicht dasselbe wie ein
+  Haltepunkt, der eine Person direkt am Studio voraussetzt, sondern eine asynchrone Freigabe, die auch
+  jemand anderes später erledigen kann.
+- **Ordner-/Projektstruktur**: Workflows, Queues und Credentials liegen heute alle flach nebeneinander
+  (`workflows/*.yaml`, eine gemeinsame Queue-/Credential-Liste). Ab einer gewissen Anzahl Workflows
+  fehlt eine Gruppierung (Ordner oder Projekte) — auch Voraussetzung für granulare Rechte pro Ordner
+  (siehe oben).
+- **Reporting/Analytics über die Zeit**: die Übersicht zeigt heute eine Momentaufnahme (Erfolgsquote,
+  offene Queue-Items). Ein Trend über Zeit (Erfolgsquote pro Woche, durchschnittliche Laufzeit pro
+  Workflow, Engpässe in einer Queue) fehlt.
+- **Versionierte, projektübergreifende Bibliotheken**: ein `run_workflow`-Schritt referenziert heute
+  eine Datei im selben `workflows/`-Verzeichnis per Namen — keine Versionierung, kein Teilen eines
+  wiederverwendbaren Sub-Workflows über mehrere unabhängige Installationen hinweg.
+- **Mobile-/App-Automatisierung** (Android/iOS, z.B. über Appium) als dritter Backend-Typ neben
+  Web und Desktop — bisher nicht einmal angedacht, wäre ein eigener Backend + eigene
+  Aktivitäten-Kategorie im Katalog.

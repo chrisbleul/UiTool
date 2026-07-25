@@ -6,6 +6,7 @@ import re
 import time
 from typing import Any, Callable, Optional
 
+from . import object_repository
 from .models import Step, Workflow, load_workflow_by_name, parse_steps
 
 logger = logging.getLogger("uiflow")
@@ -81,6 +82,17 @@ class WorkflowCancelled(RuntimeError):
     def __init__(self, index: int):
         super().__init__(f"Cancelled before step {index}")
         self.index = index
+
+
+class BusinessError(RuntimeError):
+    """Raised by a `fail` step with type: business - signals that this failure
+    is final and must never be retried (an invalid invoice is still invalid on
+    a second attempt), as opposed to a technical error (a timeout, a crashed
+    app), which a queue-driven job's normal retry-with-backoff should keep
+    retrying. Deliberately not wrapped in StepError like other step failures:
+    it needs to propagate distinctly through orchestrator/worker.py's
+    _run_queue_driven so an item can be marked failed immediately - without
+    consuming a retry - instead of being treated like any other exception."""
 
 
 class WorkflowEngine:
@@ -278,6 +290,8 @@ class WorkflowEngine:
             self._run_read_pdf(step, index)
         elif step.action == "ocr_image":
             self._run_ocr_image(step, index)
+        elif step.action == "fail":
+            self._run_fail(step, index)
         else:
             self._run_backend_step(step, index)
 
@@ -369,7 +383,7 @@ class WorkflowEngine:
             self._run_steps(try_body, on_breakpoint, should_stop, f"{path}.steps")
         except WorkflowCancelled:
             raise  # a user-requested stop must propagate, not be swallowed as a "handled" error
-        except (StepError, ValueError) as exc:
+        except (StepError, ValueError, BusinessError) as exc:
             message = str(exc)
             self._log("[%d] try: caught error -> %s", index, message)
             if error_var:
@@ -497,6 +511,18 @@ class WorkflowEngine:
             new_value = int(new_value)
         self._log("[%d] increment %s -> %s", index, name, new_value)
         self.variables[name] = new_value
+
+    def _run_fail(self, step: Step, index: int) -> None:
+        message = substitute_variables(step.params.get("message", ""), self.variables)
+        error_type = step.params.get("type", "technical")
+        if error_type not in ("business", "technical"):
+            raise StepError(
+                index, step, ValueError(f"Unknown fail type '{error_type}', expected 'business' or 'technical'")
+            )
+        self._log("[%d] fail (%s): %s", index, error_type, message)
+        if error_type == "business":
+            raise BusinessError(message)
+        raise StepError(index, step, RuntimeError(message))
 
     def _run_read_excel(self, step: Step, index: int) -> None:
         path = step.params.get("path")
@@ -679,11 +705,58 @@ class WorkflowEngine:
             return [self._redact_secrets(v) for v in value]
         return value
 
+    def _resolve_element_reference(self, params: dict[str, Any], step: Step, index: int) -> dict[str, Any]:
+        """Resolves an Object Repository reference (`element: "Scope/Name"`)
+        to the selector fields it names, in place of writing them inline on
+        every step that targets the same element - the one place a UI change
+        needs fixing instead of wherever that element happens to be used.
+        Repository fields replace any inline selector fields on the same step
+        (a step either references a repository element or carries its own
+        selector, not both) - `element` is consumed here and never reaches the
+        backend method itself.
+
+        An element can carry more than one candidate field-set (fallbacks,
+        added via the Studio's "+ Alternative aufnehmen" or
+        object_repository.add_fallback) - if the backend can report whether a
+        given one currently matches (`element_exists`), they're tried in
+        order and the first that does is used, exactly the fallback-selector
+        behaviour UiPath offers for legacy/flaky apps. Without that capability
+        (or if none of them match right now), the first candidate is used, so
+        the real action's own resolution/timeout still produces its usual,
+        clear error instead of a silent no-op here."""
+        ref = params.pop("element", None)
+        if not ref:
+            return params
+        if "/" not in ref:
+            raise StepError(index, step, ValueError(f"Invalid element reference '{ref}', expected 'Scope/Name'"))
+        scope, name = ref.split("/", 1)
+        candidates = object_repository.get_element_candidates(scope, name)
+        if not candidates:
+            raise StepError(
+                index, step, ValueError(f"No element '{name}' in scope '{scope}' in the object repository")
+            )
+        fields = self._pick_matching_candidate(candidates)
+        return {**params, **fields}
+
+    def _pick_matching_candidate(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+        if len(candidates) == 1:
+            return candidates[0]
+        exists = getattr(self.backend, "element_exists", None)
+        if callable(exists):
+            for fields in candidates:
+                try:
+                    if exists(**fields):
+                        return fields
+                except Exception:  # noqa: BLE001 - a candidate that can't even be checked just isn't a match
+                    continue
+        return candidates[0]
+
     def _run_backend_step(self, step: Step, index: int) -> None:
         handler = getattr(self.backend, step.action, None)
         if not callable(handler):
             raise StepError(index, step, AttributeError(f"Backend has no action '{step.action}'"))
         resolved_params = substitute_variables(step.params, self.variables)
+        resolved_params = self._resolve_element_reference(resolved_params, step, index)
         self._log("[%d] %s(%s)", index, step.action, resolved_params)
         try:
             result = handler(**resolved_params)

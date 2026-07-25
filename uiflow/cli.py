@@ -88,11 +88,34 @@ def cmd_studio(args: argparse.Namespace) -> int:
 
 
 def cmd_worker(args: argparse.Namespace) -> int:
-    """Run a standalone worker that claims and executes queued jobs from the orchestrator DB."""
+    """Run a standalone worker that claims and executes queued jobs - either
+    directly against the local orchestrator.db (default), or, with
+    --remote-url, against a Studio server on a different machine over HTTP
+    (see orchestrator/remote_store.py) - a worker with no filesystem access to
+    that machine's orchestrator.db at all."""
     from .orchestrator.worker import run_worker_loop
 
-    print(f"uiflow worker '{args.worker_id or '(auto)'}' polling for jobs (Ctrl+C to stop)")
-    run_worker_loop(worker_id=args.worker_id, poll_interval=args.poll_interval)
+    store = None
+    if args.remote_url:
+        import getpass
+
+        from .orchestrator.remote_store import RemoteStore, RemoteStoreError
+
+        password = args.remote_password or getpass.getpass(f"Passwort für {args.remote_url}: ")
+        store = RemoteStore(args.remote_url)
+        try:
+            store.login(password, username=args.remote_username)
+        except RemoteStoreError as exc:
+            print(f"Anmeldung an {args.remote_url} fehlgeschlagen: {exc}")
+            return 1
+        print(f"uiflow worker '{args.worker_id or '(auto)'}' polling {args.remote_url} for jobs (Ctrl+C to stop)")
+    else:
+        print(f"uiflow worker '{args.worker_id or '(auto)'}' polling for jobs (Ctrl+C to stop)")
+
+    kwargs: dict = {"worker_id": args.worker_id, "poll_interval": args.poll_interval}
+    if store is not None:
+        kwargs["store"] = store
+    run_worker_loop(**kwargs)
     return 0
 
 
@@ -102,6 +125,49 @@ def cmd_scheduler(args: argparse.Namespace) -> int:
 
     print("uiflow scheduler polling for due schedules (Ctrl+C to stop)")
     run_scheduler_loop(poll_interval=args.poll_interval)
+    return 0
+
+
+def cmd_create_user(args: argparse.Namespace) -> int:
+    """Creates (or, with --update, updates the password/role of) a Studio user
+    account - the entry point for switching an installation from the default,
+    frictionless single-user mode into per-account login/RBAC (see
+    orchestrator/db.py's users table). The moment one account exists,
+    studio/app.py requires per-account login instead of the shared
+    UIFLOW_STUDIO_PASSWORD gate (or no gate at all)."""
+    import getpass
+
+    from werkzeug.security import generate_password_hash
+
+    from .orchestrator import db
+
+    db.init_db()
+    existing = db.get_user(args.username)
+    if existing and not args.update:
+        print(f"User '{args.username}' existiert bereits (--update verwenden, um Passwort/Rolle zu ändern)")
+        return 1
+    if not existing and args.update:
+        print(f"User '{args.username}' existiert noch nicht (--update weglassen, um ihn anzulegen)")
+        return 1
+
+    password = args.password
+    if not password:
+        password = getpass.getpass("Passwort: ")
+        if password != getpass.getpass("Passwort (Wiederholung): "):
+            print("Passwörter stimmen nicht überein")
+            return 1
+    if not password:
+        print("Passwort darf nicht leer sein")
+        return 1
+
+    password_hash = generate_password_hash(password)
+    if existing:
+        db.set_user_password(args.username, password_hash)
+        db.set_user_role(args.username, args.role)
+        print(f"User '{args.username}' aktualisiert (Rolle: {args.role})")
+    else:
+        db.create_user(args.username, password_hash, args.role)
+        print(f"User '{args.username}' angelegt (Rolle: {args.role})")
     return 0
 
 
@@ -135,11 +201,34 @@ def build_parser() -> argparse.ArgumentParser:
     worker_p = sub.add_parser("worker", help="Run a standalone worker that executes queued orchestrator jobs")
     worker_p.add_argument("--worker-id", default=None, help="Identifier for this worker (default: auto-generated)")
     worker_p.add_argument("--poll-interval", type=float, default=1.0, help="Seconds between queue polls when idle")
+    worker_p.add_argument(
+        "--remote-url",
+        default=None,
+        help="Studio server to poll over HTTP instead of a local orchestrator.db "
+        "(e.g. http://studio-host:8787) - for a worker on a different machine",
+    )
+    worker_p.add_argument(
+        "--remote-username", default=None, help="Only needed if the server uses per-account login (RBAC)"
+    )
+    worker_p.add_argument(
+        "--remote-password", default=None, help="Prompted interactively if omitted (with --remote-url)"
+    )
     worker_p.set_defaults(func=cmd_worker)
 
     scheduler_p = sub.add_parser("scheduler", help="Run a standalone scheduler that enqueues jobs for due cron schedules")
     scheduler_p.add_argument("--poll-interval", type=float, default=20.0, help="Seconds between schedule checks")
     scheduler_p.set_defaults(func=cmd_scheduler)
+
+    user_p = sub.add_parser(
+        "create-user", help="Create or update a Studio user account (switches the Studio into per-account login/RBAC)"
+    )
+    user_p.add_argument("username")
+    user_p.add_argument("--role", choices=["viewer", "operator", "admin"], default="admin")
+    user_p.add_argument("--password", default=None, help="Set non-interactively (e.g. for scripting); otherwise prompted")
+    user_p.add_argument(
+        "--update", action="store_true", help="Update an existing user's password/role instead of creating a new one"
+    )
+    user_p.set_defaults(func=cmd_create_user)
 
     return parser
 

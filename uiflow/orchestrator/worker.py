@@ -16,6 +16,15 @@ thread touch UI Automation concurrently with one - is what studio/picker.py
 and studio/recorder.py encode). The worker loop is a plain synchronous loop;
 concurrency here is between separate *processes* (workers), coordinated only
 through the SQLite job/queue tables.
+
+Store note: every function below takes a `store` parameter (default: the
+local `db` module) instead of calling `db.xxx(...)` directly, so the exact
+same claiming/logging/finishing logic also works for a worker that has no
+filesystem access to orchestrator.db at all - see remote_store.RemoteStore,
+which implements the same method surface over the /api/worker/* HTTP API
+(studio/app.py) for a worker running on a different machine. Nothing here
+changes for the local case: `db` the module satisfies that surface already,
+so passing it as the default is a no-op.
 """
 
 from __future__ import annotations
@@ -29,7 +38,7 @@ from datetime import datetime
 from typing import Any
 
 from . import db
-from ..engine import StepError, WorkflowCancelled, WorkflowEngine
+from ..engine import BusinessError, StepError, WorkflowCancelled, WorkflowEngine
 from ..models import Workflow, resolve_sub_workflows
 
 logger = logging.getLogger("uiflow")
@@ -38,18 +47,19 @@ logger = logging.getLogger("uiflow")
 class _DbLogHandler(logging.Handler):
     """Persists this job's log records, filtered by thread id so a job only
     ever sees log lines produced while running *it* - same reasoning as
-    studio/app.py's _QueueLogHandler, just writing to SQLite instead of an
-    in-memory queue."""
+    studio/app.py's _QueueLogHandler, just writing to SQLite (or, via `store`,
+    the remote worker API) instead of an in-memory queue."""
 
-    def __init__(self, job_id: str, thread_id: int):
+    def __init__(self, job_id: str, thread_id: int, store: Any = db):
         super().__init__()
         self._job_id = job_id
         self._thread_id = thread_id
+        self._store = store
 
     def emit(self, record: logging.LogRecord) -> None:
         if record.thread != self._thread_id:
             return
-        db.add_log(self._job_id, record.levelname, self.format(record))
+        self._store.add_log(self._job_id, record.levelname, self.format(record))
 
 
 def _make_backend(workflow: Workflow) -> Any:
@@ -67,6 +77,7 @@ def _run_workflow_once(
     workflow: Workflow,
     variables: dict[str, Any] | None = None,
     sub_workflows: dict[str, Workflow] | None = None,
+    store: Any = db,
 ) -> None:
     # Tracks whether this run was ever paused at a breakpoint - if the user then
     # clicks "Stoppen" while paused there (mid-debug), we deliberately skip
@@ -77,27 +88,27 @@ def _run_workflow_once(
     def on_breakpoint(index: int, step, variables: dict[str, Any], path: str) -> None:
         nonlocal reached_breakpoint
         reached_breakpoint = True
-        db.set_paused(job_id, index, step.action, variables, path)
-        while not db.wait_and_clear_resume(job_id):
-            if db.is_stop_requested(job_id):
+        store.set_paused(job_id, index, step.action, variables, path)
+        while not store.wait_and_clear_resume(job_id):
+            if store.is_stop_requested(job_id):
                 break
             time.sleep(0.3)
-        db.set_paused(job_id, None, None, path=None)
+        store.set_paused(job_id, None, None, path=None)
 
     backend = _make_backend(workflow)
     try:
         WorkflowEngine(backend).run(
             workflow,
             on_breakpoint=on_breakpoint,
-            should_stop=lambda: db.is_stop_requested(job_id),
+            should_stop=lambda: store.is_stop_requested(job_id),
             variables=variables,
             # Read per run, not per job: editing a global takes effect on the
             # next run without re-queuing anything.
-            global_variables=db.get_global_variables(),
+            global_variables=store.get_global_variables(),
             sub_workflows=sub_workflows,
         )
     finally:
-        stopped_while_debugging = reached_breakpoint and db.is_stop_requested(job_id)
+        stopped_while_debugging = reached_breakpoint and store.is_stop_requested(job_id)
         if stopped_while_debugging:
             logger.info("Stopped while paused at a breakpoint - leaving the target application open")
         else:
@@ -109,9 +120,9 @@ def _run_workflow_once(
                     pass
 
 
-def _run_job(job: dict[str, Any]) -> None:
+def _run_job(job: dict[str, Any], store: Any = db) -> None:
     job_id = job["id"]
-    handler = _DbLogHandler(job_id, threading.get_ident())
+    handler = _DbLogHandler(job_id, threading.get_ident(), store=store)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
@@ -126,32 +137,32 @@ def _run_job(job: dict[str, Any]) -> None:
         failed = 0
         processed = 0
         if queue_name:
-            processed, failed = _run_queue_driven(job_id, workflow_dict, queue_name, sub_workflows)
+            processed, failed = _run_queue_driven(job_id, workflow_dict, queue_name, sub_workflows, store=store)
         else:
             logger.info("Running job '%s'", job["name"])
-            _run_workflow_once(job_id, Workflow.from_raw(workflow_dict), sub_workflows=sub_workflows)
-        if db.is_stop_requested(job_id):
-            db.finish_job(job_id, "cancelled")
+            _run_workflow_once(job_id, Workflow.from_raw(workflow_dict), sub_workflows=sub_workflows, store=store)
+        if store.is_stop_requested(job_id):
+            store.finish_job(job_id, "cancelled")
         elif failed:
             # A queue-driven job keeps going past a failing item on purpose, but
             # it must not then report "success" - the job is only successful if
             # every item it processed ended up succeeding.
-            db.finish_job(job_id, "error", f"{failed} of {processed} queue item(s) failed permanently")
+            store.finish_job(job_id, "error", f"{failed} of {processed} queue item(s) failed permanently")
         else:
-            db.finish_job(job_id, "success")
+            store.finish_job(job_id, "success")
     except WorkflowCancelled:
-        db.finish_job(job_id, "cancelled")
+        store.finish_job(job_id, "cancelled")
     except StepError as exc:
         logger.error(str(exc))
-        db.finish_job(job_id, "error", str(exc))
+        store.finish_job(job_id, "error", str(exc))
     except Exception as exc:  # noqa: BLE001 - surface any failure instead of crashing the worker loop
         logger.error(str(exc))
-        db.finish_job(job_id, "error", str(exc))
+        store.finish_job(job_id, "error", str(exc))
     finally:
         logger.removeHandler(handler)
 
 
-def _sleep_unless_stopped(job_id: str, seconds: float, tick: float = 0.5) -> bool:
+def _sleep_unless_stopped(job_id: str, seconds: float, tick: float = 0.5, store: Any = db) -> bool:
     """Sleeps up to `seconds`, in small slices so a stop request is still picked
     up promptly. Returns False if a stop was requested while waiting."""
     deadline = time.monotonic() + seconds
@@ -159,7 +170,7 @@ def _sleep_unless_stopped(job_id: str, seconds: float, tick: float = 0.5) -> boo
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return True
-        if db.is_stop_requested(job_id):
+        if store.is_stop_requested(job_id):
             return False
         time.sleep(min(tick, remaining))
 
@@ -169,32 +180,33 @@ def _run_queue_driven(
     workflow_dict: dict[str, Any],
     queue_name: str,
     sub_workflows: dict[str, Workflow] | None = None,
+    store: Any = db,
 ) -> tuple[int, int]:
     """Processes the queue until it's exhausted (or stopped), returning
     (processed, permanently_failed) so the caller can set the job's status from
     what actually happened to the items. Both counts are per *item*, not per
     attempt - a retried item is still one item."""
-    queue = db.get_queue_by_name(queue_name)
+    queue = store.get_queue_by_name(queue_name)
     if queue is None:
         raise RuntimeError(f"Queue '{queue_name}' does not exist")
 
     attempted: set[int] = set()
     failed = 0
     while True:
-        if db.is_stop_requested(job_id):
+        if store.is_stop_requested(job_id):
             logger.info("Job stopped; processed %d item(s)", len(attempted))
             return len(attempted), failed
-        item = db.claim_next_queue_item(queue["id"], job_id)
+        item = store.claim_next_queue_item(queue["id"], job_id)
         if item is None:
             # Nothing claimable *right now* isn't the same as an empty queue:
             # items awaiting their retry backoff are still ours to process, so
             # wait them out rather than ending the job with work outstanding.
-            wait_seconds = db.seconds_until_next_retry(queue["id"])
+            wait_seconds = store.seconds_until_next_retry(queue["id"])
             if wait_seconds is None:
                 logger.info("Queue '%s' empty; processed %d item(s)", queue_name, len(attempted))
                 return len(attempted), failed
             logger.info("Queue '%s': waiting %.0fs for the next retry", queue_name, wait_seconds)
-            if not _sleep_unless_stopped(job_id, wait_seconds):
+            if not _sleep_unless_stopped(job_id, wait_seconds, store=store):
                 logger.info("Job stopped; processed %d item(s)", len(attempted))
                 return len(attempted), failed
             continue
@@ -204,17 +216,27 @@ def _run_queue_driven(
         logger.info("[item %d] %s", item["id"], payload)
         try:
             _run_workflow_once(
-                job_id, Workflow.from_raw(workflow_dict), variables={"item": payload}, sub_workflows=sub_workflows
+                job_id,
+                Workflow.from_raw(workflow_dict),
+                variables={"item": payload},
+                sub_workflows=sub_workflows,
+                store=store,
             )
-            db.complete_queue_item(item["id"], True, output={})
+            store.complete_queue_item(item["id"], True, output={})
         except WorkflowCancelled:
             # A user-requested stop says nothing about the item - hand it back
             # untouched (no retry consumed) so the next run picks it up again.
-            db.release_queue_item(item["id"])
+            store.release_queue_item(item["id"])
             logger.info("[item %d] released after stop request", item["id"])
             return len(attempted), failed
+        except BusinessError as exc:
+            # A deliberate `fail type: business` - never retried, since it
+            # would be the identical failure again (see db.complete_queue_item).
+            store.complete_queue_item(item["id"], False, error_message=str(exc), permanent=True)
+            failed += 1
+            logger.error("[item %d] failed permanently (business error): %s", item["id"], exc)
         except Exception as exc:  # noqa: BLE001 - one bad item must not abort the whole queue
-            status = db.complete_queue_item(item["id"], False, error_message=str(exc))
+            status = store.complete_queue_item(item["id"], False, error_message=str(exc))
             if status == "failed":
                 failed += 1
                 logger.error("[item %d] failed permanently: %s", item["id"], exc)
@@ -222,19 +244,24 @@ def _run_queue_driven(
                 logger.warning("[item %d] failed, queued for retry: %s", item["id"], exc)
 
 
-def run_worker_loop(worker_id: str | None = None, poll_interval: float = 1.0, stop_event=None) -> None:
+def run_worker_loop(
+    worker_id: str | None = None, poll_interval: float = 1.0, stop_event=None, store: Any = db
+) -> None:
     """Blocks, repeatedly claiming and running queued jobs, until `stop_event`
     is set (if given) - used both by the standalone `uiflow worker` CLI command
-    and by the Studio's embedded worker thread."""
-    db.init_db()
+    and by the Studio's embedded worker thread. Pass a RemoteStore (see
+    remote_store.py) instead of the default `store=db` to run this loop against
+    a Studio server on a different machine, over HTTP, instead of a shared
+    orchestrator.db file."""
+    store.init_db()
     worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
     logging.getLogger("uiflow").info("Worker '%s' started", worker_id)
     while stop_event is None or not stop_event.is_set():
-        job = db.claim_next_job(worker_id)
+        job = store.claim_next_job(worker_id)
         if job is None:
             time.sleep(poll_interval)
             continue
-        _run_job(job)
+        _run_job(job, store=store)
 
 
 def _schedule_is_due(schedule: dict[str, Any]) -> bool:
