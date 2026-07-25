@@ -75,3 +75,53 @@ def test_workflow_to_dict_round_trips_breakpoint_only_when_set():
     reloaded = Workflow.from_raw(data)
     assert reloaded.steps[0].breakpoint is False
     assert reloaded.steps[1].breakpoint is True
+
+
+def test_step_on_error_defaults_to_none_and_is_parsed_from_yaml():
+    step = Step.from_dict({"action": "click", "selector": "#go"})
+    assert step.on_error is None
+    assert step.retry_count == 3
+    assert step.retry_delay == 2.0
+
+    step = Step.from_dict(
+        {"action": "click", "selector": "#go", "on_error": "retry", "retry_count": 5, "retry_delay": 1.5}
+    )
+    assert step.on_error == "retry"
+    assert step.retry_count == 5
+    assert step.retry_delay == 1.5
+    assert step.params == {"selector": "#go"}  # on_error fields must not leak into params
+
+
+def test_step_rejects_unknown_on_error():
+    with pytest.raises(ValueError):
+        Step.from_dict({"action": "click", "selector": "#go", "on_error": "ignore"})
+
+
+def test_workflow_to_dict_round_trips_on_error_only_when_set():
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[
+            Step("navigate", {"url": "a"}),
+            Step("click", {"selector": "#go"}, on_error="continue"),
+            Step("click", {"selector": "#retry-me"}, on_error="retry", retry_count=4, retry_delay=3.0),
+        ],
+    )
+
+    data = workflow.to_dict()
+
+    assert "on_error" not in data["steps"][0]
+    assert data["steps"][1]["on_error"] == "continue"
+    assert "retry_count" not in data["steps"][1]  # only meaningful (and written) for retry
+    assert data["steps"][2] == {
+        "action": "click",
+        "selector": "#retry-me",
+        "on_error": "retry",
+        "retry_count": 4,
+        "retry_delay": 3.0,
+    }
+
+    reloaded = Workflow.from_raw(data)
+    assert reloaded.steps[0].on_error is None
+    assert reloaded.steps[1].on_error == "continue"
+    assert reloaded.steps[2].retry_count == 4

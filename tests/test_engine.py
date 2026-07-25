@@ -499,6 +499,113 @@ def test_try_lets_workflow_cancelled_propagate_through_catch():
         WorkflowEngine(backend).run(workflow, should_stop=lambda: True)
 
 
+def test_on_error_retry_succeeds_after_transient_failures():
+    class FlakyBackend:
+        def __init__(self):
+            self.attempts = 0
+            self.calls = []
+
+        def click(self, selector):
+            self.attempts += 1
+            if self.attempts < 3:
+                raise RuntimeError("not ready yet")
+            self.calls.append(("click", selector))
+
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[Step("click", {"selector": "#go"}, on_error="retry", retry_count=3, retry_delay=0.01)],
+    )
+    backend = FlakyBackend()
+
+    WorkflowEngine(backend).run(workflow)
+
+    assert backend.attempts == 3
+    assert backend.calls == [("click", "#go")]
+
+
+def test_on_error_retry_gives_up_after_retry_count_and_raises():
+    class AlwaysFailingBackend:
+        def __init__(self):
+            self.attempts = 0
+
+        def click(self, selector):
+            self.attempts += 1
+            raise RuntimeError("boom")
+
+    backend = AlwaysFailingBackend()
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[Step("click", {"selector": "#go"}, on_error="retry", retry_count=2, retry_delay=0)],
+    )
+
+    with pytest.raises(StepError):
+        WorkflowEngine(backend).run(workflow)
+
+    assert backend.attempts == 3  # the original attempt plus 2 retries
+
+
+def test_on_error_continue_swallows_failure_and_runs_next_step():
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[
+            Step("does_not_exist", {}, on_error="continue"),
+            Step("navigate", {"url": "after"}),
+        ],
+    )
+    backend = RecordingBackend()
+
+    WorkflowEngine(backend).run(workflow)
+
+    assert backend.calls == [("navigate", "after")]
+
+
+def test_on_error_retry_stops_immediately_when_stop_is_requested_during_wait():
+    calls = {"n": 0}
+
+    def should_stop():
+        calls["n"] += 1
+        return calls["n"] > 1  # let the first attempt run, then cancel during its retry wait
+
+    class AlwaysFailingBackend:
+        def click(self, selector):
+            raise RuntimeError("boom")
+
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[Step("click", {"selector": "#go"}, on_error="retry", retry_count=5, retry_delay=5.0)],
+    )
+
+    with pytest.raises(WorkflowCancelled):
+        WorkflowEngine(AlwaysFailingBackend()).run(workflow, should_stop=should_stop)
+
+
+def test_on_error_continue_does_not_swallow_workflow_cancelled_from_nested_steps():
+    calls = {"n": 0}
+
+    def should_stop():
+        calls["n"] += 1
+        return calls["n"] > 1  # cancel once the for_each's own body starts iterating
+
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[
+            Step(
+                "for_each",
+                {"items": "[1, 2]", "steps": [{"action": "navigate", "url": "a"}]},
+                on_error="continue",
+            )
+        ],
+    )
+
+    with pytest.raises(WorkflowCancelled):
+        WorkflowEngine(RecordingBackend()).run(workflow, should_stop=should_stop)
+
+
 def test_http_request_stores_result_via_save_as(monkeypatch):
     monkeypatch.setattr(
         "uiflow.http_client.send_http_request",

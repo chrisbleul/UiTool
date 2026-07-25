@@ -14,12 +14,24 @@ VALID_BACKENDS = ("web", "desktop")
 WORKFLOWS_DIR = Path(__file__).resolve().parent.parent / "workflows"
 
 
+VALID_ON_ERROR = ("continue", "retry")
+
+
 @dataclass
 class Step:
     action: str
     params: dict[str, Any] = field(default_factory=dict)
     breakpoint: bool = False
     save_as: str | None = None
+    # Per-step error policy, independent of any enclosing `try`/`catch` (see
+    # engine.py's _run_step_with_policy): None means the existing default -
+    # a failure aborts the workflow. "continue" logs the failure and moves on
+    # to the next step; "retry" re-attempts the same step up to `retry_count`
+    # times, waiting `retry_delay` seconds between attempts, before falling
+    # back to aborting.
+    on_error: str | None = None
+    retry_count: int = 3
+    retry_delay: float = 2.0
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Step":
@@ -30,7 +42,20 @@ class Step:
             raise ValueError(f"Step is missing required 'action' key: {data}") from exc
         breakpoint_flag = bool(data.pop("breakpoint", False))
         save_as = data.pop("save_as", None) or None
-        return cls(action=action, params=data, breakpoint=breakpoint_flag, save_as=save_as)
+        on_error = data.pop("on_error", None) or None
+        if on_error is not None and on_error not in VALID_ON_ERROR:
+            raise ValueError(f"Unknown on_error '{on_error}', expected one of {VALID_ON_ERROR}")
+        retry_count = int(data.pop("retry_count", 3))
+        retry_delay = float(data.pop("retry_delay", 2.0))
+        return cls(
+            action=action,
+            params=data,
+            breakpoint=breakpoint_flag,
+            save_as=save_as,
+            on_error=on_error,
+            retry_count=retry_count,
+            retry_delay=retry_delay,
+        )
 
 
 VALID_BROWSER_CHANNELS = (None, "chrome", "msedge")
@@ -72,6 +97,11 @@ class Workflow:
                 entry["breakpoint"] = True
             if s.save_as:
                 entry["save_as"] = s.save_as
+            if s.on_error:
+                entry["on_error"] = s.on_error
+                if s.on_error == "retry":
+                    entry["retry_count"] = s.retry_count
+                    entry["retry_delay"] = s.retry_delay
             steps.append(entry)
         result: dict[str, Any] = {"name": self.name, "backend": self.backend, "steps": steps}
         if self.browser_channel:

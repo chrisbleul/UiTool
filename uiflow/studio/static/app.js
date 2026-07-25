@@ -207,11 +207,20 @@ function emptySlotsFor(action, actions) {
 }
 
 function makeStep(action, actions) {
-  return { action, params: {}, breakpoint: false, save_as: "", slots: emptySlotsFor(action, actions) };
+  return {
+    action,
+    params: {},
+    breakpoint: false,
+    save_as: "",
+    on_error: "",
+    retry_count: 3,
+    retry_delay: 2,
+    slots: emptySlotsFor(action, actions),
+  };
 }
 
 function rawStepToModel(raw, actions) {
-  const { action, breakpoint, save_as, ...params } = raw;
+  const { action, breakpoint, save_as, on_error, retry_count, retry_delay, ...params } = raw;
   const slots = [];
   for (const field of slotFieldsFor(action, actions)) {
     if (field.type === "cases") {
@@ -228,7 +237,16 @@ function rawStepToModel(raw, actions) {
     }
     delete params[field.name];
   }
-  return { action, params, breakpoint: !!breakpoint, save_as: save_as || "", slots };
+  return {
+    action,
+    params,
+    breakpoint: !!breakpoint,
+    save_as: save_as || "",
+    on_error: on_error || "",
+    retry_count: retry_count ?? 3,
+    retry_delay: retry_delay ?? 2,
+    slots,
+  };
 }
 
 function rawStepsToModel(rawList, actions) {
@@ -249,6 +267,13 @@ function modelStepToRaw(model) {
   }
   if (model.breakpoint) entry.breakpoint = true;
   if (model.save_as) entry.save_as = model.save_as;
+  if (model.on_error) {
+    entry.on_error = model.on_error;
+    if (model.on_error === "retry") {
+      entry.retry_count = model.retry_count ?? 3;
+      entry.retry_delay = model.retry_delay ?? 2;
+    }
+  }
   return entry;
 }
 
@@ -816,6 +841,75 @@ function renderField(step, fieldDef) {
   return wrap;
 }
 
+// Independent of an enclosing `try`/`catch`: lets any single step retry
+// itself a few times or simply be skipped over on failure (see engine.py's
+// _run_step_with_policy), without wrapping it in a try block.
+function renderErrorHandling(step) {
+  const wrap = document.createElement("div");
+  wrap.className = "field error-handling";
+
+  const label = document.createElement("label");
+  label.textContent = "Bei Fehler (unabhängig von Versuchen/Bei Fehler)";
+  const select = document.createElement("select");
+  const options = [
+    { value: "", text: "Abbrechen (Standard)" },
+    { value: "continue", text: "Fortsetzen" },
+    { value: "retry", text: "Wiederholen" },
+  ];
+  for (const opt of options) {
+    const el2 = document.createElement("option");
+    el2.value = opt.value;
+    el2.textContent = opt.text;
+    if ((step.on_error || "") === opt.value) el2.selected = true;
+    select.appendChild(el2);
+  }
+  select.addEventListener("change", () => {
+    pushUndo();
+    step.on_error = select.value;
+    renderProperties(); // retry fields only make sense once "retry" is picked
+  });
+  wrap.append(label, select);
+
+  if (step.on_error === "retry") {
+    const row = document.createElement("div");
+    row.className = "field-row";
+
+    const countWrap = document.createElement("div");
+    countWrap.className = "field";
+    const countLabel = document.createElement("label");
+    countLabel.textContent = "Anzahl Versuche";
+    const countInput = document.createElement("input");
+    countInput.type = "number";
+    countInput.min = "1";
+    countInput.value = step.retry_count ?? 3;
+    countInput.addEventListener("focus", () => pushUndo());
+    countInput.addEventListener("input", () => {
+      step.retry_count = parseInt(countInput.value, 10) || 1;
+    });
+    countWrap.append(countLabel, countInput);
+
+    const delayWrap = document.createElement("div");
+    delayWrap.className = "field";
+    const delayLabel = document.createElement("label");
+    delayLabel.textContent = "Wartezeit zwischen Versuchen (s)";
+    const delayInput = document.createElement("input");
+    delayInput.type = "number";
+    delayInput.min = "0";
+    delayInput.step = "0.5";
+    delayInput.value = step.retry_delay ?? 2;
+    delayInput.addEventListener("focus", () => pushUndo());
+    delayInput.addEventListener("input", () => {
+      step.retry_delay = parseFloat(delayInput.value) || 0;
+    });
+    delayWrap.append(delayLabel, delayInput);
+
+    row.append(countWrap, delayWrap);
+    wrap.appendChild(row);
+  }
+
+  return wrap;
+}
+
 function renderProperties() {
   const body = el("properties-body");
   const title = el("properties-title");
@@ -885,6 +979,8 @@ function renderProperties() {
   });
   saveAsWrap.append(saveAsLabel, saveAsInput);
   body.appendChild(saveAsWrap);
+
+  body.appendChild(renderErrorHandling(step));
 
   const fieldDefs = actions[step.action] || [];
   const hasSelectorField = fieldDefs.some((f) => f.name === "selector");

@@ -291,6 +291,36 @@ geschrieben und ausgeführt, wie ein lokales Skript, nicht von nicht vertrauensw
 sondern beliebig verschachtelte Sub-Blöcke); ein per Stop-Button angefordertes Abbrechen wird davon
 absichtlich **nicht** abgefangen.
 
+#### Fehlerbehandlung pro Step (`on_error`)
+
+Jeder einzelne Step kann zusätzlich `on_error` tragen — unabhängig davon, ob er in einem `try`/`catch`
+steckt:
+
+```yaml
+steps:
+  - action: click
+    selector: "#lade-daten"
+    on_error: retry            # oder: continue
+    retry_count: 5              # Standard: 3 - nur bei on_error: retry relevant
+    retry_delay: 3               # Sekunden zwischen Versuchen, Standard: 2 - nur bei on_error: retry relevant
+
+  - action: click
+    selector: "#optionaler-hinweis-schließen"
+    on_error: continue           # Fehler wird geloggt, der Workflow läuft trotzdem weiter
+```
+
+Ohne `on_error` bricht ein Step den Workflow beim ersten Fehler weiterhin ab (wie bisher), sofern kein
+umschließendes `try` ihn abfängt. `retry` wiederholt genau diesen Step an Ort und Stelle bis zu
+`retry_count`-mal, mit `retry_delay` Sekunden Wartezeit dazwischen — schlägt auch der letzte Versuch fehl,
+bricht der Step wie ohne `on_error` ab. `continue` protokolliert den Fehler und macht beim nächsten Step
+weiter, ohne den Rest des Workflows abzubrechen. Ein per Stop-Button angefordertes Abbrechen wird von
+keiner der beiden Optionen abgefangen — auch nicht während der Wartezeit zwischen zwei Retry-Versuchen,
+die dafür in kurzen Schritten geprüft wird, statt sie ungeprüft durchzuschlafen. Ist der Step selbst ein
+Container (`if`, `for_each`, `try`, ...), wiederholt bzw. überspringt `on_error` den gesamten Container —
+bei `for_each` also den kompletten Schleifendurchlauf, nicht nur das zuletzt fehlgeschlagene Element
+(dafür bleibt weiterhin das eigene, unabhängige `max_retries` der Queue-Items zuständig, siehe
+"Orchestrator" unten).
+
 #### Unterprozesse (`run_workflow`)
 
 `run_workflow` führt eine andere Workflow-Datei als Baustein aus — für Schrittfolgen, die in mehreren
@@ -478,10 +508,6 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
 - **Recorder-Feinschliff**: der Aufnahme-Modus (`uiflow/studio/recorder.py`) deckt Klick + Texteingabe
   ab; Drag, Rechtsklick, Scroll, Tastenkombinationen und Mehrfach-Fenster-Scopes werden noch nicht
   erfasst.
-- **Fehlerbehandlung pro einzelnem Step** (Retry/Continue direkt an einem Step, unabhängig von einem
-  umschließenden `try`): aktuell fängt nur ein expliziter `try`/`catch`-Block Fehler ab; ein Step ohne
-  `try` drumherum bricht den Workflow beim ersten Fehler weiterhin ab (Queue-Items haben ihr eigenes,
-  davon unabhängiges Retry via `max_retries`).
 - **Unterprozesse beim Einreihen auflösen**: `run_workflow` gibt es inzwischen (siehe oben), es löst
   den Namen aber erst zur Laufzeit auf. `create_job` legt sonst den kompletten Workflow als JSON in der
   Job-Zeile ab, damit ein Job exakt das ausführt, was beim Einreihen galt — für Unterprozesse gilt diese

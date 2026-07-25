@@ -3,6 +3,7 @@ from __future__ import annotations
 import builtins
 import logging
 import re
+import time
 from typing import Any, Callable, Optional
 
 from .models import Step, Workflow, load_workflow_by_name
@@ -99,6 +100,13 @@ class WorkflowEngine:
     identify a step in the Studio's statically rendered canvas - so breakpoints
     additionally report a `path`, the step's structural address in the workflow
     definition (see _run_steps).
+
+    Every step also carries its own `on_error` policy (see
+    _run_step_with_policy), independent of any enclosing `try`/`catch`:
+    "retry" re-attempts the step in place, "continue" logs the failure and
+    moves on. Neither needs a `try` block around the step, unlike the
+    engine-level `try` action, which only catches failures inside its own
+    `steps`.
     """
 
     def __init__(self, backend: object):
@@ -162,38 +170,93 @@ class WorkflowEngine:
                     logger.info("Workflow abgebrochen vor Schritt %d", index)
                     raise WorkflowCancelled(index)
 
-            if step.action == "if":
-                self._run_if(step, index, path, on_breakpoint, should_stop)
-            elif step.action == "switch":
-                self._run_switch(step, index, path, on_breakpoint, should_stop)
-            elif step.action == "for_each":
-                self._run_for_each(step, index, path, on_breakpoint, should_stop)
-            elif step.action == "try":
-                self._run_try(step, index, path, on_breakpoint, should_stop)
-            elif step.action == "run_workflow":
-                self._run_sub_workflow(step, index, path, on_breakpoint, should_stop)
-            elif step.action == "assign":
-                self._run_assign(step, index)
-            elif step.action == "increment":
-                self._run_increment(step, index)
-            elif step.action == "read_excel":
-                self._run_read_excel(step, index)
-            elif step.action == "write_excel":
-                self._run_write_excel(step, index)
-            elif step.action == "http_request":
-                self._run_http_request(step, index)
-            elif step.action == "get_credential":
-                self._run_get_credential(step, index)
-            elif step.action == "send_email":
-                self._run_send_email(step, index)
-            elif step.action == "read_emails":
-                self._run_read_emails(step, index)
-            elif step.action == "read_pdf":
-                self._run_read_pdf(step, index)
-            elif step.action == "ocr_image":
-                self._run_ocr_image(step, index)
-            else:
-                self._run_backend_step(step, index)
+            self._run_step_with_policy(step, index, path, on_breakpoint, should_stop)
+
+    def _run_step_with_policy(
+        self,
+        step: Step,
+        index: int,
+        path: str,
+        on_breakpoint: Optional[OnBreakpoint],
+        should_stop: Optional[ShouldStop],
+    ) -> None:
+        """Applies the step's own `on_error` policy around its dispatch -
+        independent of whether it sits inside a `try`/`catch` block. Without
+        `on_error`, a failure propagates exactly as before (aborting the
+        workflow unless an enclosing `try` catches it)."""
+        attempts = step.retry_count + 1 if step.on_error == "retry" else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                self._dispatch_step(step, index, path, on_breakpoint, should_stop)
+                return
+            except WorkflowCancelled:
+                raise  # a user-requested stop must propagate, never be retried or swallowed
+            except (StepError, ValueError) as exc:
+                if step.on_error == "retry" and attempt < attempts:
+                    self._log(
+                        "[%d] %s failed (Versuch %d/%d), erneuter Versuch in %.1fs -> %s",
+                        index, step.action, attempt, attempts, step.retry_delay, exc,
+                    )
+                    self._sleep_unless_stopped(step.retry_delay, index, should_stop)
+                    continue
+                if step.on_error == "continue":
+                    self._log("[%d] %s fehlgeschlagen, fahre fort (on_error=continue) -> %s", index, step.action, exc)
+                    return
+                raise
+
+    def _sleep_unless_stopped(self, seconds: float, index: int, should_stop: Optional[ShouldStop]) -> None:
+        """Waits out a retry delay in short slices so a stop request lands
+        promptly instead of only after the full delay has elapsed."""
+        remaining = seconds
+        slice_seconds = 0.2
+        while remaining > 0:
+            if should_stop is not None and should_stop():
+                logger.info("Workflow abgebrochen vor Schritt %d (während Retry-Wartezeit)", index)
+                raise WorkflowCancelled(index)
+            nap = min(slice_seconds, remaining)
+            time.sleep(nap)
+            remaining -= nap
+
+    def _dispatch_step(
+        self,
+        step: Step,
+        index: int,
+        path: str,
+        on_breakpoint: Optional[OnBreakpoint],
+        should_stop: Optional[ShouldStop],
+    ) -> None:
+        if step.action == "if":
+            self._run_if(step, index, path, on_breakpoint, should_stop)
+        elif step.action == "switch":
+            self._run_switch(step, index, path, on_breakpoint, should_stop)
+        elif step.action == "for_each":
+            self._run_for_each(step, index, path, on_breakpoint, should_stop)
+        elif step.action == "try":
+            self._run_try(step, index, path, on_breakpoint, should_stop)
+        elif step.action == "run_workflow":
+            self._run_sub_workflow(step, index, path, on_breakpoint, should_stop)
+        elif step.action == "assign":
+            self._run_assign(step, index)
+        elif step.action == "increment":
+            self._run_increment(step, index)
+        elif step.action == "read_excel":
+            self._run_read_excel(step, index)
+        elif step.action == "write_excel":
+            self._run_write_excel(step, index)
+        elif step.action == "http_request":
+            self._run_http_request(step, index)
+        elif step.action == "get_credential":
+            self._run_get_credential(step, index)
+        elif step.action == "send_email":
+            self._run_send_email(step, index)
+        elif step.action == "read_emails":
+            self._run_read_emails(step, index)
+        elif step.action == "read_pdf":
+            self._run_read_pdf(step, index)
+        elif step.action == "ocr_image":
+            self._run_ocr_image(step, index)
+        else:
+            self._run_backend_step(step, index)
 
     @staticmethod
     def _sub_steps(raw: Any) -> list[Step]:

@@ -651,6 +651,10 @@ body {
 .field.checkbox { display: flex; align-items: center; gap: 6px; margin-top: 18px; }
 .field.checkbox label { margin: 0; }
 
+.field-row { display: flex; gap: 10px; }
+.field-row .field { flex: 1; margin-bottom: 0; }
+.error-handling { padding-top: 10px; border-top: 1px solid var(--border); }
+
 .field-wide { grid-column: 1 / -1; }
 
 .nested-steps-wrap, .nested-cases-wrap {
