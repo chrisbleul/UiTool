@@ -15,29 +15,48 @@ def _cli_breakpoint(index: int, step: Step, variables: dict) -> None:
     input()
 
 
-def _make_backend(name: str, headless: bool, browser_channel: str | None = None):
+def _backend_class(name: str):
     if name == "web":
         from .backends.web import WebBackend
 
-        return WebBackend(headless=headless, channel=browser_channel)
+        return WebBackend
     if name == "desktop":
         from .backends.desktop import DesktopBackend
 
-        return DesktopBackend()
+        return DesktopBackend
     raise ValueError(f"Unknown backend '{name}'")
+
+
+def _make_backend(name: str, headless: bool, browser_channel: str | None = None):
+    cls = _backend_class(name)
+    if name == "web":
+        return cls(headless=headless, channel=browser_channel)
+    return cls()
 
 
 def cmd_run(args: argparse.Namespace) -> int:
     from .orchestrator import db
 
     workflow = Workflow.load(args.workflow)
-    backend = _make_backend(workflow.backend, headless=args.headless, browser_channel=workflow.browser_channel)
+    if args.dry_run:
+        from .backends.dry_run import DryRunBackend
+
+        backend = DryRunBackend(_backend_class(workflow.backend))
+    else:
+        backend = _make_backend(workflow.backend, headless=args.headless, browser_channel=workflow.browser_channel)
     engine = WorkflowEngine(backend)
     # The same global variables a job run would see, so running a workflow
     # straight from the CLI isn't subtly different from queuing it.
     db.init_db()
     try:
-        engine.run(workflow, on_breakpoint=_cli_breakpoint, global_variables=db.get_global_variables())
+        engine.run(
+            workflow,
+            on_breakpoint=None if args.dry_run else _cli_breakpoint,
+            global_variables=db.get_global_variables(),
+            dry_run=args.dry_run,
+        )
+        if args.dry_run:
+            print("Dry-Run erfolgreich - keine Fehler in Ausdrücken/Variablen/Struktur gefunden.")
         return 0
     except StepError as exc:
         logging.error(str(exc))
@@ -183,6 +202,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_p = sub.add_parser("run", help="Run a workflow YAML file")
     run_p.add_argument("workflow", help="Path to workflow YAML file")
     run_p.add_argument("--headless", action="store_true", help="Run the web backend headless")
+    run_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate expressions/variables/structure against a fake backend - no real browser/desktop app, "
+        "network call, or e-mail is touched",
+    )
     run_p.set_defaults(func=cmd_run)
 
     inspect_p = sub.add_parser(

@@ -1674,6 +1674,37 @@ async function runWorkflow() {
   };
 }
 
+async function validateWorkflow() {
+  const payload = currentWorkflowPayload();
+
+  el("log-output").textContent = "";
+  el("log-screenshot").classList.add("hidden");
+  el("log-status").textContent = "Validiere...";
+  el("log-status").className = "";
+  el("btn-continue").classList.add("hidden");
+  el("btn-stop").classList.add("hidden");
+  el("log-panel").classList.remove("hidden");
+  clearPausedHighlight();
+  hideVariablesWatch();
+
+  const res = await fetch("/api/validate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  for (const line of data.log || []) appendLog(line);
+  if (data.success) {
+    appendLog(">> Dry-Run erfolgreich - keine Fehler in Ausdrücken/Variablen/Struktur gefunden.");
+    el("log-status").textContent = "Dry-Run erfolgreich";
+    el("log-status").className = "status-success";
+  } else {
+    appendLog("Fehler: " + data.error);
+    el("log-status").textContent = "Dry-Run fehlgeschlagen";
+    el("log-status").className = "status-error";
+  }
+}
+
 async function continueRun() {
   if (!currentJobId) return;
   el("btn-continue").classList.add("hidden");
@@ -3006,6 +3037,7 @@ function init() {
   });
   el("btn-save").addEventListener("click", saveWorkflow);
   el("btn-run").addEventListener("click", runWorkflow);
+  el("btn-validate").addEventListener("click", validateWorkflow);
   el("btn-continue").addEventListener("click", continueRun);
   el("btn-stop").addEventListener("click", stopRun);
   el("btn-undo").addEventListener("click", undo);

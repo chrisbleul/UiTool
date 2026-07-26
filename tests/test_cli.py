@@ -82,6 +82,53 @@ def test_create_user_accepts_matching_prompted_passwords(monkeypatch):
     assert check_password_hash(db.get_user("alice")["password_hash"], "s3cret")
 
 
+def test_build_parser_accepts_run_dry_run_flag():
+    parser = cli.build_parser()
+
+    args = parser.parse_args(["run", "workflow.yaml", "--dry-run"])
+
+    assert args.dry_run is True
+    assert args.func is cli.cmd_run
+
+
+def test_build_parser_run_dry_run_defaults_to_false():
+    parser = cli.build_parser()
+
+    args = parser.parse_args(["run", "workflow.yaml"])
+
+    assert args.dry_run is False
+
+
+def test_cmd_run_dry_run_never_touches_a_real_backend(tmp_path, monkeypatch, capsys):
+    from uiflow.models import Step, Workflow
+
+    class _RealWebBackend:
+        def navigate(self, url):
+            raise AssertionError("a dry run must never call the real backend")
+
+    monkeypatch.setattr(cli, "_backend_class", lambda name: _RealWebBackend)
+    workflow_path = tmp_path / "demo.yaml"
+    Workflow(name="demo", backend="web", steps=[Step("navigate", {"url": "https://x"})]).save(workflow_path)
+
+    code = cli.cmd_run(argparse.Namespace(workflow=str(workflow_path), headless=True, dry_run=True))
+
+    assert code == 0
+    assert "Dry-Run erfolgreich" in capsys.readouterr().out
+
+
+def test_cmd_run_dry_run_reports_a_step_error(tmp_path):
+    from uiflow.models import Step, Workflow
+
+    workflow_path = tmp_path / "bad.yaml"
+    Workflow(
+        name="demo", backend="web", steps=[Step("if", {"condition": "nicht_deklariert == 1", "then": []})]
+    ).save(workflow_path)
+
+    code = cli.cmd_run(argparse.Namespace(workflow=str(workflow_path), headless=True, dry_run=True))
+
+    assert code == 1
+
+
 def test_build_parser_accepts_create_user_command():
     parser = cli.build_parser()
 

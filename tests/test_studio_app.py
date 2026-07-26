@@ -287,6 +287,78 @@ def test_api_run_snapshots_referenced_sub_workflows_into_the_job(client):
     assert detail["sub_workflows"]["teilprozess"]["steps"] == [{"action": "navigate", "url": "sub"}]
 
 
+def test_validate_endpoint_reports_success_for_a_valid_workflow(client):
+    workflow = _workflow("demo", "https://x")
+
+    res = client.post("/api/validate", json=workflow)
+
+    assert res.status_code == 200
+    data = res.get_json()
+    assert data["success"] is True
+    assert isinstance(data["log"], list) and len(data["log"]) > 0
+
+
+def test_validate_endpoint_reports_a_step_error_with_its_index(client):
+    workflow = {
+        "name": "demo",
+        "backend": "web",
+        "steps": [{"action": "if", "condition": "nicht_deklariert == 1", "then": []}],
+    }
+
+    res = client.post("/api/validate", json=workflow)
+
+    data = res.get_json()
+    assert data["success"] is False
+    assert data["step_index"] == 1
+    assert "nicht_deklariert" in data["error"]
+
+
+def test_validate_endpoint_rejects_a_malformed_workflow(client):
+    res = client.post("/api/validate", json={"backend": "not-a-real-backend", "steps": []})
+
+    assert res.status_code == 400
+    assert res.get_json()["success"] is False
+
+
+def test_validate_endpoint_never_sends_a_real_email(client, monkeypatch):
+    def _boom(**kwargs):
+        raise AssertionError("must not send a real e-mail from /api/validate")
+
+    monkeypatch.setattr("uiflow.email_client.send_email", _boom)
+    workflow = {
+        "name": "demo",
+        "backend": "web",
+        "steps": [{"action": "send_email", "to": "a@x.de", "subject": "s", "body": "b"}],
+    }
+
+    res = client.post("/api/validate", json=workflow)
+
+    assert res.get_json()["success"] is True
+
+
+def test_validate_endpoint_does_not_create_a_job(client):
+    client.post("/api/validate", json=_workflow("demo", "https://x"))
+
+    assert client.get("/api/jobs").get_json() == []
+
+
+def test_validate_endpoint_is_not_recorded_in_the_audit_log(client):
+    client.post("/api/validate", json=_workflow("demo", "https://x"))
+
+    entries = client.get("/api/audit-log").get_json()
+    assert not any(e["action"] == "POST /api/validate" for e in entries)
+
+
+def test_validate_endpoint_reachable_by_a_viewer_in_multiuser_mode(multiuser_app):
+    viewer = multiuser_app.test_client()
+    _login(viewer, "view1", "viewpass")
+
+    res = viewer.post("/api/validate", json=_workflow("demo", "https://x"))
+
+    assert res.status_code == 200
+    assert res.get_json()["success"] is True
+
+
 def test_worker_claim_endpoint_claims_the_oldest_queued_job(client):
     job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
 

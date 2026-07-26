@@ -130,6 +130,14 @@ class WorkflowEngine:
         # to the job log / console in plain text.
         self._secrets: set[str] = set()
         self._sub_workflows: dict[str, Workflow] = {}
+        # See run()'s `dry_run` parameter - skips only the handful of
+        # engine-level actions with a genuine external side effect
+        # (http_request, send_email, read_emails, write_excel). Everything
+        # else - variables, control flow, expressions, and every
+        # backend-dispatched UI action (via `backend`, expected to be a
+        # DryRunBackend when this is set) - runs exactly as normal, since
+        # that's precisely what a dry run is meant to validate.
+        self._dry_run = False
 
     def run(
         self,
@@ -139,7 +147,9 @@ class WorkflowEngine:
         variables: Optional[dict[str, Any]] = None,
         global_variables: Optional[dict[str, Any]] = None,
         sub_workflows: Optional[dict[str, Workflow]] = None,
+        dry_run: bool = False,
     ) -> None:
+        self._dry_run = dry_run
         self.variables = self._seed_declared_variables(workflow, dict(variables) if variables else {})
         # Installation-wide values, kept apart from the run's own variables so
         # they survive a sub-workflow's isolated scope and can't be overwritten
@@ -547,6 +557,12 @@ class WorkflowEngine:
             rows = safe_eval(data_expr, self._eval_scope())
         except ValueError as exc:
             raise StepError(index, step, exc) from exc
+        if self._dry_run:
+            row_list = list(rows)
+            self._log("[%d] [dry-run] write_excel '%s' -> würde %d Zeile(n) schreiben", index, path, len(row_list))
+            if step.save_as:
+                self.variables[step.save_as] = len(row_list)
+            return
         try:
             from .excel import write_excel_rows
 
@@ -562,6 +578,20 @@ class WorkflowEngine:
         url = resolved.get("url")
         if not url:
             raise StepError(index, step, ValueError("http_request requires 'url'"))
+        if self._dry_run:
+            self._log("[%d] [dry-run] http_request %s %s -> übersprungen", index, resolved.get("method", "GET"), url)
+            if step.save_as:
+                # Same shape as a real result (see http_client.send_http_request)
+                # so a later expression referencing e.g. result["json"] doesn't
+                # fail differently in a dry run than for a genuinely empty response.
+                self.variables[step.save_as] = {
+                    "status_code": 0,
+                    "headers": {},
+                    "text": "",
+                    "json": None,
+                    "dry_run": True,
+                }
+            return
         try:
             from .http_client import send_http_request
 
@@ -598,6 +628,11 @@ class WorkflowEngine:
 
     def _run_send_email(self, step: Step, index: int) -> None:
         resolved = substitute_variables(step.params, self.variables)
+        if self._dry_run:
+            self._log("[%d] [dry-run] send_email -> %s (übersprungen)", index, resolved.get("to"))
+            if step.save_as:
+                self.variables[step.save_as] = {"sent": False, "dry_run": True}
+            return
         try:
             from .email_client import send_email
 
@@ -622,6 +657,10 @@ class WorkflowEngine:
         if not step.save_as:
             raise StepError(index, step, ValueError("read_emails requires save_as"))
         resolved = substitute_variables(step.params, self.variables)
+        if self._dry_run:
+            self._log("[%d] [dry-run] read_emails -> übersprungen", index)
+            self.variables[step.save_as] = []
+            return
         try:
             from .email_client import read_emails
 

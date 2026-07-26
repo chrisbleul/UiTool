@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import secrets
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -14,9 +16,29 @@ from flask import Flask, Response, jsonify, redirect, request, send_from_directo
 from werkzeug.security import check_password_hash
 
 from .. import models
+from ..engine import StepError, WorkflowEngine
 from ..models import Workflow, resolve_sub_workflows
 from ..orchestrator import db
 from .schema import ACTION_SCHEMAS, activity_catalog
+
+
+class _ListLogHandler(logging.Handler):
+    """Captures this request's own log lines into an in-memory list - same
+    thread-filtering reasoning as orchestrator/worker.py's _DbLogHandler, just
+    collecting into a list instead of writing to SQLite, since a dry-run
+    validation (see /api/validate) is synchronous and has no job row of its
+    own to persist against."""
+
+    def __init__(self, sink: list[str], thread_id: int):
+        super().__init__()
+        self._sink = sink
+        self._thread_id = thread_id
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.thread != self._thread_id:
+            return
+        self._sink.append(self.format(record))
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -51,6 +73,10 @@ def _required_role(method: str, path: str) -> str:
         # this namespace (see remote_store.RemoteStore) - operational access,
         # not a plain read, regardless of HTTP method.
         return "operator"
+    if path == "/api/validate":
+        # A dry run changes nothing (see its own docstring) - a diagnostic
+        # check, not a write, despite being a POST (it needs a request body).
+        return "viewer"
     if method == "GET":
         return "viewer"
     return "operator"
@@ -120,10 +146,13 @@ def create_app() -> Flask:
         # comment in orchestrator/db.py. /api/worker/* is excluded too - that's
         # a worker process's own claim/heartbeat/log traffic (every 15s per
         # running job, or more), not an administrative action; the job/queue
-        # tables are already that traffic's own durable record.
+        # tables are already that traffic's own durable record. /api/validate
+        # is excluded too - a dry run changes nothing (see its own docstring),
+        # so it's diagnostic noise in a trail meant for actual state changes.
         if (
             request.method != "GET"
             and not request.path.startswith("/api/worker/")
+            and request.path != "/api/validate"
             and (request.path.startswith("/api/") or request.path == "/login")
         ):
             db.add_audit_entry(
@@ -258,6 +287,51 @@ def create_app() -> Flask:
             db.add_workflow_version(path.stem, path.read_text(encoding="utf-8"), session.get("username"))
         path.write_text(version["content_yaml"], encoding="utf-8")
         return jsonify({"restored": version_id})
+
+    @app.post("/api/validate")
+    def validate_workflow() -> Response:
+        """Runs the given (possibly unsaved) workflow through the real engine
+        against a DryRunBackend - the same expression evaluation, control
+        flow, and variable handling as a real run, but no real browser/
+        desktop app, network call, or e-mail is touched (see engine.py's
+        `dry_run` and backends/dry_run.py). Synchronous: there is no real I/O
+        to wait on, so unlike /api/run this doesn't go through the job queue
+        at all - the result is ephemeral, not part of job history."""
+        data = request.get_json(force=True)
+        try:
+            workflow = Workflow.from_raw(data)
+        except ValueError as exc:
+            return jsonify({"success": False, "error": str(exc), "log": []}), 400
+
+        from ..backends.dry_run import DryRunBackend
+        from ..cli import _backend_class
+
+        sub_workflows = {
+            name: Workflow.from_raw(raw) for name, raw in resolve_sub_workflows(workflow).items()
+        }
+
+        log_lines: list[str] = []
+        handler = _ListLogHandler(log_lines, threading.get_ident())
+        handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        logger = logging.getLogger("uiflow")
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        try:
+            backend = DryRunBackend(_backend_class(workflow.backend))
+            engine = WorkflowEngine(backend)
+            engine.run(
+                workflow,
+                global_variables=db.get_global_variables(),
+                sub_workflows=sub_workflows,
+                dry_run=True,
+            )
+            return jsonify({"success": True, "log": log_lines})
+        except StepError as exc:
+            return jsonify({"success": False, "error": str(exc), "step_index": exc.index, "log": log_lines})
+        except Exception as exc:  # noqa: BLE001 - surface any validation failure instead of a 500
+            return jsonify({"success": False, "error": str(exc), "log": log_lines})
+        finally:
+            logger.removeHandler(handler)
 
     @app.post("/api/run")
     def run_workflow() -> Response:

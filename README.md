@@ -804,6 +804,37 @@ Verlauf gelöscht (ein Wiederherstellen hätte ohnehin keine Datei mehr, in die 
 Bewusst eine einfache eigene Versions-Tabelle statt echtem Git im Hintergrund — kein Diff zwischen zwei
 Ständen, kein Branching, nur linearer Verlauf mit Wiederherstellen.
 
+## Dry-Run-Modus (Workflows validieren ohne echte Ausführung)
+
+Der Button **Validieren** im Builder (neben "Flowchart") führt den aktuell geöffneten (auch
+ungespeicherten) Workflow durch dieselbe Engine wie ein echter Lauf — Variablen, Kontrollfluss,
+Python-Ausdrücke in `if`/`switch`/`assign` funktionieren identisch —, aber gegen ein
+`DryRunBackend`: jede UI-Aktion (`click`, `type`, `navigate`, ...) wird zu einer No-Operation, die nur
+loggt, was sie täte, statt einen echten Browser oder eine echte Desktop-Anwendung anzufassen. Fängt
+damit genau die Fehler ab, die sonst erst beim echten Lauf auffallen würden: Tippfehler in
+Python-Ausdrücken, Verweise auf nie deklarierte Variablen, eine falsch geschriebene Aktion. Läuft
+synchron im Request (keine echte Wartezeit, kein `time.sleep` bei `wait`-Schritten) und landet nicht in
+der Job-Historie oder im Audit-Log — eine Validierung verändert nichts.
+
+Auch die wenigen Engine-Aktionen mit einem echten externen Seiteneffekt werden dabei übersprungen statt
+wirklich ausgeführt: `http_request` (kein echter Netzwerkaufruf), `send_email`/`read_emails` (keine
+echte SMTP-/IMAP-Verbindung), `write_excel` (keine echte Datei geschrieben) — jeweils mit einem
+neutralen Platzhalter-Ergebnis, damit eine nachfolgende Auswertung von `save_as` nicht zusätzlich
+fehlschlägt. `read_excel`/`read_pdf`/`ocr_image`/`get_credential` laufen dagegen bewusst echt (reine
+lokale Lesevorgänge ohne Seiteneffekt — validiert nebenbei, dass der Dateipfad/Anmeldedaten-Name
+stimmt). Ein `run_workflow`-Schritt validiert den referenzierten Unterprozess automatisch mit, rekursiv.
+
+Auch über die CLI nutzbar, ohne Studio:
+
+```powershell
+python -m uiflow.cli run workflow.yaml --dry-run
+```
+
+Was das nicht fängt: einen falsch geschriebenen **Parameternamen** (z.B. `selectr` statt `selector`) —
+das `DryRunBackend` nimmt jedes Schlüsselwortargument klaglos an, ein echter Backend-Aufruf würde ein
+unbekanntes Argument ablehnen. Ein unbekannter **Aktionsname** wird dagegen erkannt (derselbe "Backend
+hat keine Aktion" wie bei einem echten Lauf).
+
 ## Tests
 
 ```powershell
@@ -881,9 +912,10 @@ Ideen, was als Nächstes sinnvoll sein könnte. Reihenfolge ist keine Priorität
 - ~~**Workflow-Versionierung**~~ — erledigt, siehe "Workflow-Versionierung" oben (eigene
   Versions-Tabelle, kein Git). Was bewusst fehlt: kein Diff zwischen zwei Ständen (nur die volle
   YAML jeder Version einsehbar), kein Branching — nur linearer Verlauf mit Wiederherstellen.
-- **Testbarkeit von Workflows**: ein "Dry-Run"-Modus, der Ausdrücke/Variablen/Selektoren gegen einen
-  Fake-Backend validiert, ohne den echten Browser/Desktop anzufassen — würde Tippfehler in Python-
-  Ausdrücken oder fehlende Variablen schon beim Speichern statt erst beim echten Lauf auffangen.
+- ~~**Testbarkeit von Workflows**~~ — erledigt, siehe "Dry-Run-Modus" oben (Button **Validieren** im
+  Builder, auch per `uiflow run --dry-run`). Was bewusst fehlt: kein echtes Unit-Test-Framework mit
+  Assertions über einzelne Schritte hinweg — nur "läuft der ganze Workflow strukturell durch, ohne
+  Ausdrucks-/Variablenfehler", kein Prüfen eines falsch geschriebenen Parameternamens (siehe oben).
 - ~~**Business-Kalender für Zeitpläne**~~ — erledigt, siehe "Zeitpläne (Scheduling)" oben
   ("Nur an Werktagen" / "Feiertage überspringen"). Was bewusst fehlt: keine wiederkehrenden Regeln für
   Feiertage (z.B. "jeder erste Montag im Monat") — nur einzelne, von Hand gepflegte Kalenderdaten.

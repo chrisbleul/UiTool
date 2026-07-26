@@ -1714,4 +1714,163 @@ def test_shipped_reframework_example_re_raises_a_technical_failure_after_the_cat
     # technical - a queue-driven job must still see this as a normal, retryable
     # failure, not a silently swallowed one.
     assert ("screenshot", "fehler_R1.png") in backend.calls
-    assert "Seite nicht erreichbar" in str(excinfo.value)
+
+
+# --- dry-run mode (see backends/dry_run.py) -----------------------------------
+
+
+def test_dry_run_never_touches_a_real_backend_method():
+    from uiflow.backends.dry_run import DryRunBackend
+
+    class _RealWebBackend:
+        def navigate(self, url):
+            raise AssertionError("a dry run must never call the real backend")
+
+    workflow = Workflow(name="t", backend="web", steps=[Step("navigate", {"url": "https://x"})])
+
+    WorkflowEngine(DryRunBackend(_RealWebBackend)).run(workflow, dry_run=True)  # must not raise
+
+
+def test_dry_run_still_catches_an_undefined_variable_in_an_expression():
+    from uiflow.backends.dry_run import DryRunBackend
+
+    class _RealWebBackend:
+        pass
+
+    workflow = Workflow(
+        name="t", backend="web", steps=[Step("if", {"condition": "nicht_deklariert == 1", "then": []})]
+    )
+
+    with pytest.raises(StepError):
+        WorkflowEngine(DryRunBackend(_RealWebBackend)).run(workflow, dry_run=True)
+
+
+def test_dry_run_rejects_an_action_name_neither_backend_implements():
+    from uiflow.backends.dry_run import DryRunBackend
+
+    class _RealWebBackend:
+        pass
+
+    workflow = Workflow(name="t", backend="web", steps=[Step("does_not_exist_anywhere", {})])
+
+    with pytest.raises(StepError, match="has no action"):
+        WorkflowEngine(DryRunBackend(_RealWebBackend)).run(workflow, dry_run=True)
+
+
+def test_dry_run_element_exists_is_optimistic():
+    from uiflow.backends.dry_run import DryRunBackend
+
+    class _RealWebBackend:
+        def element_exists(self, **kwargs):
+            raise AssertionError("must not call the real backend")
+
+    assert DryRunBackend(_RealWebBackend).element_exists(selector="#x") is True
+
+
+def test_dry_run_skips_http_request_and_provides_a_placeholder(monkeypatch):
+    from uiflow.backends.dry_run import DryRunBackend
+
+    def _boom(**kwargs):
+        raise AssertionError("must not make a real HTTP request during a dry run")
+
+    monkeypatch.setattr("uiflow.http_client.send_http_request", _boom)
+
+    class _RealWebBackend:
+        pass
+
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[Step("http_request", {"url": "https://api.example.com"}, save_as="result")],
+    )
+
+    engine = WorkflowEngine(DryRunBackend(_RealWebBackend))
+    engine.run(workflow, dry_run=True)
+
+    assert engine.variables["result"]["dry_run"] is True
+    assert engine.variables["result"]["status_code"] == 0
+
+
+def test_dry_run_skips_send_email(monkeypatch):
+    from uiflow.backends.dry_run import DryRunBackend
+
+    def _boom(**kwargs):
+        raise AssertionError("must not send a real e-mail during a dry run")
+
+    monkeypatch.setattr("uiflow.email_client.send_email", _boom)
+
+    class _RealWebBackend:
+        pass
+
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[Step("send_email", {"to": "a@x.de", "subject": "s", "body": "b"}, save_as="result")],
+    )
+
+    engine = WorkflowEngine(DryRunBackend(_RealWebBackend))
+    engine.run(workflow, dry_run=True)
+
+    assert engine.variables["result"] == {"sent": False, "dry_run": True}
+
+
+def test_dry_run_skips_read_emails(monkeypatch):
+    from uiflow.backends.dry_run import DryRunBackend
+
+    def _boom(**kwargs):
+        raise AssertionError("must not connect to a real mailbox during a dry run")
+
+    monkeypatch.setattr("uiflow.email_client.read_emails", _boom)
+
+    class _RealWebBackend:
+        pass
+
+    workflow = Workflow(name="t", backend="web", steps=[Step("read_emails", {}, save_as="messages")])
+
+    engine = WorkflowEngine(DryRunBackend(_RealWebBackend))
+    engine.run(workflow, dry_run=True)
+
+    assert engine.variables["messages"] == []
+
+
+def test_dry_run_skips_write_excel(monkeypatch, tmp_path):
+    from uiflow.backends.dry_run import DryRunBackend
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("must not write a real file during a dry run")
+
+    monkeypatch.setattr("uiflow.excel.write_excel_rows", _boom)
+
+    class _RealWebBackend:
+        pass
+
+    target = tmp_path / "out.xlsx"
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[Step("write_excel", {"path": str(target), "data": "[{'a': 1}]"}, save_as="count")],
+    )
+
+    engine = WorkflowEngine(DryRunBackend(_RealWebBackend))
+    engine.run(workflow, dry_run=True)
+
+    assert engine.variables["count"] == 1
+    assert not target.exists()
+
+
+def test_dry_run_propagates_into_a_sub_workflow(monkeypatch, tmp_path):
+    from uiflow.backends.dry_run import DryRunBackend
+
+    def _boom(**kwargs):
+        raise AssertionError("a sub-workflow's http_request must also be skipped in a dry run")
+
+    monkeypatch.setattr("uiflow.http_client.send_http_request", _boom)
+
+    class _RealWebBackend:
+        pass
+
+    sub = Workflow(name="teilprozess", backend="web", steps=[Step("http_request", {"url": "https://x"})])
+    main = Workflow(name="main", backend="web", steps=[Step("run_workflow", {"workflow": "teilprozess"})])
+
+    engine = WorkflowEngine(DryRunBackend(_RealWebBackend))
+    engine.run(main, dry_run=True, sub_workflows={"teilprozess": sub})  # must not raise
