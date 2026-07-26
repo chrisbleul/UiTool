@@ -1353,3 +1353,102 @@ def test_delete_folder_permissions_for_user_removes_only_that_users_grants():
 
     assert db.list_folder_permissions("alice") == []
     assert len(db.list_folder_permissions("bob")) == 1
+
+
+# --- approval requests (human-in-the-loop, see engine.py's request_approval) --
+
+
+def test_create_approval_request_starts_pending():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+
+    request_id = db.create_approval_request(job_id, "Rechnung freigeben", "Details hier")
+
+    assert db.get_approval_decision(request_id) is None  # still pending
+
+
+def test_decide_approval_request_records_the_decision():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+    request_id = db.create_approval_request(job_id, "x", "")
+
+    decided = db.decide_approval_request(request_id, True, "passt", "alice")
+
+    assert decided is True
+    decision = db.get_approval_decision(request_id)
+    assert decision["approved"] is True
+    assert decision["comment"] == "passt"
+    assert decision["decided_by"] == "alice"
+    assert decision["decided_at"]
+
+
+def test_decide_approval_request_can_only_happen_once():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+    request_id = db.create_approval_request(job_id, "x", "")
+    db.decide_approval_request(request_id, True, "erste Entscheidung", "alice")
+
+    second = db.decide_approval_request(request_id, False, "zweite Entscheidung", "bob")
+
+    assert second is False
+    assert db.get_approval_decision(request_id)["comment"] == "erste Entscheidung"
+
+
+def test_decide_approval_request_returns_false_for_an_unknown_id():
+    assert db.decide_approval_request(99999, True, "", None) is False
+
+
+def test_cancel_approval_request_marks_it_cancelled_and_resolves_any_poller():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+    request_id = db.create_approval_request(job_id, "x", "")
+
+    db.cancel_approval_request(request_id)
+
+    # No longer "pending" - get_approval_decision resolves (as unapproved)
+    # instead of leaving an independent poller waiting forever.
+    decision = db.get_approval_decision(request_id)
+    assert decision is not None
+    assert decision["approved"] is False
+    [row] = db.list_approval_requests(status=None)
+    assert row["status"] == "cancelled"
+
+
+def test_cancel_approval_request_does_not_override_an_existing_decision():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+    request_id = db.create_approval_request(job_id, "x", "")
+    db.decide_approval_request(request_id, True, "genehmigt", "alice")
+
+    db.cancel_approval_request(request_id)
+
+    assert db.get_approval_decision(request_id)["approved"] is True
+
+
+def test_list_approval_requests_defaults_to_pending_only():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+    pending_id = db.create_approval_request(job_id, "pending one", "")
+    decided_id = db.create_approval_request(job_id, "decided one", "")
+    db.decide_approval_request(decided_id, True, "", None)
+
+    pending = db.list_approval_requests()
+
+    assert [r["id"] for r in pending] == [pending_id]
+
+
+def test_list_approval_requests_includes_the_job_name():
+    job_id = db.create_job("Rechnungsprüfung", {"name": "Rechnungsprüfung", "backend": "web", "steps": []})
+    db.create_approval_request(job_id, "x", "")
+
+    [row] = db.list_approval_requests()
+
+    assert row["job_name"] == "Rechnungsprüfung"
+
+
+def test_list_approval_requests_status_none_returns_every_status():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+    a = db.create_approval_request(job_id, "a", "")
+    b = db.create_approval_request(job_id, "b", "")
+    c = db.create_approval_request(job_id, "c", "")
+    db.decide_approval_request(a, True, "", None)
+    db.cancel_approval_request(b)
+    # c stays pending
+
+    all_requests = db.list_approval_requests(status=None)
+
+    assert {r["id"] for r in all_requests} == {a, b, c}

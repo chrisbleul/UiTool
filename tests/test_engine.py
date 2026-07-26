@@ -1874,3 +1874,107 @@ def test_dry_run_propagates_into_a_sub_workflow(monkeypatch, tmp_path):
 
     engine = WorkflowEngine(DryRunBackend(_RealWebBackend))
     engine.run(main, dry_run=True, sub_workflows={"teilprozess": sub})  # must not raise
+
+
+# --- request_approval (human-in-the-loop, see engine.py's _run_request_approval) --
+
+
+def test_request_approval_requires_a_title():
+    workflow = Workflow(name="t", backend="web", steps=[Step("request_approval", {})])
+
+    with pytest.raises(StepError):
+        WorkflowEngine(RecordingBackend()).run(workflow)
+
+
+def test_request_approval_without_a_handler_raises_a_clear_step_error():
+    """Bare `uiflow run` (no orchestrator) has nothing that can wait on a
+    human - see run()'s on_request_approval docstring."""
+    workflow = Workflow(name="t", backend="web", steps=[Step("request_approval", {"title": "Freigeben?"})])
+
+    with pytest.raises(StepError) as excinfo:
+        WorkflowEngine(RecordingBackend()).run(workflow)
+
+    assert "request_approval" in str(excinfo.value)
+
+
+def test_request_approval_calls_the_handler_with_title_and_message_and_stores_the_decision():
+    calls = []
+
+    def handler(title, message, variables):
+        calls.append((title, message, dict(variables)))
+        return {"approved": True, "comment": "sieht gut aus", "decided_by": "alice"}
+
+    workflow = Workflow(
+        name="t",
+        backend="web",
+        steps=[
+            Step(
+                "request_approval",
+                {"title": "Rechnung {var.betrag}€ freigeben", "message": "Bitte prüfen"},
+                save_as="decision",
+            )
+        ],
+    )
+
+    engine = WorkflowEngine(RecordingBackend())
+    engine.run(workflow, variables={"betrag": 12000}, on_request_approval=handler)
+
+    assert calls[0][0] == "Rechnung 12000€ freigeben"
+    assert calls[0][1] == "Bitte prüfen"
+    assert engine.variables["decision"] == {"approved": True, "comment": "sieht gut aus", "decided_by": "alice"}
+
+
+def test_request_approval_rejection_is_just_a_normal_decision_not_a_failure():
+    """A rejection doesn't raise - it's a value in `variables`, same as any
+    other step result; a workflow author branches on it with a normal `if`."""
+
+    def handler(title, message, variables):
+        return {"approved": False, "comment": "zu hoch", "decided_by": "bob"}
+
+    workflow = Workflow(
+        name="t", backend="web", steps=[Step("request_approval", {"title": "x"}, save_as="decision")]
+    )
+
+    engine = WorkflowEngine(RecordingBackend())
+    engine.run(workflow, on_request_approval=handler)  # must not raise
+
+    assert engine.variables["decision"]["approved"] is False
+
+
+def test_request_approval_dry_run_auto_approves_without_calling_the_handler():
+    def handler(title, message, variables):
+        raise AssertionError("must not wait on a human during a dry run")
+
+    workflow = Workflow(
+        name="t", backend="web", steps=[Step("request_approval", {"title": "x"}, save_as="decision")]
+    )
+
+    from uiflow.backends.dry_run import DryRunBackend
+
+    class _RealWebBackend:
+        pass
+
+    engine = WorkflowEngine(DryRunBackend(_RealWebBackend))
+    engine.run(workflow, dry_run=True, on_request_approval=handler)
+
+    assert engine.variables["decision"]["approved"] is True
+    assert engine.variables["decision"]["dry_run"] is True
+
+
+def test_request_approval_propagates_into_a_sub_workflow():
+    def handler(title, message, variables):
+        return {"approved": True, "comment": "", "decided_by": None}
+
+    sub = Workflow(
+        name="teilprozess", backend="web", steps=[Step("request_approval", {"title": "x"}, save_as="decision")]
+    )
+    main = Workflow(
+        name="main",
+        backend="web",
+        steps=[Step("run_workflow", {"workflow": "teilprozess", "outputs": {"decision": "sub_decision"}})],
+    )
+
+    engine = WorkflowEngine(RecordingBackend())
+    engine.run(main, sub_workflows={"teilprozess": sub}, on_request_approval=handler)
+
+    assert engine.variables["sub_decision"]["approved"] is True

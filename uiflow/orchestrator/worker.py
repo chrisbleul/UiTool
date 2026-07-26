@@ -95,6 +95,21 @@ def _run_workflow_once(
             time.sleep(0.3)
         store.set_paused(job_id, None, None, path=None)
 
+    def on_request_approval(title: str, message: str, variables: dict[str, Any]) -> dict[str, Any]:
+        request_id = store.create_approval_request(job_id, title, message)
+        while True:
+            decision = store.get_approval_decision(request_id)
+            if decision is not None:
+                return decision
+            if store.is_stop_requested(job_id):
+                # Not resolved into a real approve/reject - just unblocks the
+                # wait. The workflow itself gets cancelled the normal way
+                # (should_stop, checked before the *next* step), same as a
+                # stop requested while paused at a breakpoint.
+                store.cancel_approval_request(request_id)
+                return {"approved": False, "comment": "", "decided_by": None, "cancelled": True}
+            time.sleep(1.0)
+
     backend = _make_backend(workflow)
     try:
         WorkflowEngine(backend).run(
@@ -106,6 +121,7 @@ def _run_workflow_once(
             # next run without re-queuing anything.
             global_variables=store.get_global_variables(),
             sub_workflows=sub_workflows,
+            on_request_approval=on_request_approval,
         )
     finally:
         stopped_while_debugging = reached_breakpoint and store.is_stop_requested(job_id)

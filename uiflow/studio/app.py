@@ -558,6 +558,21 @@ def create_app() -> Flask:
                 db.notify_job_failed(job_id, job["name"], data.get("error_message"))
         return jsonify({"ok": True})
 
+    @app.post("/api/worker/jobs/<job_id>/approval_requests")
+    def worker_create_approval_request(job_id: str) -> Response:
+        data = request.get_json(force=True)
+        request_id = db.create_approval_request(job_id, data["title"], data.get("message", ""))
+        return jsonify({"id": request_id})
+
+    @app.get("/api/worker/approval_requests/<int:request_id>")
+    def worker_get_approval_decision(request_id: int) -> Response:
+        return jsonify(db.get_approval_decision(request_id))
+
+    @app.post("/api/worker/approval_requests/<int:request_id>/cancel")
+    def worker_cancel_approval_request(request_id: int) -> Response:
+        db.cancel_approval_request(request_id)
+        return jsonify({"ok": True})
+
     @app.get("/api/worker/globals")
     def worker_globals() -> Response:
         return jsonify(db.get_global_variables())
@@ -862,6 +877,26 @@ def create_app() -> Flask:
     def get_audit_log() -> Response:
         limit = request.args.get("limit", default=200, type=int)
         return jsonify(db.list_audit_entries(limit=limit))
+
+    @app.get("/api/actions")
+    def list_actions() -> Response:
+        """The Action Center: every `request_approval` step currently waiting
+        on a human (see engine.py/worker.py). Any logged-in user can see this
+        list (matches viewer's read access elsewhere); deciding one requires
+        "operator" (see _required_role's default for a non-GET request)."""
+        return jsonify(db.list_approval_requests(status="pending"))
+
+    @app.post("/api/actions/<int:request_id>/decide")
+    def decide_action(request_id: int) -> Response:
+        data = request.get_json(force=True) or {}
+        approved = data.get("approved")
+        if not isinstance(approved, bool):
+            return jsonify({"error": "'approved' (true/false) is required"}), 400
+        comment = (data.get("comment") or "").strip()
+        decided = db.decide_approval_request(request_id, approved, comment, session.get("username"))
+        if not decided:
+            return jsonify({"error": "Anfrage nicht gefunden oder bereits entschieden"}), 404
+        return jsonify({"decided": True})
 
     @app.get("/api/credentials")
     def list_credentials() -> Response:

@@ -2111,6 +2111,80 @@ async function addFolderPermission() {
   toast(`Ordner-Berechtigung für "${username}" gespeichert.`, "success");
 }
 
+async function renderActionsPanel() {
+  const container = el("actions-list");
+  container.innerHTML = "Lädt...";
+  const res = await fetch("/api/actions");
+  if (!res.ok) {
+    container.innerHTML = '<p style="color:var(--muted)">Nur für angemeldete Benutzer sichtbar.</p>';
+    return;
+  }
+  const actions = await res.json();
+  if (actions.length === 0) {
+    container.innerHTML = '<p style="color:var(--muted)">Keine offenen Genehmigungen.</p>';
+    return;
+  }
+  container.innerHTML = "";
+  for (const action of actions) {
+    const row = document.createElement("div");
+    row.className = "list-row action-row";
+
+    const info = document.createElement("div");
+    info.style.flex = "1";
+    info.style.minWidth = "220px";
+    const title = document.createElement("div");
+    title.className = "list-row-name";
+    title.textContent = action.title;
+    const meta = document.createElement("div");
+    meta.className = "list-row-meta";
+    meta.textContent = `${action.job_name || action.job_id} · ${new Date(action.requested_at).toLocaleString()}`;
+    info.append(title, meta);
+    if (action.message) {
+      const msg = document.createElement("div");
+      msg.className = "action-message";
+      msg.textContent = action.message;
+      info.appendChild(msg);
+    }
+
+    const controls = document.createElement("div");
+    controls.className = "action-controls";
+
+    const commentInput = document.createElement("input");
+    commentInput.type = "text";
+    commentInput.className = "action-comment";
+    commentInput.placeholder = "Kommentar (optional)";
+
+    const approveBtn = document.createElement("button");
+    approveBtn.className = "btn";
+    approveBtn.textContent = "Genehmigen";
+    approveBtn.addEventListener("click", () => decideAction(action.id, true, commentInput.value));
+
+    const rejectBtn = document.createElement("button");
+    rejectBtn.className = "btn btn-danger";
+    rejectBtn.textContent = "Ablehnen";
+    rejectBtn.addEventListener("click", () => decideAction(action.id, false, commentInput.value));
+
+    controls.append(commentInput, approveBtn, rejectBtn);
+    row.append(info, controls);
+    container.appendChild(row);
+  }
+}
+
+async function decideAction(id, approved, comment) {
+  const res = await fetch(`/api/actions/${id}/decide`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ approved, comment }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    toast("Entscheidung fehlgeschlagen: " + (data.error || res.status), "error");
+    return;
+  }
+  await renderActionsPanel();
+  toast(approved ? "Genehmigt." : "Abgelehnt.", "success");
+}
+
 async function loadCurrentUser() {
   const res = await fetch("/api/me");
   if (!res.ok) return;
@@ -3115,6 +3189,7 @@ function switchTab(name) {
     renderSchedulesPanel();
     renderHolidaysPanel();
   }
+  if (name === "actions") renderActionsPanel();
   if (name === "users") {
     renderUsersPanel();
     renderFolderPermissionsPanel();

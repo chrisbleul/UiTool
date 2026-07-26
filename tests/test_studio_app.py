@@ -718,6 +718,130 @@ def test_worker_api_requires_at_least_operator_in_multiuser_mode(multiuser_app):
     assert operator.post("/api/worker/claim", json={"worker_id": "w"}).status_code == 200
 
 
+# --- human-in-the-loop approvals (request_approval step + Action Center) -----
+
+
+def test_worker_create_approval_request_endpoint_returns_an_id(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+
+    res = client.post(
+        f"/api/worker/jobs/{job_id}/approval_requests", json={"title": "Rechnung freigeben", "message": "Details"}
+    )
+
+    assert res.status_code == 200
+    assert isinstance(res.get_json()["id"], int)
+
+
+def test_worker_get_approval_decision_endpoint_returns_null_while_pending(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+    request_id = client.post(
+        f"/api/worker/jobs/{job_id}/approval_requests", json={"title": "x", "message": ""}
+    ).get_json()["id"]
+
+    res = client.get(f"/api/worker/approval_requests/{request_id}")
+
+    assert res.status_code == 200
+    assert res.get_json() is None
+
+
+def test_worker_get_approval_decision_endpoint_returns_the_decision_once_decided(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+    request_id = client.post(
+        f"/api/worker/jobs/{job_id}/approval_requests", json={"title": "x", "message": ""}
+    ).get_json()["id"]
+    client.post(f"/api/actions/{request_id}/decide", json={"approved": True, "comment": "ok"})
+
+    res = client.get(f"/api/worker/approval_requests/{request_id}")
+
+    decision = res.get_json()
+    assert decision["approved"] is True
+    assert decision["comment"] == "ok"
+    assert decision["decided_by"] is None
+    assert decision["decided_at"]
+
+
+def test_worker_cancel_approval_request_endpoint_marks_it_cancelled(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+    request_id = client.post(
+        f"/api/worker/jobs/{job_id}/approval_requests", json={"title": "x", "message": ""}
+    ).get_json()["id"]
+
+    res = client.post(f"/api/worker/approval_requests/{request_id}/cancel")
+
+    assert res.status_code == 200
+    # no longer pending, so it drops out of the Action Center's default listing
+    assert client.get("/api/actions").get_json() == []
+
+
+def test_list_actions_endpoint_returns_only_pending_requests(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+    pending = client.post(
+        f"/api/worker/jobs/{job_id}/approval_requests", json={"title": "wartet", "message": ""}
+    ).get_json()["id"]
+    decided = client.post(
+        f"/api/worker/jobs/{job_id}/approval_requests", json={"title": "erledigt", "message": ""}
+    ).get_json()["id"]
+    client.post(f"/api/actions/{decided}/decide", json={"approved": True})
+
+    actions = client.get("/api/actions").get_json()
+
+    assert [a["id"] for a in actions] == [pending]
+    assert actions[0]["title"] == "wartet"
+    assert actions[0]["job_id"] == job_id
+
+
+def test_decide_action_endpoint_requires_a_boolean_approved(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+    request_id = client.post(
+        f"/api/worker/jobs/{job_id}/approval_requests", json={"title": "x", "message": ""}
+    ).get_json()["id"]
+
+    res = client.post(f"/api/actions/{request_id}/decide", json={"comment": "hm"})
+
+    assert res.status_code == 400
+
+
+def test_decide_action_endpoint_returns_404_for_an_already_decided_request(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+    request_id = client.post(
+        f"/api/worker/jobs/{job_id}/approval_requests", json={"title": "x", "message": ""}
+    ).get_json()["id"]
+    client.post(f"/api/actions/{request_id}/decide", json={"approved": True})
+
+    res = client.post(f"/api/actions/{request_id}/decide", json={"approved": False})
+
+    assert res.status_code == 404
+
+
+def test_decide_action_endpoint_records_the_deciding_username_in_multiuser_mode(multiuser_app):
+    operator = multiuser_app.test_client()
+    _login(operator, "op1", "oppass")
+    job_id = operator.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+    request_id = operator.post(
+        f"/api/worker/jobs/{job_id}/approval_requests", json={"title": "x", "message": ""}
+    ).get_json()["id"]
+
+    operator.post(f"/api/actions/{request_id}/decide", json={"approved": True})
+
+    decision = db.get_approval_decision(request_id)
+    assert decision["decided_by"] == "op1"
+
+
+def test_actions_list_is_readable_by_a_viewer_but_deciding_needs_at_least_operator(multiuser_app):
+    operator = multiuser_app.test_client()
+    _login(operator, "op1", "oppass")
+    job_id = operator.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+    request_id = operator.post(
+        f"/api/worker/jobs/{job_id}/approval_requests", json={"title": "x", "message": ""}
+    ).get_json()["id"]
+
+    viewer = multiuser_app.test_client()
+    _login(viewer, "view1", "viewpass")
+
+    assert viewer.get("/api/actions").status_code == 200
+    assert viewer.post(f"/api/actions/{request_id}/decide", json={"approved": True}).status_code == 403
+
+
 def test_inspect_web_endpoint_reports_match_count(client, monkeypatch):
     monkeypatch.setattr(
         "uiflow.studio.picker.inspect_web_selector",

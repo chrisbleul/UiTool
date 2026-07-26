@@ -108,6 +108,15 @@ class RemoteStore:
         # has no local notification settings/credentials to read anyway.
         pass
 
+    def create_approval_request(self, job_id: str, title: str, message: str) -> int:
+        return self._post(f"/api/worker/jobs/{quote(job_id)}/approval_requests", {"title": title, "message": message})["id"]
+
+    def get_approval_decision(self, request_id: int) -> dict[str, Any] | None:
+        return self._get(f"/api/worker/approval_requests/{request_id}")
+
+    def cancel_approval_request(self, request_id: int) -> None:
+        self._post(f"/api/worker/approval_requests/{request_id}/cancel")
+
     def get_global_variables(self) -> dict[str, Any]:
         return self._get("/api/worker/globals")
 

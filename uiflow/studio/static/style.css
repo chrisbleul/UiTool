@@ -1009,6 +1009,19 @@ body {
 .list-row-meta { font-size: 0.76rem; color: var(--muted); }
 .list-row .btn-icon { flex: none; }
 
+.action-row { align-items: flex-start; flex-wrap: wrap; }
+.action-message { font-size: 0.82rem; color: var(--text); margin-top: 4px; white-space: pre-wrap; }
+.action-controls { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-left: auto; }
+.action-comment {
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 0.85rem;
+  width: 160px;
+}
+
 .queue-card {
   border: 1px solid var(--border);
   border-radius: 8px;

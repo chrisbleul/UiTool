@@ -147,6 +147,7 @@
         <button class="tab-btn" data-tab="credentials" role="tab" id="tab-btn-credentials">Anmeldedaten</button>
         <button class="tab-btn" data-tab="globals" role="tab" id="tab-btn-globals">Globale Variablen</button>
         <button class="tab-btn" data-tab="schedules" role="tab">Zeitplan</button>
+        <button class="tab-btn" data-tab="actions" role="tab" id="tab-btn-actions">Aktionen</button>
         <button class="tab-btn hidden" data-tab="users" role="tab" id="tab-btn-users">Benutzer</button>
         <button class="tab-btn hidden" data-tab="audit" role="tab" id="tab-btn-audit">Audit-Log</button>
         <button class="tab-btn hidden" data-tab="notifications" role="tab" id="tab-btn-notifications">Benachrichtigungen</button>
@@ -226,6 +227,16 @@
           <button id="btn-add-holiday" class="btn">Hinzufügen</button>
         </div>
         <div id="holidays-list" class="queues-list"></div>
+      </div>
+
+      <div class="tab-panel" data-tab-panel="actions">
+        <p class="panel-hint">
+          Das <strong>Action Center</strong>: jeder Workflow-Lauf mit einem offenen Schritt "Genehmigung
+          anfordern" wartet hier auf eine menschliche Entscheidung, statt weiterzulaufen — auch von jemand
+          anderem als der Person, die den Lauf gestartet hat. Sehen kann das jeder angemeldete Nutzer,
+          entscheiden (Genehmigen/Ablehnen) erfordert mindestens die Rolle <strong>Operator</strong>.
+        </p>
+        <div id="actions-list" class="queues-list"></div>
       </div>
 
       <div class="tab-panel" data-tab-panel="users">

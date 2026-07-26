@@ -539,6 +539,29 @@ steps:
     save_as: eingang                # -> Liste von {subject, from, date, body}
 ```
 
+### Genehmigung anfordern (Human-in-the-loop)
+
+```yaml
+steps:
+  - action: request_approval
+    title: "Rechnung {var.betrag}€ freigeben"   # kurz, erlaubt {var.x}/{item.x}
+    message: "Lieferant: {var.lieferant}"        # optional, Kontext für die entscheidende Person
+    save_as: entscheidung           # -> {approved: bool, comment: str, decided_by: str|None}
+
+  - action: if
+    condition: "entscheidung['approved']"
+    then: [{action: assign, variable: status, value: "freigegeben"}]
+    else: [{action: fail, message: "Freigabe abgelehnt: {var.entscheidung}", type: business}]
+```
+
+Pausiert den Workflow-Lauf, bis jemand die Anfrage im Studio-Tab **Aktionen** (dem "Action Center")
+genehmigt oder ablehnt — siehe den eigenen Abschnitt "Action Center" unten. Eine Ablehnung ist selbst
+kein Fehler, sondern nur ein Wert in `save_as`; ob eine Ablehnung den Workflow abbricht (wie im Beispiel
+oben über `fail`) oder nur einen anderen Zweig nimmt, entscheidet der Workflow-Autor über ein normales
+`if`. Nur über den Orchestrator (Studio oder `uiflow worker`) nutzbar — ein bloßes `uiflow run
+workflow.yaml` ohne Orchestrator bricht mit einer klaren Fehlermeldung ab, weil dort niemand da ist, der
+entscheiden könnte.
+
 ## Deklarierte Workflow-Variablen
 
 Bislang entstand jede Workflow-eigene Variable stillschweigend beim ersten `assign` — nirgends stand,
@@ -856,6 +879,35 @@ Bewusst (noch) **nicht** umgesetzt, obwohl in der ursprünglichen Idee "pro Work
 genannt: Queues haben keine eigenen granularen Rechte, nur Workflow-Ordner. Auch keine
 Wildcard-/Glob-Muster für Ordnernamen — nur echte Ordner-Hierarchie (Elternordner deckt Kinder ab).
 
+## Action Center (Human-in-the-loop-Genehmigungen)
+
+Ein `request_approval`-Schritt (siehe "Genehmigung anfordern" oben) pausiert seinen Workflow-Lauf, bis
+eine Person im Studio-Tab **Aktionen** entscheidet — bewusst **asynchron**: anders als ein Haltepunkt
+(siehe Builder), der direkt am Studio hängen bleibt und nur von der Person fortgesetzt werden kann, die
+den Lauf gerade vor sich hat, kann eine Genehmigungsanfrage von *jeder* berechtigten Person zu einem
+späteren Zeitpunkt entschieden werden — auch jemand anderem als der Person, die den Lauf gestartet hat.
+Sehen kann die Liste offener Anfragen jeder angemeldete Nutzer, entscheiden (Genehmigen/Ablehnen, mit
+optionalem Kommentar) erfordert mindestens die Rolle **Operator**. Genehmigt/abgelehnt landet als
+`{approved, comment, decided_by, decided_at}` in der Variable aus `save_as` — eine Ablehnung lässt den
+Job selbst nicht fehlschlagen (siehe oben), sie ist nur ein Wert, auf den der Workflow reagiert.
+
+Technisch blockiert der wartende Workflow-Lauf seinen Worker-Thread (Polling, ähnlich einem Haltepunkt-
+Pause), verbraucht dabei aber keine CPU-Zeit und wird durch den bestehenden Heartbeat-Mechanismus (siehe
+"Heartbeat & automatisches Requeuing" oben) nicht als abgestürzt erkannt — der Heartbeat läuft in einem
+eigenen Thread unabhängig vom wartenden Schritt weiter. Funktioniert auch mit einem Remote-Worker (siehe
+oben): die Anfrage wird über dieselbe `/api/worker/*`-API erstellt/abgefragt wie andere
+Orchestrator-Zustände. Bricht man den Lauf während des Wartens ab (Button **Stoppen**), wird die
+Anfrage automatisch als storniert markiert und verschwindet aus der Liste offener Anfragen, statt dort
+verwaist liegen zu bleiben.
+
+Im **Dry-Run-Modus** (siehe unten) wird ein `request_approval`-Schritt übersprungen und automatisch als
+genehmigt behandelt, statt wirklich auf eine Person zu warten — eine Validierung darf nicht hängen bleiben.
+
+Bewusst **nicht** umgesetzt: keine sichtbare Historie bereits entschiedener Anfragen im Action Center
+(nur die aktuell offenen), keine Eskalation/Erinnerung, wenn eine Anfrage lange offen bleibt, und keine
+Mehrfach-Genehmigung ("zwei von drei müssen zustimmen") — eine Anfrage kennt nur eine einzige, finale
+Entscheidung.
+
 ## Dry-Run-Modus (Workflows validieren ohne echte Ausführung)
 
 Der Button **Validieren** im Builder (neben "Flowchart") führt den aktuell geöffneten (auch
@@ -870,10 +922,11 @@ der Job-Historie oder im Audit-Log — eine Validierung verändert nichts.
 
 Auch die wenigen Engine-Aktionen mit einem echten externen Seiteneffekt werden dabei übersprungen statt
 wirklich ausgeführt: `http_request` (kein echter Netzwerkaufruf), `send_email`/`read_emails` (keine
-echte SMTP-/IMAP-Verbindung), `write_excel` (keine echte Datei geschrieben) — jeweils mit einem
-neutralen Platzhalter-Ergebnis, damit eine nachfolgende Auswertung von `save_as` nicht zusätzlich
-fehlschlägt. `read_excel`/`read_pdf`/`ocr_image`/`get_credential` laufen dagegen bewusst echt (reine
-lokale Lesevorgänge ohne Seiteneffekt — validiert nebenbei, dass der Dateipfad/Anmeldedaten-Name
+echte SMTP-/IMAP-Verbindung), `write_excel` (keine echte Datei geschrieben), `request_approval` (wartet
+nicht wirklich auf eine Person, sondern gilt automatisch als genehmigt, siehe "Action Center" oben) —
+jeweils mit einem neutralen Platzhalter-Ergebnis, damit eine nachfolgende Auswertung von `save_as` nicht
+zusätzlich fehlschlägt. `read_excel`/`read_pdf`/`ocr_image`/`get_credential` laufen dagegen bewusst echt
+(reine lokale Lesevorgänge ohne Seiteneffekt — validiert nebenbei, dass der Dateipfad/Anmeldedaten-Name
 stimmt). Ein `run_workflow`-Schritt validiert den referenzierten Unterprozess automatisch mit, rekursiv.
 
 Auch über die CLI nutzbar, ohne Studio:
@@ -972,10 +1025,10 @@ Ideen, was als Nächstes sinnvoll sein könnte. Reihenfolge ist keine Priorität
 - ~~**Business-Kalender für Zeitpläne**~~ — erledigt, siehe "Zeitpläne (Scheduling)" oben
   ("Nur an Werktagen" / "Feiertage überspringen"). Was bewusst fehlt: keine wiederkehrenden Regeln für
   Feiertage (z.B. "jeder erste Montag im Monat") — nur einzelne, von Hand gepflegte Kalenderdaten.
-- **Human-in-the-loop / Action Center**: ein Schritt-Typ, der auf eine menschliche Entscheidung wartet
-  (z.B. "Rechnung > 10.000€ manuell freigeben") über ein Web-Formular — nicht dasselbe wie ein
-  Haltepunkt, der eine Person direkt am Studio voraussetzt, sondern eine asynchrone Freigabe, die auch
-  jemand anderes später erledigen kann.
+- ~~**Human-in-the-loop / Action Center**~~ — erledigt, siehe "Action Center (Human-in-the-loop-
+  Genehmigungen)" oben und den Schritt `request_approval`. Was bewusst fehlt: keine Historie bereits
+  entschiedener Anfragen (nur die aktuell offenen), keine Eskalation/Erinnerung bei lange offenen
+  Anfragen, keine Mehrfach-Genehmigung ("zwei von drei müssen zustimmen").
 - ~~**Ordner-/Projektstruktur**~~ — für Workflows erledigt, siehe "Workflow-Ordner" oben (Name mit
   `/`, echte Unterordner in `workflows/`, Gruppierung im Tab **Workflows**). Was bewusst fehlt: Queues
   und Anmeldedaten liegen weiterhin flach (eine gemeinsame Liste je) — Ordner sind reine Namensräume,

@@ -223,6 +223,27 @@ CREATE TABLE IF NOT EXISTS folder_permissions (
     role TEXT NOT NULL,
     UNIQUE(username, folder)
 );
+
+-- A `request_approval` engine step (see engine.py's _run_request_approval)
+-- blocks the running job until a human decides here - the human-in-the-loop
+-- "Action Center" (studio/app.py's /api/actions*). `status` starts 'pending'
+-- and settles exactly once into 'approved'/'rejected' (a real decision) or
+-- 'cancelled' (the job was stopped while still waiting, see worker.py's
+-- on_request_approval) - never back to 'pending'. `decided_by` is the
+-- deciding session's username, NULL outside multi-user mode - same
+-- convention as audit_log/workflow_versions.
+CREATE TABLE IF NOT EXISTS approval_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    message TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    comment TEXT,
+    decided_by TEXT,
+    requested_at TEXT NOT NULL,
+    decided_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_approval_requests_status ON approval_requests(status);
 """
 
 
@@ -462,6 +483,77 @@ def get_controls(job_id: str) -> dict[str, Any] | None:
     with connect() as conn:
         row = conn.execute("SELECT * FROM job_controls WHERE job_id=?", (job_id,)).fetchone()
         return dict(row) if row else None
+
+
+# --- human-in-the-loop approvals (see the approval_requests table comment
+# and engine.py's _run_request_approval) --------------------------------------
+
+
+def create_approval_request(job_id: str, title: str, message: str) -> int:
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO approval_requests (job_id, title, message, status, requested_at) "
+            "VALUES (?, ?, ?, 'pending', ?)",
+            (job_id, title, message, _now()),
+        )
+        return cur.lastrowid
+
+
+def get_approval_decision(request_id: int) -> dict[str, Any] | None:
+    """None while still pending - the engine's on_request_approval callback
+    (see worker.py) polls this until it isn't. A cancelled request also
+    resolves here (as an unapproved decision, never as None) so any poller
+    unblocks, not just the one that called cancel_approval_request."""
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM approval_requests WHERE id=?", (request_id,)).fetchone()
+        if row is None or row["status"] == "pending":
+            return None
+        return {
+            "approved": row["status"] == "approved",
+            "comment": row["comment"] or "",
+            "decided_by": row["decided_by"],
+            "decided_at": row["decided_at"],
+        }
+
+
+def cancel_approval_request(request_id: int) -> None:
+    """Called when the waiting job is stopped before anyone decided - leaves
+    an already-decided request untouched (a decision, once made, stands)."""
+    with connect() as conn:
+        conn.execute(
+            "UPDATE approval_requests SET status='cancelled', decided_at=? WHERE id=? AND status='pending'",
+            (_now(), request_id),
+        )
+
+
+def list_approval_requests(status: str | None = "pending") -> list[dict[str, Any]]:
+    """The Action Center's listing (studio/app.py's GET /api/actions) - pending
+    only by default, joined with the job's name since a bare job_id means
+    little in a UI. Pass status=None for every request regardless of status."""
+    with connect() as conn:
+        query = (
+            "SELECT approval_requests.*, jobs.name AS job_name FROM approval_requests "
+            "LEFT JOIN jobs ON jobs.id = approval_requests.job_id"
+        )
+        params: tuple[Any, ...] = ()
+        if status is not None:
+            query += " WHERE approval_requests.status=?"
+            params = (status,)
+        query += " ORDER BY approval_requests.requested_at"
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def decide_approval_request(request_id: int, approved: bool, comment: str, decided_by: str | None) -> bool:
+    """Returns False if there was nothing left to decide (unknown id, or
+    already decided/cancelled) - a request can be decided exactly once."""
+    with connect() as conn:
+        cur = conn.execute(
+            "UPDATE approval_requests SET status=?, comment=?, decided_by=?, decided_at=? "
+            "WHERE id=? AND status='pending'",
+            ("approved" if approved else "rejected", comment, decided_by, _now(), request_id),
+        )
+        return cur.rowcount > 0
 
 
 # --- queues -------------------------------------------------------------------

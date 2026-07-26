@@ -4,7 +4,7 @@ just calls whatever method matches the step's `action` name (see engine.py),
 except the engine-level actions in _CONTROL_FLOW_AND_VARIABLES below (if,
 switch, for_each, try, run_workflow, assign, increment, read_excel,
 write_excel, http_request, get_credential, send_email, read_emails, read_pdf,
-ocr_image),
+ocr_image, request_approval),
 which the engine handles itself (not backend methods) and are therefore
 identical for both backends."""
 
@@ -129,6 +129,20 @@ _CONTROL_FLOW_AND_VARIABLES: dict[str, list[dict]] = {
     "ocr_image": [
         {"name": "path", "label": "Datei-Pfad (Bild)", "type": "text", "required": True},
         {"name": "lang", "label": "Sprache (z.B. eng, deu)", "type": "text", "required": False},
+    ],
+    "request_approval": [
+        {
+            "name": "title",
+            "label": "Titel (kurz, z.B. Rechnung {var.betrag}€ freigeben, erlaubt {var.x}/{item.x})",
+            "type": "text",
+            "required": True,
+        },
+        {
+            "name": "message",
+            "label": "Details für die entscheidende Person (optional, erlaubt {var.x}/{item.x})",
+            "type": "text",
+            "required": False,
+        },
     ],
 }
 
@@ -280,6 +294,7 @@ CATEGORY_ORDER = [
     "UI-Interaktion",
     "Warten",
     "Ablaufsteuerung",
+    "Freigabe",
     "Variablen",
     "Dateien & Dokumente",
     "Integration",
@@ -418,6 +433,13 @@ ACTION_META: dict[str, dict] = {
         "description": "Führt einen anderen Workflow als Baustein aus, mit eigenen Variablen.",
         "keywords": ["unterprozess", "aufrufen", "wiederverwenden", "baustein", "invoke"],
         "primary": ["workflow"],
+    },
+    "request_approval": {
+        "label": "Genehmigung anfordern",
+        "category": "Freigabe",
+        "description": "Pausiert den Workflow, bis eine Person die Anfrage im Action Center genehmigt oder ablehnt.",
+        "keywords": ["freigabe", "genehmigung", "approval", "human-in-the-loop", "entscheidung", "vier-augen"],
+        "primary": ["title"],
     },
     "assign": {
         "label": "Variable zuweisen",
