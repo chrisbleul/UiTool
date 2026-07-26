@@ -204,6 +204,25 @@ CREATE TABLE IF NOT EXISTS workflow_versions (
     saved_by TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_workflow_versions_name ON workflow_versions(workflow_name, id);
+
+-- Per-user, per-workflow-folder role grants (see studio/app.py's
+-- _effective_role) - opt-in on top of a user's global role (see the users
+-- table): a user with zero rows here is entirely unaffected, their global
+-- role applies to every workflow exactly as before this table existed. The
+-- moment a user has *any* row, they become folder-scoped for workflow
+-- access specifically (not queues/credentials/schedules/etc.): only
+-- folders they hold a grant for (or an ancestor folder, e.g. a grant on
+-- "Rechnungswesen" also covers "Rechnungswesen/Sub") are reachable at all -
+-- everything else is a 403, not a silent fallback to their global role.
+-- `folder` is "" for the top-level (workflows with no "/" in their name).
+-- Never consulted for an admin, who always has full access.
+CREATE TABLE IF NOT EXISTS folder_permissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL,
+    folder TEXT NOT NULL,
+    role TEXT NOT NULL,
+    UNIQUE(username, folder)
+);
 """
 
 
@@ -998,3 +1017,41 @@ def delete_workflow_versions(workflow_name: str) -> None:
     live file a restore could write back to."""
     with connect() as conn:
         conn.execute("DELETE FROM workflow_versions WHERE workflow_name=?", (workflow_name,))
+
+
+# --- folder permissions (granular, opt-in per-user workflow-folder scoping,
+# see the folder_permissions table comment and studio/app.py's
+# _effective_role) ------------------------------------------------------------
+
+
+def set_folder_permission(username: str, folder: str, role: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO folder_permissions (username, folder, role) VALUES (?, ?, ?) "
+            "ON CONFLICT(username, folder) DO UPDATE SET role=excluded.role",
+            (username, folder, role),
+        )
+
+
+def list_folder_permissions(username: str | None = None) -> list[dict[str, Any]]:
+    with connect() as conn:
+        if username is not None:
+            rows = conn.execute(
+                "SELECT * FROM folder_permissions WHERE username=? ORDER BY folder", (username,)
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM folder_permissions ORDER BY username, folder").fetchall()
+        return [dict(r) for r in rows]
+
+
+def delete_folder_permission(username: str, folder: str) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM folder_permissions WHERE username=? AND folder=?", (username, folder))
+
+
+def delete_folder_permissions_for_user(username: str) -> None:
+    """Called when the user account itself is deleted (see studio/app.py's
+    delete_user_route) - an orphaned grant for a username that no longer
+    exists would just be dead weight."""
+    with connect() as conn:
+        conn.execute("DELETE FROM folder_permissions WHERE username=?", (username,))

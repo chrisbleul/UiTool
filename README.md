@@ -808,8 +808,9 @@ Ständen, kein Branching, nur linearer Verlauf mit Wiederherstellen.
 
 Ein Workflow-Name darf `/` enthalten (z.B. `Rechnungswesen/rechnung_buchen`) — er landet dann als
 echte Unterordner-Struktur in `workflows/` (`workflows/Rechnungswesen/rechnung_buchen.yaml`), rein zur
-Gruppierung bei vielen Workflows. Ein Ordner hat sonst keine eigene Bedeutung: keine separaten Rechte,
-keine eigene Konfiguration — nur ein Namensraum. Einfach beim Speichern (Feld "Workflow-Name" im
+Gruppierung bei vielen Workflows. Ein Ordner hat sonst keine eigene Bedeutung: keine eigene
+Konfiguration — nur ein Namensraum (optional lassen sich pro Benutzer trotzdem Rechte daran hängen,
+siehe "Granulare Berechtigungen (Ordner-Rechte)" unten). Einfach beim Speichern (Feld "Workflow-Name" im
 Builder) mit `/` eintragen; im Tab **Workflows** werden Einträge automatisch nach Ordner gruppiert
 angezeigt (mit Kopfzeile pro Ordner, sobald mehr als eine Gruppe existiert), sortiert so, dass alle
 Einträge eines Ordners zusammenbleiben statt durch alphabetisch dazwischenliegende andere Namen
@@ -822,6 +823,38 @@ Verlauf (siehe "Workflow-Versionierung" oben).
 `..`- oder leere Pfadsegmente in einem Namen werden beim Auflösen stillschweigend verworfen (nicht der
 gesamte Name wie früher, nur die gefährlichen Teile) — ein Name kann also nie außerhalb von
 `workflows/` auflösen, egal woher er kommt (Studio-API oder ein `run_workflow`-Verweis).
+
+## Granulare Berechtigungen (Ordner-Rechte)
+
+Zusätzlich zu den drei globalen Rollen (siehe "Benutzer & Rollen (RBAC)" oben) lässt sich pro Benutzer
+optional eine feinere Einschränkung *pro Workflow-Ordner* vergeben — im Tab **Benutzer** unter dem
+Abschnitt "Ordner-Berechtigungen" (nur für Admins sichtbar). Das Modell ist bewusst **opt-in und
+additiv**:
+
+- Ein Benutzer **ohne** einen einzigen Ordner-Eintrag ist von dieser Funktion komplett unberührt — seine
+  globale Rolle gilt wie gewohnt überall, nichts ändert sich an bestehenden Installationen.
+- Sobald ein Benutzer **irgendeinen** Ordner-Eintrag hat, wechselt er in einen ordner-beschränkten
+  Modus: Zugriff auf einen konkreten Workflow gibt es nur noch dort, wo ein passender Eintrag existiert
+  (der Ordner selbst oder ein übergeordneter Ordner — ein Eintrag auf `Rechnungswesen` deckt automatisch
+  auch `Rechnungswesen/Mahnwesen` mit ab, der spezifischste Treffer gewinnt). Für jeden nicht getroffenen
+  Ordner (auch die oberste Ebene, dafür extra ein Eintrag mit leerem Ordnernamen nötig) ist der Zugriff
+  **verweigert**, unabhängig von der globalen Rolle.
+- Ein Ordner-Eintrag kann die globale Rolle sowohl **einschränken** (z.B. global `operator`, aber nur
+  `viewer` in einem bestimmten Ordner) als auch **erweitern** (z.B. global `viewer`, aber `operator` in
+  einem bestimmten Ordner).
+- **Admins sind nie betroffen** — ein Admin-Konto behält immer vollen Zugriff, egal welche Ordner-Einträge
+  für es existieren.
+
+Gilt für alle Endpunkte, die einen konkreten Workflow-Namen ansprechen (Öffnen, Speichern, Löschen,
+Ausführen über `/api/run`, Versionsverlauf samt Wiederherstellen). Die reine Auflistung
+(`GET /api/workflows`, ohne Namen) ist bewusst **nicht** gefiltert — ein ordner-beschränkter Benutzer
+sieht also weiterhin alle Namen in der Liste, bekommt aber beim Öffnen eines nicht freigegebenen
+Workflows eine Ablehnung. Löscht man einen Benutzer, werden auch alle seine Ordner-Einträge automatisch
+mit entfernt.
+
+Bewusst (noch) **nicht** umgesetzt, obwohl in der ursprünglichen Idee "pro Workflow/Ordner/**Queue**"
+genannt: Queues haben keine eigenen granularen Rechte, nur Workflow-Ordner. Auch keine
+Wildcard-/Glob-Muster für Ordnernamen — nur echte Ordner-Hierarchie (Elternordner deckt Kinder ab).
 
 ## Dry-Run-Modus (Workflows validieren ohne echte Ausführung)
 
@@ -921,10 +954,11 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
 Unten gesammelt, aber noch nicht bewertet oder gegen den tatsächlichen Bedarf geprüft — einfach
 Ideen, was als Nächstes sinnvoll sein könnte. Reihenfolge ist keine Priorität.
 
-- **Granulare Berechtigungen pro Workflow/Ordner/Queue**: RBAC kennt heute nur drei globale Rollen
-  (viewer/operator/admin, siehe "Benutzer & Rollen" oben) — kein "Team A darf nur Workflows in Ordner
-  X sehen/starten". Workflow-Ordner gibt es inzwischen (siehe oben) als reine Gruppierung — die
-  Voraussetzung für so eine Regel wäre also da, es fehlt aber weiterhin die Rechteprüfung selbst.
+- ~~**Granulare Berechtigungen pro Workflow/Ordner/Queue**~~ — für Workflow-Ordner erledigt, siehe
+  "Granulare Berechtigungen (Ordner-Rechte)" oben (opt-in pro Benutzer, Ordner-Eintrag kann global
+  einschränken oder erweitern, Admins immer ausgenommen). Was bewusst fehlt: **Queue**-Ebene ist trotz
+  des Namens der Idee nicht abgedeckt (keine granularen Rechte pro Queue, nur pro Workflow-Ordner), und
+  keine Wildcard-/Glob-Muster für Ordnernamen (nur echte Eltern-Kind-Hierarchie).
 - ~~**Proaktive Fehlerbenachrichtigung**~~ — als E-Mail erledigt, siehe "Proaktive
   Fehlerbenachrichtigung" oben. Was fehlt: Slack- oder Webhook-Kanäle statt/zusätzlich zu E-Mail — die
   Einstellung kennt aktuell nur SMTP.

@@ -269,6 +269,200 @@ def _workflow(name: str, url: str) -> dict:
     return {"name": name, "backend": "web", "steps": [{"action": "navigate", "url": url}]}
 
 
+# --- granular folder permissions (see studio/app.py's _effective_role) -------
+
+
+def test_a_user_with_no_folder_grants_is_unaffected_by_the_feature(multiuser_app):
+    # op1 has zero folder_permissions rows - their global "operator" role
+    # must apply everywhere exactly as before this feature existed, in any
+    # folder or none at all.
+    client = multiuser_app.test_client()
+    _login(client, "op1", "oppass")
+
+    assert client.post("/api/workflows/Rechnungswesen/invoice", json=_workflow("invoice", "https://a")).status_code == 200
+    assert client.post("/api/workflows/top_level", json=_workflow("top_level", "https://a")).status_code == 200
+
+
+def test_a_folder_grant_restricts_access_outside_that_folder(multiuser_app):
+    db.set_folder_permission("op1", "Rechnungswesen", "operator")
+    client = multiuser_app.test_client()
+    _login(client, "op1", "oppass")
+
+    # inside the granted folder: works, at operator level
+    assert client.post("/api/workflows/Rechnungswesen/invoice", json=_workflow("invoice", "https://a")).status_code == 200
+    # outside it: denied, even though op1's *global* role is operator
+    res = client.post("/api/workflows/Personal/mahnung", json=_workflow("mahnung", "https://b"))
+    assert res.status_code == 403
+    res = client.post("/api/workflows/top_level", json=_workflow("top_level", "https://b"))
+    assert res.status_code == 403
+
+
+def test_a_folder_grant_can_be_more_restrictive_than_the_global_role(multiuser_app):
+    # op1 is a global operator, but only a *viewer* inside Rechnungswesen -
+    # a folder grant can narrow access, not just widen it.
+    db.set_folder_permission("op1", "Rechnungswesen", "viewer")
+    admin = multiuser_app.test_client()
+    _login(admin, "admin1", "adminpass")
+    admin.post("/api/workflows/Rechnungswesen/invoice", json=_workflow("invoice", "https://a"))
+
+    client = multiuser_app.test_client()
+    _login(client, "op1", "oppass")
+
+    assert client.get("/api/workflows/Rechnungswesen/invoice").status_code == 200
+    res = client.post("/api/workflows/Rechnungswesen/invoice", json=_workflow("invoice", "https://b"))
+    assert res.status_code == 403
+
+
+def test_a_folder_grant_can_widen_a_viewers_access(multiuser_app):
+    # view1 is a global viewer, but an operator inside Rechnungswesen specifically.
+    db.set_folder_permission("view1", "Rechnungswesen", "operator")
+    client = multiuser_app.test_client()
+    _login(client, "view1", "viewpass")
+
+    assert client.post("/api/workflows/Rechnungswesen/invoice", json=_workflow("invoice", "https://a")).status_code == 200
+    # still just a viewer everywhere else
+    res = client.post("/api/workflows/top_level", json=_workflow("top_level", "https://b"))
+    assert res.status_code == 403
+
+
+def test_a_grant_on_a_parent_folder_covers_a_nested_subfolder(multiuser_app):
+    db.set_folder_permission("op1", "Rechnungswesen", "operator")
+    client = multiuser_app.test_client()
+    _login(client, "op1", "oppass")
+
+    res = client.post(
+        "/api/workflows/Rechnungswesen/Mahnwesen/erste_mahnung", json=_workflow("erste_mahnung", "https://a")
+    )
+
+    assert res.status_code == 200
+
+
+def test_the_most_specific_grant_wins_over_a_parent_folder_grant(multiuser_app):
+    db.set_folder_permission("op1", "Rechnungswesen", "viewer")
+    db.set_folder_permission("op1", "Rechnungswesen/Mahnwesen", "operator")
+    client = multiuser_app.test_client()
+    _login(client, "op1", "oppass")
+
+    # the more specific grant (operator) applies, not the parent's (viewer)
+    res = client.post(
+        "/api/workflows/Rechnungswesen/Mahnwesen/erste_mahnung", json=_workflow("erste_mahnung", "https://a")
+    )
+    assert res.status_code == 200
+    # a sibling folder still only has the parent's grant
+    res = client.post("/api/workflows/Rechnungswesen/other/x", json=_workflow("x", "https://a"))
+    assert res.status_code == 403
+
+
+def test_a_folder_scoped_user_needs_an_explicit_root_grant_for_top_level_workflows(multiuser_app):
+    db.set_folder_permission("op1", "Rechnungswesen", "operator")
+    client = multiuser_app.test_client()
+    _login(client, "op1", "oppass")
+
+    res = client.post("/api/workflows/top_level", json=_workflow("top_level", "https://a"))
+    assert res.status_code == 403
+
+    db.set_folder_permission("op1", "", "viewer")
+    assert client.get("/api/workflows/top_level").status_code == 404  # readable now, just doesn't exist yet
+
+
+def test_folder_scoping_applies_to_api_run_based_on_the_payload_name(multiuser_app):
+    db.set_folder_permission("op1", "Rechnungswesen", "operator")
+    client = multiuser_app.test_client()
+    _login(client, "op1", "oppass")
+
+    res = client.post("/api/run", json=_workflow("Rechnungswesen/invoice", "https://a"))
+    assert res.status_code == 200
+
+    res = client.post("/api/run", json=_workflow("Personal/mahnung", "https://a"))
+    assert res.status_code == 403
+
+
+def test_workflow_list_is_not_folder_filtered(multiuser_app):
+    # deliberate scope limit (see _workflow_name_from_request's docstring):
+    # the bare list endpoint shows every name regardless of folder grants.
+    admin = multiuser_app.test_client()
+    _login(admin, "admin1", "adminpass")
+    admin.post("/api/workflows/Rechnungswesen/invoice", json=_workflow("invoice", "https://a"))
+    admin.post("/api/workflows/Personal/mahnung", json=_workflow("mahnung", "https://a"))
+    db.set_folder_permission("op1", "Rechnungswesen", "operator")
+
+    client = multiuser_app.test_client()
+    _login(client, "op1", "oppass")
+
+    names = client.get("/api/workflows").get_json()
+    assert set(names) == {"Rechnungswesen/invoice", "Personal/mahnung"}
+
+
+def test_folder_permissions_never_restrict_an_admin(multiuser_app):
+    # granting an admin a folder permission is a strange thing to do, but
+    # must not lock them out of everything else - see _effective_role.
+    db.set_folder_permission("admin1", "Rechnungswesen", "viewer")
+    client = multiuser_app.test_client()
+    _login(client, "admin1", "adminpass")
+
+    res = client.post("/api/workflows/Personal/mahnung", json=_workflow("mahnung", "https://a"))
+    assert res.status_code == 200
+
+
+def test_deleting_a_user_removes_their_folder_permissions(multiuser_app):
+    db.set_folder_permission("op1", "Rechnungswesen", "operator")
+    admin = multiuser_app.test_client()
+    _login(admin, "admin1", "adminpass")
+
+    admin.delete("/api/users/op1")
+
+    assert db.list_folder_permissions("op1") == []
+
+
+def test_folder_permissions_endpoint_crud_and_admin_gating(multiuser_app):
+    operator = multiuser_app.test_client()
+    _login(operator, "op1", "oppass")
+    assert operator.get("/api/folder-permissions").status_code == 403
+    assert operator.post("/api/folder-permissions", json={}).status_code == 403
+
+    admin = multiuser_app.test_client()
+    _login(admin, "admin1", "adminpass")
+
+    res = admin.post("/api/folder-permissions", json={"username": "op1", "folder": "Rechnungswesen", "role": "viewer"})
+    assert res.status_code == 200
+
+    grants = admin.get("/api/folder-permissions?username=op1").get_json()
+    assert grants == [{"id": grants[0]["id"], "username": "op1", "folder": "Rechnungswesen", "role": "viewer"}]
+
+    res = admin.delete("/api/folder-permissions/op1/Rechnungswesen")
+    assert res.status_code == 200
+    assert admin.get("/api/folder-permissions?username=op1").get_json() == []
+
+
+def test_folder_permissions_endpoint_uses_a_token_for_the_root_folder(multiuser_app):
+    admin = multiuser_app.test_client()
+    _login(admin, "admin1", "adminpass")
+    admin.post("/api/folder-permissions", json={"username": "op1", "folder": "", "role": "viewer"})
+
+    res = admin.delete("/api/folder-permissions/op1/_root_")
+
+    assert res.status_code == 200
+    assert admin.get("/api/folder-permissions?username=op1").get_json() == []
+
+
+def test_folder_permissions_endpoint_rejects_an_unknown_username(multiuser_app):
+    admin = multiuser_app.test_client()
+    _login(admin, "admin1", "adminpass")
+
+    res = admin.post("/api/folder-permissions", json={"username": "nope", "folder": "A", "role": "viewer"})
+
+    assert res.status_code == 400
+
+
+def test_folder_permissions_endpoint_rejects_an_unknown_role(multiuser_app):
+    admin = multiuser_app.test_client()
+    _login(admin, "admin1", "adminpass")
+
+    res = admin.post("/api/folder-permissions", json={"username": "op1", "folder": "A", "role": "superadmin"})
+
+    assert res.status_code == 400
+
+
 def test_api_run_snapshots_referenced_sub_workflows_into_the_job(client):
     client.post(
         "/api/workflows/teilprozess",

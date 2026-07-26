@@ -2038,6 +2038,79 @@ async function addUser() {
   toast(`Benutzer "${username}" angelegt.`, "success");
 }
 
+function folderPermissionUrlToken(folder) {
+  return folder === "" ? "_root_" : encodeWorkflowName(folder);
+}
+
+async function renderFolderPermissionsPanel() {
+  const container = el("folder-permissions-list");
+  container.innerHTML = "Lädt...";
+  const res = await fetch("/api/folder-permissions");
+  if (!res.ok) {
+    container.innerHTML = '<p style="color:var(--muted)">Nur für Admins sichtbar.</p>';
+    return;
+  }
+  const grants = await res.json();
+  if (grants.length === 0) {
+    container.innerHTML = '<p style="color:var(--muted)">Noch keine Ordner-Berechtigungen vergeben.</p>';
+    return;
+  }
+  container.innerHTML = "";
+  for (const grant of grants) {
+    const row = document.createElement("div");
+    row.className = "list-row";
+
+    const label = document.createElement("span");
+    label.className = "list-row-name";
+    label.textContent = `${grant.username} — ${grant.folder === "" ? "(oberste Ebene)" : grant.folder}`;
+
+    const meta = document.createElement("span");
+    meta.className = "list-row-meta";
+    meta.textContent = ROLE_LABELS[grant.role] || grant.role;
+
+    const delBtn = document.createElement("button");
+    delBtn.className = "btn-icon danger";
+    delBtn.textContent = "✕";
+    delBtn.title = "Löschen";
+    delBtn.setAttribute("aria-label", `Ordner-Berechtigung für "${grant.username}" löschen`);
+    delBtn.addEventListener("click", async () => {
+      if (!(await confirmDialog(`Ordner-Berechtigung für "${grant.username}" (${grant.folder || "oberste Ebene"}) wirklich löschen?`))) return;
+      await fetch(`/api/folder-permissions/${encodeURIComponent(grant.username)}/${folderPermissionUrlToken(grant.folder)}`, {
+        method: "DELETE",
+      });
+      renderFolderPermissionsPanel();
+      toast("Ordner-Berechtigung gelöscht.", "success");
+    });
+
+    row.append(label, meta, delBtn);
+    container.appendChild(row);
+  }
+}
+
+async function addFolderPermission() {
+  const username = el("folderperm-username").value.trim();
+  const folder = el("folderperm-folder").value.trim().replace(/^\/+|\/+$/g, "");
+  const role = el("folderperm-role").value;
+  if (!username) {
+    toast("Bitte einen Benutzernamen angeben.", "error");
+    return;
+  }
+  const res = await fetch("/api/folder-permissions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, folder, role }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    toast("Hinzufügen fehlgeschlagen: " + (data.error || res.status), "error");
+    return;
+  }
+  el("folderperm-username").value = "";
+  el("folderperm-folder").value = "";
+  await renderFolderPermissionsPanel();
+  toast(`Ordner-Berechtigung für "${username}" gespeichert.`, "success");
+}
+
 async function loadCurrentUser() {
   const res = await fetch("/api/me");
   if (!res.ok) return;
@@ -3042,7 +3115,10 @@ function switchTab(name) {
     renderSchedulesPanel();
     renderHolidaysPanel();
   }
-  if (name === "users") renderUsersPanel();
+  if (name === "users") {
+    renderUsersPanel();
+    renderFolderPermissionsPanel();
+  }
   if (name === "audit") renderAuditLogPanel();
   if (name === "notifications") renderNotificationsPanel();
 }
@@ -3113,6 +3189,7 @@ function init() {
   el("btn-add-schedule").addEventListener("click", addSchedule);
   el("btn-add-holiday").addEventListener("click", addHoliday);
   el("btn-add-user").addEventListener("click", addUser);
+  el("btn-add-folder-permission").addEventListener("click", addFolderPermission);
   el("btn-save-notifications").addEventListener("click", saveNotificationSettings);
   el("btn-test-notification").addEventListener("click", sendTestNotification);
   el("btn-refresh-runs").addEventListener("click", renderRunsView);

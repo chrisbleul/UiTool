@@ -1305,3 +1305,51 @@ def test_delete_workflow_versions_removes_only_that_workflows_history():
 
     assert db.list_workflow_versions("a") == []
     assert len(db.list_workflow_versions("b")) == 1
+
+
+# --- folder permissions -------------------------------------------------------
+
+
+def test_set_and_list_folder_permissions():
+    db.set_folder_permission("alice", "Rechnungswesen", "operator")
+    db.set_folder_permission("alice", "", "viewer")
+
+    grants = db.list_folder_permissions("alice")
+
+    assert {g["folder"]: g["role"] for g in grants} == {"Rechnungswesen": "operator", "": "viewer"}
+
+
+def test_set_folder_permission_is_an_upsert():
+    db.set_folder_permission("alice", "Rechnungswesen", "viewer")
+    db.set_folder_permission("alice", "Rechnungswesen", "operator")
+
+    [grant] = db.list_folder_permissions("alice")
+    assert grant["role"] == "operator"
+
+
+def test_list_folder_permissions_without_a_username_lists_everyone():
+    db.set_folder_permission("alice", "A", "viewer")
+    db.set_folder_permission("bob", "B", "operator")
+
+    grants = db.list_folder_permissions()
+
+    assert {(g["username"], g["folder"]) for g in grants} == {("alice", "A"), ("bob", "B")}
+
+
+def test_delete_folder_permission_removes_only_that_grant():
+    db.set_folder_permission("alice", "A", "viewer")
+    db.set_folder_permission("alice", "B", "viewer")
+
+    db.delete_folder_permission("alice", "A")
+
+    assert [g["folder"] for g in db.list_folder_permissions("alice")] == ["B"]
+
+
+def test_delete_folder_permissions_for_user_removes_only_that_users_grants():
+    db.set_folder_permission("alice", "A", "viewer")
+    db.set_folder_permission("bob", "A", "viewer")
+
+    db.delete_folder_permissions_for_user("alice")
+
+    assert db.list_folder_permissions("alice") == []
+    assert len(db.list_folder_permissions("bob")) == 1

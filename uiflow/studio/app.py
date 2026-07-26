@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import queue
+import re
 import secrets
 import threading
 import time
@@ -53,6 +54,10 @@ _RESERVED_GLOBAL_NAMES = ("global", "item", "var")
 # frictionless single-user mode has no notion of roles at all.
 _ROLE_ORDER = {"viewer": 0, "operator": 1, "admin": 2}
 
+# Stands in for folder="" (the top-level, "no folder") in a URL path segment,
+# which can never itself be empty (see delete_folder_permission_route).
+ROOT_FOLDER_TOKEN = "_root_"
+
 
 def _required_role(method: str, path: str) -> str:
     """Minimum role a request needs, once multi-user mode is active.
@@ -66,6 +71,7 @@ def _required_role(method: str, path: str) -> str:
         or path.startswith("/api/globals")
         or path.startswith("/api/audit-log")
         or path.startswith("/api/notifications")
+        or path.startswith("/api/folder-permissions")
     ):
         return "admin"
     if path.startswith("/api/worker/"):
@@ -80,6 +86,61 @@ def _required_role(method: str, path: str) -> str:
     if method == "GET":
         return "viewer"
     return "operator"
+
+
+_WORKFLOW_VERSION_SUFFIX_RE = re.compile(r"^(?P<name>.+?)/versions(?:/\d+(?:/restore)?)?$")
+
+
+def _workflow_name_from_request() -> str | None:
+    """The workflow this request targets, if any - a specific workflow
+    endpoint's <path:name>, or /api/run's body (which may name a workflow
+    that was never saved at all; folder scoping still applies to it exactly
+    as if it had been, since name is the only identity a workflow has either
+    way). None for anything else (including the bare /api/workflows list,
+    deliberately not folder-filtered - see _effective_role's docstring)."""
+    if request.path == "/api/run" and request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        name = data.get("name")
+        return name if isinstance(name, str) and name else None
+    prefix = "/api/workflows/"
+    if not request.path.startswith(prefix):
+        return None
+    rest = request.path[len(prefix):]
+    if not rest:
+        return None
+    match = _WORKFLOW_VERSION_SUFFIX_RE.match(rest)
+    return match.group("name") if match else rest
+
+
+def _folder_of(workflow_name: str) -> str:
+    idx = workflow_name.rfind("/")
+    return workflow_name[:idx] if idx != -1 else ""
+
+
+def _ancestor_folders(folder: str) -> list[str]:
+    """Most specific first: "a/b/c" -> ["a/b/c", "a/b", "a", ""] - a grant on
+    a parent folder also covers everything nested under it."""
+    parts = folder.split("/") if folder else []
+    return ["/".join(parts[:i]) for i in range(len(parts), -1, -1)]
+
+
+def _effective_role(username: str, global_role: str, workflow_name: str) -> str:
+    """The role this user actually has for this specific workflow: their
+    global role, unless they hold *any* folder_permissions grant at all - in
+    which case only a grant matching this workflow's folder (or an ancestor
+    of it) counts, and anything else resolves to "none" (always denied, see
+    _ROLE_ORDER, which has no entry for it - not a silent fallback to their
+    global role). An admin is never folder-restricted."""
+    if global_role == "admin":
+        return "admin"
+    grants = {g["folder"]: g["role"] for g in db.list_folder_permissions(username)}
+    if not grants:
+        return global_role
+    for candidate in _ancestor_folders(_folder_of(workflow_name)):
+        if candidate in grants:
+            return grants[candidate]
+    return "none"
+
 
 # One entry per in-flight recording session (unaffected by the orchestrator -
 # a recording is a live interactive picking session tied to one browser tab,
@@ -130,8 +191,10 @@ def create_app() -> Flask:
                     return jsonify({"error": "unauthenticated"}), 401
                 return redirect("/login")
             role = session.get("role", "viewer")
+            workflow_name = _workflow_name_from_request()
+            effective_role = _effective_role(username, role, workflow_name) if workflow_name is not None else role
             required = _required_role(request.method, request.path)
-            if _ROLE_ORDER.get(role, -1) < _ROLE_ORDER[required]:
+            if _ROLE_ORDER.get(effective_role, -1) < _ROLE_ORDER[required]:
                 return jsonify({"error": "forbidden"}), 403
             return None
         if not studio_password:
@@ -766,7 +829,34 @@ def create_app() -> Flask:
         if username == session.get("username"):
             return jsonify({"error": "Kann den eigenen Account nicht selbst löschen"}), 400
         db.delete_user(username)
+        db.delete_folder_permissions_for_user(username)
         return jsonify({"deleted": username})
+
+    @app.get("/api/folder-permissions")
+    def list_folder_permissions_route() -> Response:
+        return jsonify(db.list_folder_permissions(request.args.get("username")))
+
+    @app.post("/api/folder-permissions")
+    def set_folder_permission_route() -> Response:
+        data = request.get_json(force=True) or {}
+        username = (data.get("username") or "").strip()
+        folder = (data.get("folder") or "").strip("/")
+        role = data.get("role")
+        if not username or role not in db.VALID_ROLES:
+            return jsonify({"error": "username and a valid role are required"}), 400
+        if db.get_user(username) is None:
+            return jsonify({"error": f"Unbekannter Benutzer '{username}'"}), 400
+        db.set_folder_permission(username, folder, role)
+        return jsonify({"username": username, "folder": folder, "role": role})
+
+    @app.delete("/api/folder-permissions/<username>/<path:folder_token>")
+    def delete_folder_permission_route(username: str, folder_token: str) -> Response:
+        # A URL path segment can't be empty (Werkzeug's <path:...> converter
+        # requires at least one character), so the top-level/root folder -
+        # folder="" everywhere else - needs a stand-in token here.
+        folder = "" if folder_token == ROOT_FOLDER_TOKEN else folder_token
+        db.delete_folder_permission(username, folder)
+        return jsonify({"deleted": True})
 
     @app.get("/api/audit-log")
     def get_audit_log() -> Response:

@@ -246,6 +246,29 @@
           Anmeldedaten und globale Variablen verwalten.
         </p>
         <div id="users-list" class="queues-list"></div>
+
+        <div class="tab-subsection-head">Ordner-Berechtigungen</div>
+        <div class="excel-import-row">
+          <input id="folderperm-username" type="text" placeholder="Benutzername" autocomplete="off">
+          <input id="folderperm-folder" type="text" placeholder="Ordner (leer = oberste Ebene)" autocomplete="off">
+          <select id="folderperm-role">
+            <option value="viewer">Viewer (nur lesen)</option>
+            <option value="operator" selected>Operator (bauen &amp; ausführen)</option>
+            <option value="admin">Admin</option>
+          </select>
+          <button id="btn-add-folder-permission" class="btn">Hinzufügen</button>
+        </div>
+        <p class="panel-hint">
+          Optionale, zusätzliche Einschränkung <em>pro Workflow-Ordner</em>, oben auf der globalen Rolle.
+          Ein Benutzer <strong>ohne</strong> Eintrag hier ist von dieser Funktion unberührt — seine globale
+          Rolle gilt überall wie gewohnt. Sobald ein Benutzer <strong>irgendeinen</strong> Ordner-Eintrag
+          hat, gilt für ihn: Zugriff auf einen Workflow nur noch dort, wo ein passender Ordner-Eintrag
+          existiert (der eigene Ordner oder ein übergeordneter) — alles andere wird verweigert, unabhängig
+          von der globalen Rolle. Ein Ordner-Eintrag kann die globale Rolle sowohl einschränken als auch
+          erweitern. Admins sind von Ordner-Beschränkungen nie betroffen. Gilt nur für Workflows/Ordner,
+          nicht für Queues.
+        </p>
+        <div id="folder-permissions-list" class="queues-list"></div>
       </div>
 
       <div class="tab-panel" data-tab-panel="audit">
