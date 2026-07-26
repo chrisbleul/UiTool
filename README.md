@@ -804,6 +804,25 @@ Verlauf gelöscht (ein Wiederherstellen hätte ohnehin keine Datei mehr, in die 
 Bewusst eine einfache eigene Versions-Tabelle statt echtem Git im Hintergrund — kein Diff zwischen zwei
 Ständen, kein Branching, nur linearer Verlauf mit Wiederherstellen.
 
+## Workflow-Ordner
+
+Ein Workflow-Name darf `/` enthalten (z.B. `Rechnungswesen/rechnung_buchen`) — er landet dann als
+echte Unterordner-Struktur in `workflows/` (`workflows/Rechnungswesen/rechnung_buchen.yaml`), rein zur
+Gruppierung bei vielen Workflows. Ein Ordner hat sonst keine eigene Bedeutung: keine separaten Rechte,
+keine eigene Konfiguration — nur ein Namensraum. Einfach beim Speichern (Feld "Workflow-Name" im
+Builder) mit `/` eintragen; im Tab **Workflows** werden Einträge automatisch nach Ordner gruppiert
+angezeigt (mit Kopfzeile pro Ordner, sobald mehr als eine Gruppe existiert), sortiert so, dass alle
+Einträge eines Ordners zusammenbleiben statt durch alphabetisch dazwischenliegende andere Namen
+auseinandergerissen zu werden. Löscht man den letzten Workflow in einem Ordner, wird der leere Ordner
+automatisch mit entfernt. Ein `run_workflow`-Schritt kann einen ordner-qualifizierten Namen genauso
+referenzieren wie einen ohne Ordner. Zwei Workflows mit demselben Namen in unterschiedlichen Ordnern
+(z.B. `Rechnungswesen/mahnung` und `Personal/mahnung`) sind vollständig unabhängig, auch in ihrem
+Verlauf (siehe "Workflow-Versionierung" oben).
+
+`..`- oder leere Pfadsegmente in einem Namen werden beim Auflösen stillschweigend verworfen (nicht der
+gesamte Name wie früher, nur die gefährlichen Teile) — ein Name kann also nie außerhalb von
+`workflows/` auflösen, egal woher er kommt (Studio-API oder ein `run_workflow`-Verweis).
+
 ## Dry-Run-Modus (Workflows validieren ohne echte Ausführung)
 
 Der Button **Validieren** im Builder (neben "Flowchart") führt den aktuell geöffneten (auch
@@ -904,8 +923,8 @@ Ideen, was als Nächstes sinnvoll sein könnte. Reihenfolge ist keine Priorität
 
 - **Granulare Berechtigungen pro Workflow/Ordner/Queue**: RBAC kennt heute nur drei globale Rollen
   (viewer/operator/admin, siehe "Benutzer & Rollen" oben) — kein "Team A darf nur Workflows in Ordner
-  X sehen/starten". Setzt vermutlich eine Ordner-/Projektstruktur (siehe unten) als Voraussetzung
-  voraus, bevor sich Rechte überhaupt sinnvoll darauf beziehen lassen.
+  X sehen/starten". Workflow-Ordner gibt es inzwischen (siehe oben) als reine Gruppierung — die
+  Voraussetzung für so eine Regel wäre also da, es fehlt aber weiterhin die Rechteprüfung selbst.
 - ~~**Proaktive Fehlerbenachrichtigung**~~ — als E-Mail erledigt, siehe "Proaktive
   Fehlerbenachrichtigung" oben. Was fehlt: Slack- oder Webhook-Kanäle statt/zusätzlich zu E-Mail — die
   Einstellung kennt aktuell nur SMTP.
@@ -923,10 +942,10 @@ Ideen, was als Nächstes sinnvoll sein könnte. Reihenfolge ist keine Priorität
   (z.B. "Rechnung > 10.000€ manuell freigeben") über ein Web-Formular — nicht dasselbe wie ein
   Haltepunkt, der eine Person direkt am Studio voraussetzt, sondern eine asynchrone Freigabe, die auch
   jemand anderes später erledigen kann.
-- **Ordner-/Projektstruktur**: Workflows, Queues und Credentials liegen heute alle flach nebeneinander
-  (`workflows/*.yaml`, eine gemeinsame Queue-/Credential-Liste). Ab einer gewissen Anzahl Workflows
-  fehlt eine Gruppierung (Ordner oder Projekte) — auch Voraussetzung für granulare Rechte pro Ordner
-  (siehe oben).
+- ~~**Ordner-/Projektstruktur**~~ — für Workflows erledigt, siehe "Workflow-Ordner" oben (Name mit
+  `/`, echte Unterordner in `workflows/`, Gruppierung im Tab **Workflows**). Was bewusst fehlt: Queues
+  und Anmeldedaten liegen weiterhin flach (eine gemeinsame Liste je) — Ordner sind reine Namensräume,
+  kein Projekt-Konzept mit eigener Konfiguration oder Mitgliedschaft.
 - **Reporting/Analytics über die Zeit**: die Übersicht zeigt heute eine Momentaufnahme (Erfolgsquote,
   offene Queue-Items). Ein Trend über Zeit (Erfolgsquote pro Woche, durchschnittliche Laufzeit pro
   Workflow, Engpässe in einer Queue) fehlt.

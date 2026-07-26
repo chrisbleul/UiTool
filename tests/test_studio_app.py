@@ -759,6 +759,105 @@ def test_workflow_version_records_the_acting_username(multiuser_app):
     assert version["saved_by"] == "admin1"
 
 
+# --- workflow folders --------------------------------------------------------
+
+
+def test_folder_qualified_workflow_can_be_saved_and_loaded(client):
+    res = client.post("/api/workflows/Rechnungen/invoice", json=_workflow("invoice", "https://x"))
+    assert res.status_code == 200
+    assert res.get_json()["saved"] == "Rechnungen/invoice"
+
+    detail = client.get("/api/workflows/Rechnungen/invoice").get_json()
+    assert detail["steps"][0]["url"] == "https://x"
+
+
+def test_workflows_list_includes_folder_qualified_names(client):
+    client.post("/api/workflows/top_level", json=_workflow("top_level", "https://a"))
+    client.post("/api/workflows/Rechnungen/invoice", json=_workflow("invoice", "https://b"))
+
+    names = client.get("/api/workflows").get_json()
+
+    assert names == ["Rechnungen/invoice", "top_level"]
+
+
+def test_folder_qualified_workflow_can_be_deleted(client):
+    client.post("/api/workflows/Rechnungen/invoice", json=_workflow("invoice", "https://x"))
+
+    res = client.delete("/api/workflows/Rechnungen/invoice")
+
+    assert res.status_code == 200
+    assert client.get("/api/workflows").get_json() == []
+
+
+def test_deleting_the_last_workflow_in_a_folder_removes_the_empty_folder(client):
+    from uiflow import models
+
+    client.post("/api/workflows/Rechnungen/invoice", json=_workflow("invoice", "https://x"))
+    assert (models.WORKFLOWS_DIR / "Rechnungen").exists()
+
+    client.delete("/api/workflows/Rechnungen/invoice")
+
+    assert not (models.WORKFLOWS_DIR / "Rechnungen").exists()
+    assert models.WORKFLOWS_DIR.exists()  # the top-level directory itself is untouched
+
+
+def test_deleting_one_of_two_workflows_in_a_folder_keeps_the_folder(client):
+    from uiflow import models
+
+    client.post("/api/workflows/Rechnungen/invoice", json=_workflow("invoice", "https://x"))
+    client.post("/api/workflows/Rechnungen/reminder", json=_workflow("reminder", "https://y"))
+
+    client.delete("/api/workflows/Rechnungen/invoice")
+
+    assert (models.WORKFLOWS_DIR / "Rechnungen").exists()
+    assert client.get("/api/workflows").get_json() == ["Rechnungen/reminder"]
+
+
+def test_same_named_workflows_in_different_folders_have_independent_version_history(client):
+    client.post("/api/workflows/Rechnungen/invoice", json=_workflow("invoice", "https://a-v1"))
+    client.post("/api/workflows/Mahnungen/invoice", json=_workflow("invoice", "https://b-v1"))
+
+    client.post("/api/workflows/Rechnungen/invoice", json=_workflow("invoice", "https://a-v2"))
+
+    rechnungen_versions = client.get("/api/workflows/Rechnungen/invoice/versions").get_json()
+    mahnungen_versions = client.get("/api/workflows/Mahnungen/invoice/versions").get_json()
+    assert len(rechnungen_versions) == 1  # only Rechnungen/invoice was overwritten a second time
+    assert len(mahnungen_versions) == 0
+
+    version = client.get(f"/api/workflows/Rechnungen/invoice/versions/{rechnungen_versions[0]['id']}").get_json()
+    assert "https://a-v1" in version["content_yaml"]
+
+
+def test_restoring_a_folder_qualified_version_does_not_leak_into_another_folder(client):
+    client.post("/api/workflows/Rechnungen/invoice", json=_workflow("invoice", "https://v1"))
+    client.post("/api/workflows/Rechnungen/invoice", json=_workflow("invoice", "https://v2"))
+    client.post("/api/workflows/Mahnungen/invoice", json=_workflow("invoice", "https://other"))
+    [version] = client.get("/api/workflows/Rechnungen/invoice/versions").get_json()
+
+    res = client.post(f"/api/workflows/Mahnungen/invoice/versions/{version['id']}/restore")
+
+    assert res.status_code == 404
+    assert client.get("/api/workflows/Mahnungen/invoice").get_json()["steps"][0]["url"] == "https://other"
+
+
+def test_run_workflow_resolves_a_folder_qualified_sub_workflow(client):
+    client.post(
+        "/api/workflows/Bausteine/login",
+        json={"name": "login", "backend": "web", "steps": [{"action": "navigate", "url": "https://sub"}]},
+    )
+    haupt = {
+        "name": "haupt",
+        "backend": "web",
+        "steps": [{"action": "run_workflow", "workflow": "Bausteine/login"}],
+    }
+
+    res = client.post("/api/run", json=haupt)
+    job_id = res.get_json()["job_id"]
+
+    detail = client.get(f"/api/jobs/{job_id}").get_json()
+    assert detail["sub_workflows"]["Bausteine/login"]["steps"] == [{"action": "navigate", "url": "https://sub"}]
+
+
 class _FakeKeyring:
     def __init__(self):
         self.store = {}

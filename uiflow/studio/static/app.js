@@ -15,6 +15,17 @@ let recordingSource = null;
 
 const el = (id) => document.getElementById(id);
 
+// A workflow name may be folder-qualified ("Rechnungen/invoice", see
+// models.workflow_path) - plain encodeURIComponent(name) would escape that
+// "/" as "%2F", which a Flask <path:name> route does not decode back into a
+// segment separator (by design - RFC 3986 leaves that ambiguous, and Flask
+// errs toward not silently reinterpreting it). Encode each segment on its
+// own instead, so the "/" stays a real path separator and everything else
+// (spaces, unicode, ...) is still safely escaped.
+function encodeWorkflowName(name) {
+  return name.split("/").map(encodeURIComponent).join("/");
+}
+
 // --- icons: one consistent, monochrome SVG set (currentColor) instead of
 // mixed emoji, so icon-only controls render identically across platforms ---
 function icon(inner) {
@@ -161,7 +172,7 @@ async function loadWorkflowList() {
 }
 
 async function loadWorkflow(name) {
-  const res = await fetch(`/api/workflows/${encodeURIComponent(name)}`);
+  const res = await fetch(`/api/workflows/${encodeWorkflowName(name)}`);
   if (!res.ok) return;
   const data = await res.json();
   el("wf-name").value = data.name;
@@ -1518,7 +1529,7 @@ function currentWorkflowPayload() {
 }
 
 function saveWorkflowAs(name, payload, { overwrite }) {
-  return fetch(`/api/workflows/${encodeURIComponent(name)}?overwrite=${overwrite}`, {
+  return fetch(`/api/workflows/${encodeWorkflowName(name)}?overwrite=${overwrite}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -2446,7 +2457,7 @@ async function renderVersionsList() {
   const name = versionsOverlayWorkflow;
   const container = el("versions-list");
   container.innerHTML = "Lädt...";
-  const versions = await (await fetch(`/api/workflows/${encodeURIComponent(name)}/versions`)).json();
+  const versions = await (await fetch(`/api/workflows/${encodeWorkflowName(name)}/versions`)).json();
   if (versions.length === 0) {
     container.innerHTML = '<p style="color:var(--muted)">Noch keine früheren Versionen — erst ab dem zweiten "Speichern" gibt es etwas zu archivieren.</p>';
     return;
@@ -2480,7 +2491,7 @@ async function renderVersionsList() {
     restoreBtn.textContent = "Wiederherstellen";
     restoreBtn.addEventListener("click", async () => {
       if (!(await confirmDialog(`Diesen Stand von "${name}" wiederherstellen? Der aktuelle Stand wird dabei selbst archiviert.`, "Wiederherstellen"))) return;
-      const res = await fetch(`/api/workflows/${encodeURIComponent(name)}/versions/${version.id}/restore`, {
+      const res = await fetch(`/api/workflows/${encodeWorkflowName(name)}/versions/${version.id}/restore`, {
         method: "POST",
       });
       if (!res.ok) {
@@ -2503,7 +2514,7 @@ async function renderVersionsList() {
       }
       if (!preview.textContent) {
         const detail = await (
-          await fetch(`/api/workflows/${encodeURIComponent(name)}/versions/${version.id}`)
+          await fetch(`/api/workflows/${encodeWorkflowName(name)}/versions/${version.id}`)
         ).json();
         preview.textContent = detail.content_yaml;
       }
@@ -2757,7 +2768,7 @@ function startInlineRename(row, oldName, mode) {
       cleanup();
       return;
     }
-    const data = await (await fetch(`/api/workflows/${encodeURIComponent(oldName)}`)).json();
+    const data = await (await fetch(`/api/workflows/${encodeWorkflowName(oldName)}`)).json();
     data.name = newName;
     // Never clobber a different workflow that happens to carry the target name:
     // ask the server to refuse first, then let the user decide (the edit stays
@@ -2777,7 +2788,7 @@ function startInlineRename(row, oldName, mode) {
       return;
     }
     if (mode === "rename") {
-      await fetch(`/api/workflows/${encodeURIComponent(oldName)}`, { method: "DELETE" });
+      await fetch(`/api/workflows/${encodeWorkflowName(oldName)}`, { method: "DELETE" });
     }
     await renderWorkflowsPanel();
     await loadWorkflowList();
@@ -2799,6 +2810,11 @@ function startInlineRename(row, oldName, mode) {
   input.select();
 }
 
+function workflowFolderOf(name) {
+  const slashIndex = name.lastIndexOf("/");
+  return slashIndex === -1 ? null : name.slice(0, slashIndex);
+}
+
 async function renderWorkflowsPanel() {
   const container = el("workflows-list");
   container.innerHTML = "Lädt...";
@@ -2808,13 +2824,40 @@ async function renderWorkflowsPanel() {
     return;
   }
   container.innerHTML = "";
-  for (const name of names) {
+  // /api/workflows sorts as one flat list of names, so an unrelated
+  // top-level name can sort *between* two entries of the same folder (plain
+  // ASCII order puts every "Aaa"-starting name before every "aaa"-starting
+  // one, regardless of folder) - group by folder first, alphabetically
+  // within it second, so every folder's rows (and "Ohne Ordner"'s) end up
+  // contiguous under one header instead of split across several.
+  const sortedNames = [...names].sort((a, b) => {
+    const folderA = workflowFolderOf(a) || "";
+    const folderB = workflowFolderOf(b) || "";
+    return folderA === folderB ? a.localeCompare(b) : folderA.localeCompare(folderB);
+  });
+  // a header per folder is only worth showing once there's more than one
+  // group at all (a flat installation with no folders in use stays a plain
+  // list, not "Ohne Ordner" shown once above everything).
+  const showFolderHeaders = new Set(names.map(workflowFolderOf)).size > 1;
+  let currentFolder;
+  for (const name of sortedNames) {
+    const folder = workflowFolderOf(name);
+    const displayName = folder === null ? name : name.slice(folder.length + 1);
+
+    if (showFolderHeaders && folder !== currentFolder) {
+      currentFolder = folder;
+      const header = document.createElement("div");
+      header.className = "workflow-folder-head";
+      header.textContent = folder === null ? "Ohne Ordner" : folder;
+      container.appendChild(header);
+    }
+
     const row = document.createElement("div");
     row.className = "list-row";
 
     const label = document.createElement("span");
     label.className = "list-row-name";
-    label.textContent = name;
+    label.textContent = displayName;
 
     const openBtn = document.createElement("button");
     openBtn.className = "btn-icon";
@@ -2854,7 +2897,7 @@ async function renderWorkflowsPanel() {
     delBtn.setAttribute("aria-label", `Workflow "${name}" löschen`);
     delBtn.addEventListener("click", async () => {
       if (!(await confirmDialog(`Workflow "${name}" wirklich löschen?`))) return;
-      await fetch(`/api/workflows/${encodeURIComponent(name)}`, { method: "DELETE" });
+      await fetch(`/api/workflows/${encodeWorkflowName(name)}`, { method: "DELETE" });
       await renderWorkflowsPanel();
       await loadWorkflowList();
       toast(`Workflow "${name}" gelöscht.`, "success");

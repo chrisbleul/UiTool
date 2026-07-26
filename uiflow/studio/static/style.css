@@ -984,6 +984,16 @@ body {
   margin-top: 8px;
 }
 
+.workflow-folder-head {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--muted);
+  padding: 10px 4px 4px;
+}
+.workflow-folder-head:first-child { padding-top: 0; }
+
 .list-row {
   display: flex;
   align-items: center;

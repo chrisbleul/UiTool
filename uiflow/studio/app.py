@@ -94,6 +94,13 @@ def _safe_workflow_path(name: str) -> Path:
     return models.workflow_path(name)
 
 
+def _workflow_identity(path: Path) -> str:
+    """The folder-qualified name a workflow file is keyed by in
+    workflow_versions (e.g. "Rechnungen/invoice") - `path.stem` alone would
+    collide between same-named workflows in different folders."""
+    return path.relative_to(models.WORKFLOWS_DIR).with_suffix("").as_posix()
+
+
 def create_app() -> Flask:
     app = Flask(__name__, static_folder=None)
     app.json.sort_keys = False  # preserve schema.py's action order (e.g. "navigate" before "click")
@@ -219,21 +226,16 @@ def create_app() -> Flask:
 
     @app.get("/api/workflows")
     def list_workflows() -> Response:
-        from ..object_repository import REPOSITORY_FILENAME
+        return jsonify(models.list_workflows())
 
-        names = sorted(
-            p.stem for p in models.WORKFLOWS_DIR.glob("*.yaml") if p.name != REPOSITORY_FILENAME
-        )
-        return jsonify(names)
-
-    @app.get("/api/workflows/<name>")
+    @app.get("/api/workflows/<path:name>")
     def get_workflow(name: str) -> Response:
         path = _safe_workflow_path(name)
         if not path.exists():
             return jsonify({"error": "not found"}), 404
         return jsonify(Workflow.load(path).to_dict())
 
-    @app.post("/api/workflows/<name>")
+    @app.post("/api/workflows/<path:name>")
     def save_workflow(name: str) -> Response:
         data = request.get_json(force=True)
         try:
@@ -241,50 +243,61 @@ def create_app() -> Flask:
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         path = _safe_workflow_path(name)
+        identity = _workflow_identity(path)
         # Saving the workflow you have open is meant to overwrite, so that stays
         # the default. Writing under a *different* name (rename, duplicate, "save
         # as") is not - it would destroy an unrelated workflow with no warning -
         # so those callers pass ?overwrite=false and handle the 409.
         if request.args.get("overwrite", "true").lower() in ("false", "0") and path.exists():
-            return jsonify({"error": f"Workflow '{path.stem}' existiert bereits"}), 409
+            return jsonify({"error": f"Workflow '{identity}' existiert bereits"}), 409
         if path.exists():
             # Archives what the file *was*, not what it becomes - the file
             # itself is always the newest version, so it's never duplicated
             # into workflow_versions (see db.add_workflow_version).
-            db.add_workflow_version(path.stem, path.read_text(encoding="utf-8"), session.get("username"))
+            db.add_workflow_version(identity, path.read_text(encoding="utf-8"), session.get("username"))
         workflow.save(path)
-        return jsonify({"saved": path.name})
+        return jsonify({"saved": identity})
 
-    @app.delete("/api/workflows/<name>")
+    @app.delete("/api/workflows/<path:name>")
     def delete_workflow(name: str) -> Response:
         path = _safe_workflow_path(name)
         if not path.exists():
             return jsonify({"error": "not found"}), 404
         path.unlink()
-        db.delete_workflow_versions(path.stem)
+        db.delete_workflow_versions(_workflow_identity(path))
+        # A folder is nothing but a grouping of workflow files (see
+        # models.workflow_path) - once the last one in it is gone, an empty
+        # directory left behind would be pure clutter, not a "folder" anyone
+        # can still do anything with. Walks upward in case removing it also
+        # emptied its own parent folder.
+        parent = path.parent
+        while parent != models.WORKFLOWS_DIR and not any(parent.iterdir()):
+            parent.rmdir()
+            parent = parent.parent
         return jsonify({"deleted": name})
 
-    @app.get("/api/workflows/<name>/versions")
+    @app.get("/api/workflows/<path:name>/versions")
     def list_workflow_versions_route(name: str) -> Response:
-        return jsonify(db.list_workflow_versions(_safe_workflow_path(name).stem))
+        return jsonify(db.list_workflow_versions(_workflow_identity(_safe_workflow_path(name))))
 
-    @app.get("/api/workflows/<name>/versions/<int:version_id>")
+    @app.get("/api/workflows/<path:name>/versions/<int:version_id>")
     def get_workflow_version_route(name: str, version_id: int) -> Response:
         version = db.get_workflow_version(version_id)
-        if version is None or version["workflow_name"] != _safe_workflow_path(name).stem:
+        if version is None or version["workflow_name"] != _workflow_identity(_safe_workflow_path(name)):
             return jsonify({"error": "not found"}), 404
         return jsonify(version)
 
-    @app.post("/api/workflows/<name>/versions/<int:version_id>/restore")
+    @app.post("/api/workflows/<path:name>/versions/<int:version_id>/restore")
     def restore_workflow_version_route(name: str, version_id: int) -> Response:
         version = db.get_workflow_version(version_id)
-        if version is None or version["workflow_name"] != _safe_workflow_path(name).stem:
-            return jsonify({"error": "not found"}), 404
         path = _safe_workflow_path(name)
+        if version is None or version["workflow_name"] != _workflow_identity(path):
+            return jsonify({"error": "not found"}), 404
         if path.exists():
             # Restoring is itself just another save - the state right before
             # the restore must stay recoverable too, not get silently lost.
-            db.add_workflow_version(path.stem, path.read_text(encoding="utf-8"), session.get("username"))
+            db.add_workflow_version(_workflow_identity(path), path.read_text(encoding="utf-8"), session.get("username"))
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(version["content_yaml"], encoding="utf-8")
         return jsonify({"restored": version_id})
 
