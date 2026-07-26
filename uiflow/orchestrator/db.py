@@ -123,7 +123,20 @@ CREATE TABLE IF NOT EXISTS schedules (
     queue_name TEXT,
     enabled INTEGER NOT NULL DEFAULT 1,
     last_run_at TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    skip_weekends INTEGER NOT NULL DEFAULT 0,
+    skip_holidays INTEGER NOT NULL DEFAULT 0
+);
+
+-- Installation-wide (not per-schedule) list of dates a schedule may opt out
+-- of firing on via its own skip_holidays flag - see
+-- worker.py's _schedule_is_due, which treats this the same way it treats a
+-- weekend when skip_weekends is set: an occurrence that falls on a listed
+-- date is skipped, not fired late, and the *next* occurrence is what
+-- eventually runs.
+CREATE TABLE IF NOT EXISTS holidays (
+    date TEXT PRIMARY KEY,
+    name TEXT
 );
 
 -- Individual accounts, opt-in: the Studio defaults to the frictionless
@@ -139,6 +152,98 @@ CREATE TABLE IF NOT EXISTS users (
     role TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+-- Every state-changing Studio API request (see studio/app.py's after_request
+-- hook), regardless of outcome - a rejected attempt (403/401/400) is exactly
+-- as auditable as a successful one. `username`/`role` are the acting
+-- session's, both NULL outside multi-user mode (see users table above), where
+-- there is no individual account to attribute the action to. `action` is
+-- "METHOD /api/path", which - given this API's naming - already names the
+-- target in almost every case (e.g. "DELETE /api/users/bob"), without having
+-- to duplicate that per-route.
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    username TEXT,
+    role TEXT,
+    action TEXT NOT NULL,
+    status_code INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts);
+
+-- Singleton (id is always 1) installation-wide config for the proactive
+-- "a job failed" e-mail notification (see notify_job_failed) - separate from
+-- a workflow's own `send_email` step, which is per-workflow and requires an
+-- author to build it in explicitly. The SMTP password itself is never stored
+-- here - `credential_name` names an existing entry in the credentials table
+-- (see credentials.py), resolved through the same OS keyring every
+-- `get_credential` step already uses.
+CREATE TABLE IF NOT EXISTS notification_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled INTEGER NOT NULL DEFAULT 0,
+    smtp_host TEXT,
+    smtp_port INTEGER NOT NULL DEFAULT 587,
+    use_tls INTEGER NOT NULL DEFAULT 1,
+    username TEXT,
+    from_addr TEXT,
+    to_addr TEXT,
+    credential_name TEXT,
+    updated_at TEXT
+);
+
+-- One row per prior save of a workflow (see studio/app.py's save_workflow,
+-- which archives the file's *current* content here before overwriting it -
+-- the live YAML file in workflows/ is always the newest version, so it is
+-- never duplicated into this table). `saved_by` is the acting session's
+-- username, NULL outside multi-user mode - same convention as audit_log.
+CREATE TABLE IF NOT EXISTS workflow_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workflow_name TEXT NOT NULL,
+    content_yaml TEXT NOT NULL,
+    saved_at TEXT NOT NULL,
+    saved_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_versions_name ON workflow_versions(workflow_name, id);
+
+-- Per-user, per-workflow-folder role grants (see studio/app.py's
+-- _effective_role) - opt-in on top of a user's global role (see the users
+-- table): a user with zero rows here is entirely unaffected, their global
+-- role applies to every workflow exactly as before this table existed. The
+-- moment a user has *any* row, they become folder-scoped for workflow
+-- access specifically (not queues/credentials/schedules/etc.): only
+-- folders they hold a grant for (or an ancestor folder, e.g. a grant on
+-- "Rechnungswesen" also covers "Rechnungswesen/Sub") are reachable at all -
+-- everything else is a 403, not a silent fallback to their global role.
+-- `folder` is "" for the top-level (workflows with no "/" in their name).
+-- Never consulted for an admin, who always has full access.
+CREATE TABLE IF NOT EXISTS folder_permissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL,
+    folder TEXT NOT NULL,
+    role TEXT NOT NULL,
+    UNIQUE(username, folder)
+);
+
+-- A `request_approval` engine step (see engine.py's _run_request_approval)
+-- blocks the running job until a human decides here - the human-in-the-loop
+-- "Action Center" (studio/app.py's /api/actions*). `status` starts 'pending'
+-- and settles exactly once into 'approved'/'rejected' (a real decision) or
+-- 'cancelled' (the job was stopped while still waiting, see worker.py's
+-- on_request_approval) - never back to 'pending'. `decided_by` is the
+-- deciding session's username, NULL outside multi-user mode - same
+-- convention as audit_log/workflow_versions.
+CREATE TABLE IF NOT EXISTS approval_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    message TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    comment TEXT,
+    decided_by TEXT,
+    requested_at TEXT NOT NULL,
+    decided_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_approval_requests_status ON approval_requests(status);
 """
 
 
@@ -173,6 +278,9 @@ def init_db() -> None:
                     ("job_controls", "paused_step_path", "TEXT"),
                     ("queue_items", "retry_after", "TEXT"),
                     ("jobs", "sub_workflows_json", "TEXT"),
+                    ("jobs", "last_heartbeat_at", "TEXT"),
+                    ("schedules", "skip_weekends", "INTEGER NOT NULL DEFAULT 0"),
+                    ("schedules", "skip_holidays", "INTEGER NOT NULL DEFAULT 0"),
                 ):
                     try:
                         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
@@ -213,10 +321,11 @@ def claim_next_job(worker_id: str) -> dict[str, Any] | None:
         if row is None:
             return None
         job_id = row["id"]
+        now = _now()
         cur = conn.execute(
-            "UPDATE jobs SET status='running', worker_id=?, started_at=? "
+            "UPDATE jobs SET status='running', worker_id=?, started_at=?, last_heartbeat_at=? "
             "WHERE id=? AND status='queued'",
-            (worker_id, _now(), job_id),
+            (worker_id, now, now, job_id),
         )
         if cur.rowcount == 0:
             return None  # another worker won the race
@@ -253,6 +362,54 @@ def finish_job(job_id: str, status: str, error_message: str | None = None) -> No
             "UPDATE jobs SET status=?, error_message=?, finished_at=? WHERE id=?",
             (status, error_message, _now(), job_id),
         )
+
+
+# Heartbeat is written every ~20s while a job runs (see worker.py's _run_job) -
+# not tied to any specific step timing, since a step can legitimately run much
+# longer than that (a slow page, a paused breakpoint waiting on a human). Only
+# a worker *process* dying stops the heartbeats; how long a single step takes
+# is irrelevant to it.
+STALE_JOB_TIMEOUT_SECONDS = 90.0
+
+
+def heartbeat_job(job_id: str) -> None:
+    with connect() as conn:
+        conn.execute("UPDATE jobs SET last_heartbeat_at=? WHERE id=? AND status='running'", (_now(), job_id))
+
+
+def sweep_stale_jobs(timeout_seconds: float = STALE_JOB_TIMEOUT_SECONDS) -> list[str]:
+    """Finds jobs whose worker has gone silent (no heartbeat within
+    `timeout_seconds`, e.g. the worker process crashed or its machine died) and
+    settles them: any queue item that job still held `in_progress` is handed
+    back to the queue exactly like release_queue_item does (no retry
+    consumed - the item itself was never actually attempted-and-failed, its
+    worker just vanished), and the job itself is marked 'error' so it stops
+    looking perpetually 'running'. A one-shot (non-queue-driven) job is *not*
+    silently re-run - its side effects up to the crash are unknown, so
+    "error, needs a human to re-trigger it" is the only safe automatic
+    outcome. Returns the swept job ids (for logging by the caller).
+
+    Called periodically from run_scheduler_loop (see worker.py) - the same
+    maintenance loop that already runs continuously, embedded in `uiflow
+    studio` by default or standalone via `uiflow scheduler`."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=timeout_seconds)).isoformat()
+    with connect() as conn:
+        stale = conn.execute(
+            "SELECT id FROM jobs WHERE status='running' AND last_heartbeat_at IS NOT NULL AND last_heartbeat_at <= ?",
+            (cutoff,),
+        ).fetchall()
+        job_ids = [row["id"] for row in stale]
+        for job_id in job_ids:
+            conn.execute(
+                "UPDATE queue_items SET status='new', locked_by=NULL, locked_at=NULL, started_at=NULL, "
+                "retry_after=NULL WHERE locked_by=? AND status='in_progress'",
+                (job_id,),
+            )
+            conn.execute(
+                "UPDATE jobs SET status='error', error_message=?, finished_at=? WHERE id=? AND status='running'",
+                ("Worker-Heartbeat-Timeout - der Worker ist vermutlich abgestürzt", _now(), job_id),
+            )
+        return job_ids
 
 
 # --- logs -------------------------------------------------------------------
@@ -326,6 +483,77 @@ def get_controls(job_id: str) -> dict[str, Any] | None:
     with connect() as conn:
         row = conn.execute("SELECT * FROM job_controls WHERE job_id=?", (job_id,)).fetchone()
         return dict(row) if row else None
+
+
+# --- human-in-the-loop approvals (see the approval_requests table comment
+# and engine.py's _run_request_approval) --------------------------------------
+
+
+def create_approval_request(job_id: str, title: str, message: str) -> int:
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO approval_requests (job_id, title, message, status, requested_at) "
+            "VALUES (?, ?, ?, 'pending', ?)",
+            (job_id, title, message, _now()),
+        )
+        return cur.lastrowid
+
+
+def get_approval_decision(request_id: int) -> dict[str, Any] | None:
+    """None while still pending - the engine's on_request_approval callback
+    (see worker.py) polls this until it isn't. A cancelled request also
+    resolves here (as an unapproved decision, never as None) so any poller
+    unblocks, not just the one that called cancel_approval_request."""
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM approval_requests WHERE id=?", (request_id,)).fetchone()
+        if row is None or row["status"] == "pending":
+            return None
+        return {
+            "approved": row["status"] == "approved",
+            "comment": row["comment"] or "",
+            "decided_by": row["decided_by"],
+            "decided_at": row["decided_at"],
+        }
+
+
+def cancel_approval_request(request_id: int) -> None:
+    """Called when the waiting job is stopped before anyone decided - leaves
+    an already-decided request untouched (a decision, once made, stands)."""
+    with connect() as conn:
+        conn.execute(
+            "UPDATE approval_requests SET status='cancelled', decided_at=? WHERE id=? AND status='pending'",
+            (_now(), request_id),
+        )
+
+
+def list_approval_requests(status: str | None = "pending") -> list[dict[str, Any]]:
+    """The Action Center's listing (studio/app.py's GET /api/actions) - pending
+    only by default, joined with the job's name since a bare job_id means
+    little in a UI. Pass status=None for every request regardless of status."""
+    with connect() as conn:
+        query = (
+            "SELECT approval_requests.*, jobs.name AS job_name FROM approval_requests "
+            "LEFT JOIN jobs ON jobs.id = approval_requests.job_id"
+        )
+        params: tuple[Any, ...] = ()
+        if status is not None:
+            query += " WHERE approval_requests.status=?"
+            params = (status,)
+        query += " ORDER BY approval_requests.requested_at"
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def decide_approval_request(request_id: int, approved: bool, comment: str, decided_by: str | None) -> bool:
+    """Returns False if there was nothing left to decide (unknown id, or
+    already decided/cancelled) - a request can be decided exactly once."""
+    with connect() as conn:
+        cur = conn.execute(
+            "UPDATE approval_requests SET status=?, comment=?, decided_by=?, decided_at=? "
+            "WHERE id=? AND status='pending'",
+            ("approved" if approved else "rejected", comment, decided_by, _now(), request_id),
+        )
+        return cur.rowcount > 0
 
 
 # --- queues -------------------------------------------------------------------
@@ -581,12 +809,20 @@ def delete_global_variable(name: str) -> None:
 # --- schedules ---------------------------------------------------------------
 
 
-def create_schedule(name: str, cron_expr: str, workflow: dict[str, Any], queue_name: str | None = None) -> int:
+def create_schedule(
+    name: str,
+    cron_expr: str,
+    workflow: dict[str, Any],
+    queue_name: str | None = None,
+    skip_weekends: bool = False,
+    skip_holidays: bool = False,
+) -> int:
     with connect() as conn:
         cur = conn.execute(
-            "INSERT INTO schedules (name, cron_expr, workflow_json, queue_name, enabled, created_at) "
-            "VALUES (?, ?, ?, ?, 1, ?)",
-            (name, cron_expr, json.dumps(workflow), queue_name, _now()),
+            "INSERT INTO schedules "
+            "(name, cron_expr, workflow_json, queue_name, enabled, created_at, skip_weekends, skip_holidays) "
+            "VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
+            (name, cron_expr, json.dumps(workflow), queue_name, _now(), int(skip_weekends), int(skip_holidays)),
         )
         return cur.lastrowid
 
@@ -616,6 +852,34 @@ def delete_schedule(schedule_id: int) -> None:
 def mark_schedule_ran(schedule_id: int) -> None:
     with connect() as conn:
         conn.execute("UPDATE schedules SET last_run_at=? WHERE id=?", (_now(), schedule_id))
+
+
+# --- business calendar (holidays a schedule can opt out of, see the holidays
+# table comment and worker.py's _schedule_is_due) ------------------------------
+
+
+def add_holiday(date: str, name: str | None = None) -> None:
+    with connect() as conn:
+        conn.execute("INSERT OR REPLACE INTO holidays (date, name) VALUES (?, ?)", (date, name))
+
+
+def list_holidays() -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute("SELECT * FROM holidays ORDER BY date").fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_holiday_dates() -> set[str]:
+    """Just the ISO date strings, for a fast membership check (see
+    worker.py's _schedule_is_due) - the holiday's own name is display-only."""
+    with connect() as conn:
+        rows = conn.execute("SELECT date FROM holidays").fetchall()
+        return {r["date"] for r in rows}
+
+
+def delete_holiday(date: str) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM holidays WHERE date=?", (date,))
 
 
 # --- users (opt-in per-account login/RBAC, see the users table comment) -----
@@ -668,3 +932,218 @@ def any_users_exist() -> bool:
     """Whether multi-user mode is active - see studio/app.py's require_login."""
     with connect() as conn:
         return conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None
+
+
+# --- audit log ---------------------------------------------------------------
+
+
+def add_audit_entry(username: str | None, role: str | None, action: str, status_code: int) -> None:
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO audit_log (ts, username, role, action, status_code) VALUES (?, ?, ?, ?, ?)",
+            (_now(), username, role, action, status_code),
+        )
+
+
+def list_audit_entries(limit: int = 200) -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+# --- proactive failure notification ------------------------------------------
+
+_DEFAULT_NOTIFICATION_SETTINGS: dict[str, Any] = {
+    "enabled": False,
+    "smtp_host": None,
+    "smtp_port": 587,
+    "use_tls": True,
+    "username": None,
+    "from_addr": None,
+    "to_addr": None,
+    "credential_name": None,
+}
+
+
+def get_notification_settings() -> dict[str, Any]:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM notification_settings WHERE id=1").fetchone()
+    if row is None:
+        return dict(_DEFAULT_NOTIFICATION_SETTINGS)
+    result = dict(row)
+    result["enabled"] = bool(result["enabled"])
+    result["use_tls"] = bool(result["use_tls"])
+    return result
+
+
+def set_notification_settings(
+    enabled: bool,
+    smtp_host: str | None,
+    smtp_port: int,
+    use_tls: bool,
+    username: str | None,
+    from_addr: str | None,
+    to_addr: str | None,
+    credential_name: str | None,
+) -> None:
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO notification_settings "
+            "(id, enabled, smtp_host, smtp_port, use_tls, username, from_addr, to_addr, credential_name, updated_at) "
+            "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled, smtp_host=excluded.smtp_host, "
+            "smtp_port=excluded.smtp_port, use_tls=excluded.use_tls, username=excluded.username, "
+            "from_addr=excluded.from_addr, to_addr=excluded.to_addr, credential_name=excluded.credential_name, "
+            "updated_at=excluded.updated_at",
+            (
+                int(enabled),
+                smtp_host,
+                smtp_port,
+                int(use_tls),
+                username,
+                from_addr,
+                to_addr,
+                credential_name,
+                _now(),
+            ),
+        )
+
+
+def send_notification_email(subject: str, body: str) -> None:
+    """Sends via the installation-wide notification settings above. Raises if
+    notifications aren't enabled/configured, or if the SMTP send itself fails
+    - unlike notify_job_failed below, which wraps this for the "fire and
+    forget from a job completion" case. Used directly by the Studio's "Test
+    senden" button, where a real error is exactly what an admin fixing their
+    SMTP config needs to see."""
+    settings = get_notification_settings()
+    if not settings["enabled"]:
+        raise RuntimeError("Benachrichtigungen sind nicht aktiviert")
+    if not settings["smtp_host"] or not settings["to_addr"]:
+        raise RuntimeError("SMTP-Host und Empfänger müssen gesetzt sein")
+
+    from .. import credentials
+    from ..email_client import send_email
+
+    password = ""
+    if settings["credential_name"]:
+        password = credentials.get_credential(settings["credential_name"])
+    send_email(
+        smtp_host=settings["smtp_host"],
+        username=settings["username"] or "",
+        password=password,
+        to=settings["to_addr"],
+        subject=subject,
+        body=body,
+        smtp_port=settings["smtp_port"],
+        use_tls=settings["use_tls"],
+        from_addr=settings["from_addr"],
+    )
+
+
+def notify_job_failed(job_id: str, job_name: str, error_message: str | None) -> None:
+    """Best-effort - never raises, so a bad SMTP config or a network blip
+    can't fail the job bookkeeping this is called from (see worker.py's
+    _run_job and studio/app.py's remote-worker finish endpoint). Silently
+    does nothing if notifications aren't enabled - that's the default,
+    unconfigured state, not an error worth logging."""
+    if not get_notification_settings()["enabled"]:
+        return
+    try:
+        send_notification_email(
+            f"uiflow: Job '{job_name}' fehlgeschlagen",
+            f"Job-ID: {job_id}\nName: {job_name}\nFehler: {error_message or '(keine Meldung)'}",
+        )
+    except Exception:  # noqa: BLE001 - a notification hiccup must never fail the job itself
+        import logging
+
+        logging.getLogger("uiflow").warning("Fehlerbenachrichtigung konnte nicht gesendet werden", exc_info=True)
+
+
+# --- workflow version history -------------------------------------------------
+
+# Caps growth for a workflow that gets saved very often (e.g. scripted) -
+# older versions beyond this are pruned on each new save. A version is a full
+# YAML text snapshot, typically a few KB, so even 50 of them per workflow is
+# not a meaningful amount of storage.
+_MAX_VERSIONS_PER_WORKFLOW = 50
+
+
+def add_workflow_version(workflow_name: str, content_yaml: str, saved_by: str | None) -> int:
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO workflow_versions (workflow_name, content_yaml, saved_at, saved_by) VALUES (?, ?, ?, ?)",
+            (workflow_name, content_yaml, _now(), saved_by),
+        )
+        version_id = cur.lastrowid
+        conn.execute(
+            "DELETE FROM workflow_versions WHERE workflow_name=? AND id NOT IN "
+            "(SELECT id FROM workflow_versions WHERE workflow_name=? ORDER BY id DESC LIMIT ?)",
+            (workflow_name, workflow_name, _MAX_VERSIONS_PER_WORKFLOW),
+        )
+        return version_id
+
+
+def list_workflow_versions(workflow_name: str) -> list[dict[str, Any]]:
+    """Newest first, without `content_yaml` - kept light for a list view, the
+    same way list_jobs() drops each job's workflow_json. Fetch a single
+    version (get_workflow_version) to see its content."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, workflow_name, saved_at, saved_by FROM workflow_versions "
+            "WHERE workflow_name=? ORDER BY id DESC",
+            (workflow_name,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_workflow_version(version_id: int) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM workflow_versions WHERE id=?", (version_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def delete_workflow_versions(workflow_name: str) -> None:
+    """Called when the workflow itself is deleted (see studio/app.py's
+    delete_workflow) - its history is meaningless once there is no longer a
+    live file a restore could write back to."""
+    with connect() as conn:
+        conn.execute("DELETE FROM workflow_versions WHERE workflow_name=?", (workflow_name,))
+
+
+# --- folder permissions (granular, opt-in per-user workflow-folder scoping,
+# see the folder_permissions table comment and studio/app.py's
+# _effective_role) ------------------------------------------------------------
+
+
+def set_folder_permission(username: str, folder: str, role: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO folder_permissions (username, folder, role) VALUES (?, ?, ?) "
+            "ON CONFLICT(username, folder) DO UPDATE SET role=excluded.role",
+            (username, folder, role),
+        )
+
+
+def list_folder_permissions(username: str | None = None) -> list[dict[str, Any]]:
+    with connect() as conn:
+        if username is not None:
+            rows = conn.execute(
+                "SELECT * FROM folder_permissions WHERE username=? ORDER BY folder", (username,)
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM folder_permissions ORDER BY username, folder").fetchall()
+        return [dict(r) for r in rows]
+
+
+def delete_folder_permission(username: str, folder: str) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM folder_permissions WHERE username=? AND folder=?", (username, folder))
+
+
+def delete_folder_permissions_for_user(username: str) -> None:
+    """Called when the user account itself is deleted (see studio/app.py's
+    delete_user_route) - an orphaned grant for a username that no longer
+    exists would just be dead weight."""
+    with connect() as conn:
+        conn.execute("DELETE FROM folder_permissions WHERE username=?", (username,))

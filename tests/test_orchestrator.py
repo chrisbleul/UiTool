@@ -54,6 +54,98 @@ def test_finish_job_sets_status_and_timestamp():
     assert job["finished_at"] is not None
 
 
+def test_claim_next_job_sets_an_initial_heartbeat():
+    db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+
+    claimed = db.claim_next_job("worker-1")
+
+    assert claimed["last_heartbeat_at"] is not None
+    assert claimed["last_heartbeat_at"] == claimed["started_at"]
+
+
+def test_heartbeat_job_updates_the_timestamp():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+    claimed = db.claim_next_job("worker-1")
+    original = claimed["last_heartbeat_at"]
+
+    with db.connect() as conn:
+        conn.execute("UPDATE jobs SET last_heartbeat_at=? WHERE id=?", ("2000-01-01T00:00:00+00:00", job_id))
+    db.heartbeat_job(job_id)
+
+    assert db.get_job(job_id)["last_heartbeat_at"] != "2000-01-01T00:00:00+00:00"
+    assert db.get_job(job_id)["last_heartbeat_at"] != original  # moved forward, not just restored
+
+
+def test_heartbeat_job_is_a_no_op_for_a_job_that_is_not_running():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})  # still 'queued'
+
+    db.heartbeat_job(job_id)
+
+    assert db.get_job(job_id)["last_heartbeat_at"] is None
+
+
+def _backdate_heartbeat(job_id: str, seconds_ago: float) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    stale_at = (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).isoformat()
+    with db.connect() as conn:
+        conn.execute("UPDATE jobs SET last_heartbeat_at=? WHERE id=?", (stale_at, job_id))
+
+
+def test_sweep_stale_jobs_marks_a_silent_one_shot_job_as_error():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+    db.claim_next_job("worker-1")
+    _backdate_heartbeat(job_id, seconds_ago=200)
+
+    swept = db.sweep_stale_jobs(timeout_seconds=90)
+
+    assert swept == [job_id]
+    job = db.get_job(job_id)
+    assert job["status"] == "error"
+    assert "Heartbeat" in job["error_message"]
+    assert job["finished_at"] is not None
+
+
+def test_sweep_stale_jobs_leaves_a_recently_heartbeating_job_alone():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+    db.claim_next_job("worker-1")  # heartbeat is "now" - well within any timeout
+
+    swept = db.sweep_stale_jobs(timeout_seconds=90)
+
+    assert swept == []
+    assert db.get_job(job_id)["status"] == "running"
+
+
+def test_sweep_stale_jobs_ignores_jobs_that_are_not_running():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})  # still 'queued', no heartbeat yet
+
+    swept = db.sweep_stale_jobs(timeout_seconds=0)
+
+    assert swept == []
+    assert db.get_job(job_id)["status"] == "queued"
+
+
+def test_sweep_stale_jobs_releases_its_in_progress_queue_item_without_consuming_a_retry():
+    queue_id = db.create_queue("invoices")
+    db.add_queue_items(queue_id, [{"payload": {"n": 1}, "max_retries": 3}])
+    job_id = db.create_job(
+        "process", {"name": "process", "backend": "web", "steps": []}, queue_name="invoices"
+    )
+    db.claim_next_job("worker-1")
+    item = db.claim_next_queue_item(queue_id, job_id)
+    assert item["status"] == "in_progress"
+    _backdate_heartbeat(job_id, seconds_ago=200)
+
+    db.sweep_stale_jobs(timeout_seconds=90)
+
+    [released] = db.list_queue_items(queue_id)
+    assert released["status"] == "new"  # handed back, not failed
+    assert released["retry_count"] == 0  # no retry consumed - it was never actually attempted-and-failed
+    assert released["locked_by"] is None
+    # and it's claimable again, by a fresh worker
+    assert db.claim_next_queue_item(queue_id, "worker-2") is not None
+
+
 def test_logs_are_persisted_and_fetchable_incrementally():
     job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
     db.add_log(job_id, "INFO", "first")
@@ -227,6 +319,102 @@ class _RecordingFakeBackend:
         pass
 
 
+class _HeartbeatRecordingStore:
+    """A minimal fake `store` (see worker.py's Store note) covering only what
+    a one-shot _run_job needs, so the heartbeat thread can be exercised
+    without a real orchestrator.db at all - the same "fake the dependency"
+    approach test_remote_store.py uses for RemoteStore itself."""
+
+    def __init__(self):
+        self.heartbeats = []
+        self.finished = None
+
+    def is_stop_requested(self, job_id):
+        return False
+
+    def set_paused(self, job_id, index, action, variables=None, path=None):
+        pass
+
+    def wait_and_clear_resume(self, job_id):
+        return True
+
+    def get_global_variables(self):
+        return {}
+
+    def add_log(self, job_id, level, message):
+        pass
+
+    def heartbeat_job(self, job_id):
+        self.heartbeats.append(job_id)
+
+    def finish_job(self, job_id, status, error_message=None):
+        self.finished = (status, error_message)
+
+    def notify_job_failed(self, job_id, job_name, error_message):
+        pass
+
+
+def test_run_job_heartbeats_periodically_while_a_step_is_slow(monkeypatch):
+    import time as time_module
+
+    from uiflow.orchestrator import worker
+
+    class _SlowBackend:
+        def navigate(self, url):
+            time_module.sleep(0.15)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(worker, "_make_backend", lambda wf: _SlowBackend())
+    store = _HeartbeatRecordingStore()
+    job = {
+        "id": "job-1",
+        "name": "demo",
+        "workflow_json": json.dumps(
+            {"name": "demo", "backend": "web", "steps": [{"action": "navigate", "url": "https://x"}]}
+        ),
+        "sub_workflows_json": "{}",
+        "queue_name": None,
+    }
+
+    worker._run_job(job, store=store, heartbeat_interval=0.02)
+
+    assert len(store.heartbeats) >= 2  # ~0.15s of run time / 0.02s interval
+    assert store.finished == ("success", None)
+
+
+def test_run_job_stops_heartbeating_once_the_job_finishes(monkeypatch):
+    import time as time_module
+
+    from uiflow.orchestrator import worker
+
+    class _FastBackend:
+        def navigate(self, url):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(worker, "_make_backend", lambda wf: _FastBackend())
+    store = _HeartbeatRecordingStore()
+    job = {
+        "id": "job-1",
+        "name": "demo",
+        "workflow_json": json.dumps(
+            {"name": "demo", "backend": "web", "steps": [{"action": "navigate", "url": "https://x"}]}
+        ),
+        "sub_workflows_json": "{}",
+        "queue_name": None,
+    }
+
+    worker._run_job(job, store=store, heartbeat_interval=0.02)
+    count_right_after = len(store.heartbeats)
+    time_module.sleep(0.1)  # several more intervals' worth of time
+
+    assert len(store.heartbeats) == count_right_after  # the thread really stopped, not just slowed
+
+
 def test_queue_driven_job_seeds_item_variables_end_to_end(monkeypatch):
     from uiflow.orchestrator import worker
 
@@ -303,6 +491,44 @@ def test_queue_job_reports_error_when_an_item_fails_permanently(monkeypatch):
     assert "1 of 2" in job["error_message"]
     by_status = {i["status"] for i in db.list_queue_items(queue_id)}
     assert by_status == {"success", "failed"}  # the good item was still processed
+
+
+def test_run_job_sends_a_failure_notification_when_configured(monkeypatch):
+    from uiflow.orchestrator import worker
+
+    captured = {}
+    monkeypatch.setattr("uiflow.email_client.send_email", lambda **kwargs: captured.update(kwargs))
+    db.set_notification_settings(
+        enabled=True, smtp_host="smtp.example.com", smtp_port=587, use_tls=True,
+        username=None, from_addr=None, to_addr="ops@example.com", credential_name=None,
+    )
+    monkeypatch.setattr(worker, "_make_backend", lambda name: _SelectivelyFailingBackend())
+    job_id = db.create_job(
+        "demo", {"name": "demo", "backend": "web", "steps": [{"action": "navigate", "url": "https://bad"}]}
+    )
+
+    worker._run_job(db.claim_next_job("test-worker"))
+
+    assert db.get_job(job_id)["status"] == "error"
+    assert captured["to"] == "ops@example.com"
+    assert "demo" in captured["subject"]
+
+
+def test_run_job_does_not_notify_on_success(monkeypatch):
+    from uiflow.orchestrator import worker
+
+    def _boom(**kwargs):
+        raise AssertionError("must not notify on a successful job")
+
+    monkeypatch.setattr("uiflow.email_client.send_email", _boom)
+    db.set_notification_settings(
+        enabled=True, smtp_host="smtp.example.com", smtp_port=587, use_tls=True,
+        username=None, from_addr=None, to_addr="ops@example.com", credential_name=None,
+    )
+    monkeypatch.setattr(worker, "_make_backend", lambda name: _RecordingFakeBackend())
+    db.create_job("demo", {"name": "demo", "backend": "web", "steps": [{"action": "navigate", "url": "https://ok"}]})
+
+    worker._run_job(db.claim_next_job("test-worker"))  # must not raise via the monkeypatched _boom
 
 
 def test_business_error_marks_an_item_failed_immediately_without_consuming_a_retry():
@@ -493,6 +719,159 @@ def test_schedule_is_not_due_right_after_being_marked_ran():
     assert _schedule_is_due(schedule) is False
 
 
+# --- business calendar (skip_weekends / skip_holidays) -----------------------
+
+
+def test_is_occurrence_skipped_by_weekend():
+    import datetime as dt
+
+    from uiflow.orchestrator.worker import _is_occurrence_skipped
+
+    saturday = dt.datetime(2000, 1, 8, tzinfo=dt.timezone.utc)
+    assert saturday.weekday() == 5  # sanity-check the fixed anchor itself
+    assert _is_occurrence_skipped(saturday, True, set()) is True
+    assert _is_occurrence_skipped(saturday, False, set()) is False
+
+
+def test_is_occurrence_skipped_by_holiday():
+    import datetime as dt
+
+    from uiflow.orchestrator.worker import _is_occurrence_skipped
+
+    day = dt.datetime(2026, 12, 25, tzinfo=dt.timezone.utc)
+    assert _is_occurrence_skipped(day, False, {"2026-12-25"}) is True
+    assert _is_occurrence_skipped(day, False, {"2026-12-24"}) is False
+
+
+def test_schedule_with_skip_weekends_skips_saturday_and_sunday_then_fires_monday():
+    import datetime as dt
+
+    from uiflow.orchestrator.worker import _schedule_is_due
+
+    # A fixed, safely-far-in-the-past Friday - any real test run happens long
+    # after this, so every occurrence computed from it is unambiguously in
+    # the past ("due"), which isolates this test from skip_weekends'
+    # weekday-of-the-occurrence logic instead of skip_weekends'
+    # in-the-future logic.
+    friday_late = dt.datetime(2000, 1, 7, 23, 0, tzinfo=dt.timezone.utc)
+    assert friday_late.weekday() == 4  # sanity-check the anchor
+    schedule = {
+        "cron_expr": "0 0 * * *",  # daily at midnight
+        "last_run_at": None,
+        "created_at": friday_late.isoformat(),
+        "skip_weekends": True,
+    }
+
+    # Saturday's and Sunday's occurrences are both skipped; Monday's is the
+    # first one that counts, and it's still due (long since passed).
+    assert _schedule_is_due(schedule) is True
+
+
+def test_schedule_without_skip_weekends_still_fires_on_the_weekend_occurrence():
+    import datetime as dt
+
+    from uiflow.orchestrator.worker import _schedule_is_due
+
+    friday_late = dt.datetime(2000, 1, 7, 23, 0, tzinfo=dt.timezone.utc)
+    schedule = {
+        "cron_expr": "0 0 * * *",
+        "last_run_at": None,
+        "created_at": friday_late.isoformat(),
+        # no skip_weekends key at all - matches every schedule created before
+        # this feature existed
+    }
+
+    assert _schedule_is_due(schedule) is True
+
+
+def test_schedule_with_skip_holidays_skips_a_listed_date():
+    import datetime as dt
+
+    from uiflow.orchestrator.worker import _schedule_is_due
+
+    anchor = dt.datetime(2000, 1, 6, 23, 0, tzinfo=dt.timezone.utc)  # just before Jan 7 midnight
+    db.add_holiday("2000-01-07", "Test-Feiertag")
+    schedule = {
+        "cron_expr": "0 0 * * *",
+        "last_run_at": None,
+        "created_at": anchor.isoformat(),
+        "skip_holidays": True,
+    }
+
+    # Jan 7 is listed as a holiday and skipped; Jan 8 is the next occurrence.
+    assert _schedule_is_due(schedule) is True
+
+
+def test_schedule_with_skip_holidays_ignores_unlisted_dates():
+    import datetime as dt
+
+    from uiflow.orchestrator.worker import _schedule_is_due
+
+    anchor = dt.datetime(2000, 1, 6, 23, 0, tzinfo=dt.timezone.utc)
+    db.add_holiday("2005-05-05", "Ein ganz anderes Datum")  # not Jan 7
+    schedule = {
+        "cron_expr": "0 0 * * *",
+        "last_run_at": None,
+        "created_at": anchor.isoformat(),
+        "skip_holidays": True,
+    }
+
+    assert _schedule_is_due(schedule) is True  # Jan 7 itself is not skipped
+
+
+def test_schedule_is_due_gives_up_when_every_occurrence_is_forever_skipped():
+    from uiflow.orchestrator.worker import _schedule_is_due
+
+    schedule = {
+        "cron_expr": "0 0 * * 6",  # every Saturday, forever
+        "last_run_at": None,
+        "created_at": "2000-01-01T00:00:00+00:00",
+        "skip_weekends": True,  # every possible occurrence is a Saturday
+    }
+
+    assert _schedule_is_due(schedule) is False
+
+
+def test_add_list_and_delete_holidays():
+    db.add_holiday("2026-12-25", "Weihnachten")
+    db.add_holiday("2026-01-01", "Neujahr")
+
+    holidays = db.list_holidays()
+    assert [h["date"] for h in holidays] == ["2026-01-01", "2026-12-25"]  # sorted by date
+    assert db.list_holiday_dates() == {"2026-01-01", "2026-12-25"}
+
+    db.delete_holiday("2026-01-01")
+
+    assert db.list_holiday_dates() == {"2026-12-25"}
+
+
+def test_add_holiday_is_idempotent_by_date():
+    db.add_holiday("2026-12-25", "Weihnachten")
+    db.add_holiday("2026-12-25", "Christmas")  # same date, different name - replaces
+
+    [holiday] = db.list_holidays()
+    assert holiday["name"] == "Christmas"
+
+
+def test_create_schedule_stores_skip_flags():
+    schedule_id = db.create_schedule(
+        "nightly", "0 2 * * *", {"name": "demo", "backend": "web", "steps": []},
+        skip_weekends=True, skip_holidays=True,
+    )
+
+    schedule = db.get_schedule(schedule_id)
+    assert schedule["skip_weekends"] == 1
+    assert schedule["skip_holidays"] == 1
+
+
+def test_create_schedule_defaults_skip_flags_to_false():
+    schedule_id = db.create_schedule("nightly", "0 2 * * *", {"name": "demo", "backend": "web", "steps": []})
+
+    schedule = db.get_schedule(schedule_id)
+    assert schedule["skip_weekends"] == 0
+    assert schedule["skip_holidays"] == 0
+
+
 def test_run_scheduler_loop_snapshots_referenced_sub_workflows(monkeypatch, tmp_path):
     import threading
 
@@ -557,6 +936,190 @@ def test_run_scheduler_loop_enqueues_a_job_for_a_due_schedule(monkeypatch):
     [job] = db.list_jobs()
     assert job["queue_name"] == "q1"
     assert db.get_schedule(schedule_id)["last_run_at"] is not None
+
+
+def test_run_scheduler_loop_sweeps_stale_jobs_each_iteration(monkeypatch):
+    import threading
+
+    from uiflow.orchestrator import worker
+
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+    db.claim_next_job("worker-1")
+    _backdate_heartbeat(job_id, seconds_ago=200)
+
+    stop_event = threading.Event()
+    original_sweep = db.sweep_stale_jobs
+
+    def sweep_and_stop(timeout_seconds):
+        result = original_sweep(timeout_seconds)
+        stop_event.set()
+        return result
+
+    monkeypatch.setattr(db, "sweep_stale_jobs", sweep_and_stop)
+
+    worker.run_scheduler_loop(poll_interval=0, stop_event=stop_event, stale_job_timeout=90)
+
+    assert db.get_job(job_id)["status"] == "error"
+
+
+# --- audit log ---------------------------------------------------------------
+
+
+def test_add_and_list_audit_entries():
+    db.add_audit_entry("alice", "admin", "POST /api/globals", 200)
+    db.add_audit_entry(None, None, "POST /api/globals", 400)
+
+    entries = db.list_audit_entries()
+
+    assert len(entries) == 2
+    assert entries[0]["action"] == "POST /api/globals"
+    assert entries[0]["status_code"] == 400
+    assert entries[0]["username"] is None
+    assert entries[1]["username"] == "alice"
+    assert entries[1]["role"] == "admin"
+
+
+def test_list_audit_entries_newest_first_and_respects_limit():
+    for i in range(5):
+        db.add_audit_entry("alice", "admin", f"POST /api/x{i}", 200)
+
+    entries = db.list_audit_entries(limit=2)
+
+    assert [e["action"] for e in entries] == ["POST /api/x4", "POST /api/x3"]
+
+
+# --- proactive failure notification ------------------------------------------
+
+
+def test_get_notification_settings_defaults_to_disabled():
+    settings = db.get_notification_settings()
+
+    assert settings["enabled"] is False
+    assert settings["smtp_host"] is None
+    assert settings["smtp_port"] == 587
+    assert settings["use_tls"] is True
+
+
+def test_set_and_get_notification_settings_round_trip():
+    db.set_notification_settings(
+        enabled=True,
+        smtp_host="smtp.example.com",
+        smtp_port=465,
+        use_tls=False,
+        username="bot@example.com",
+        from_addr="bot@example.com",
+        to_addr="ops@example.com",
+        credential_name="smtp_password",
+    )
+
+    settings = db.get_notification_settings()
+
+    assert settings["enabled"] is True
+    assert settings["smtp_host"] == "smtp.example.com"
+    assert settings["smtp_port"] == 465
+    assert settings["use_tls"] is False
+    assert settings["to_addr"] == "ops@example.com"
+    assert settings["credential_name"] == "smtp_password"
+
+
+def test_set_notification_settings_can_be_updated_in_place():
+    db.set_notification_settings(
+        enabled=True, smtp_host="a", smtp_port=587, use_tls=True,
+        username=None, from_addr=None, to_addr="a@x.de", credential_name=None,
+    )
+    db.set_notification_settings(
+        enabled=False, smtp_host="b", smtp_port=25, use_tls=False,
+        username=None, from_addr=None, to_addr="b@x.de", credential_name=None,
+    )
+
+    settings = db.get_notification_settings()
+    assert settings["enabled"] is False
+    assert settings["smtp_host"] == "b"
+    assert settings["to_addr"] == "b@x.de"
+
+
+def test_send_notification_email_raises_when_not_enabled():
+    with pytest.raises(RuntimeError, match="nicht aktiviert"):
+        db.send_notification_email("subject", "body")
+
+
+def test_send_notification_email_raises_when_missing_smtp_host_or_recipient():
+    db.set_notification_settings(
+        enabled=True, smtp_host=None, smtp_port=587, use_tls=True,
+        username=None, from_addr=None, to_addr=None, credential_name=None,
+    )
+
+    with pytest.raises(RuntimeError):
+        db.send_notification_email("subject", "body")
+
+
+def test_send_notification_email_resolves_the_credential_and_sends(monkeypatch):
+    captured = {}
+    monkeypatch.setattr("uiflow.email_client.send_email", lambda **kwargs: captured.update(kwargs))
+    monkeypatch.setattr("uiflow.credentials.get_credential", lambda name: f"secret-for-{name}")
+    db.set_notification_settings(
+        enabled=True, smtp_host="smtp.example.com", smtp_port=587, use_tls=True,
+        username="bot@example.com", from_addr="bot@example.com", to_addr="ops@example.com",
+        credential_name="smtp_password",
+    )
+
+    db.send_notification_email("Betreff", "Text")
+
+    assert captured["smtp_host"] == "smtp.example.com"
+    assert captured["to"] == "ops@example.com"
+    assert captured["subject"] == "Betreff"
+    assert captured["body"] == "Text"
+    assert captured["password"] == "secret-for-smtp_password"
+
+
+def test_send_notification_email_works_without_a_credential_name(monkeypatch):
+    captured = {}
+    monkeypatch.setattr("uiflow.email_client.send_email", lambda **kwargs: captured.update(kwargs))
+    db.set_notification_settings(
+        enabled=True, smtp_host="smtp.example.com", smtp_port=587, use_tls=True,
+        username=None, from_addr=None, to_addr="ops@example.com", credential_name=None,
+    )
+
+    db.send_notification_email("Betreff", "Text")
+
+    assert captured["password"] == ""
+
+
+def test_notify_job_failed_is_a_no_op_when_disabled(monkeypatch):
+    def _boom(**kwargs):
+        raise AssertionError("must not be called when notifications are disabled")
+
+    monkeypatch.setattr("uiflow.email_client.send_email", _boom)
+
+    db.notify_job_failed("job-1", "demo", "kaputt")  # must not raise either
+
+
+def test_notify_job_failed_sends_when_enabled(monkeypatch):
+    captured = {}
+    monkeypatch.setattr("uiflow.email_client.send_email", lambda **kwargs: captured.update(kwargs))
+    db.set_notification_settings(
+        enabled=True, smtp_host="smtp.example.com", smtp_port=587, use_tls=True,
+        username=None, from_addr=None, to_addr="ops@example.com", credential_name=None,
+    )
+
+    db.notify_job_failed("job-1", "demo", "kaputt")
+
+    assert "demo" in captured["subject"]
+    assert "job-1" in captured["body"]
+    assert "kaputt" in captured["body"]
+
+
+def test_notify_job_failed_never_raises_even_if_sending_fails(monkeypatch):
+    def _boom(**kwargs):
+        raise RuntimeError("SMTP down")
+
+    monkeypatch.setattr("uiflow.email_client.send_email", _boom)
+    db.set_notification_settings(
+        enabled=True, smtp_host="smtp.example.com", smtp_port=587, use_tls=True,
+        username=None, from_addr=None, to_addr="ops@example.com", credential_name=None,
+    )
+
+    db.notify_job_failed("job-1", "demo", "kaputt")  # must not raise
 
 
 # --- global variables -------------------------------------------------------
@@ -687,3 +1250,205 @@ def test_delete_user_removes_it():
 
     assert db.get_user("alice") is None
     assert db.any_users_exist() is False
+
+
+# --- workflow version history -------------------------------------------------
+
+
+def test_add_and_list_workflow_versions():
+    db.add_workflow_version("report", "steps: []", "alice")
+
+    [version] = db.list_workflow_versions("report")
+    assert version["saved_by"] == "alice"
+    assert version["workflow_name"] == "report"
+
+
+def test_get_workflow_version_includes_content():
+    version_id = db.add_workflow_version("report", "steps: [x]", None)
+
+    version = db.get_workflow_version(version_id)
+
+    assert version["content_yaml"] == "steps: [x]"
+
+
+def test_get_workflow_version_returns_none_for_an_unknown_id():
+    assert db.get_workflow_version(9999) is None
+
+
+def test_list_workflow_versions_is_newest_first_and_scoped_to_its_workflow():
+    db.add_workflow_version("a", "v1", None)
+    db.add_workflow_version("b", "other workflow", None)
+    db.add_workflow_version("a", "v2", None)
+
+    versions = db.list_workflow_versions("a")
+
+    assert [db.get_workflow_version(v["id"])["content_yaml"] for v in versions] == ["v2", "v1"]
+
+
+def test_versions_beyond_the_cap_are_pruned(monkeypatch):
+    monkeypatch.setattr(db, "_MAX_VERSIONS_PER_WORKFLOW", 3)
+    for i in range(5):
+        db.add_workflow_version("report", f"v{i}", None)
+
+    versions = db.list_workflow_versions("report")
+
+    assert len(versions) == 3
+    contents = [db.get_workflow_version(v["id"])["content_yaml"] for v in versions]
+    assert contents == ["v4", "v3", "v2"]  # the two oldest were pruned
+
+
+def test_delete_workflow_versions_removes_only_that_workflows_history():
+    db.add_workflow_version("a", "v1", None)
+    db.add_workflow_version("b", "v1", None)
+
+    db.delete_workflow_versions("a")
+
+    assert db.list_workflow_versions("a") == []
+    assert len(db.list_workflow_versions("b")) == 1
+
+
+# --- folder permissions -------------------------------------------------------
+
+
+def test_set_and_list_folder_permissions():
+    db.set_folder_permission("alice", "Rechnungswesen", "operator")
+    db.set_folder_permission("alice", "", "viewer")
+
+    grants = db.list_folder_permissions("alice")
+
+    assert {g["folder"]: g["role"] for g in grants} == {"Rechnungswesen": "operator", "": "viewer"}
+
+
+def test_set_folder_permission_is_an_upsert():
+    db.set_folder_permission("alice", "Rechnungswesen", "viewer")
+    db.set_folder_permission("alice", "Rechnungswesen", "operator")
+
+    [grant] = db.list_folder_permissions("alice")
+    assert grant["role"] == "operator"
+
+
+def test_list_folder_permissions_without_a_username_lists_everyone():
+    db.set_folder_permission("alice", "A", "viewer")
+    db.set_folder_permission("bob", "B", "operator")
+
+    grants = db.list_folder_permissions()
+
+    assert {(g["username"], g["folder"]) for g in grants} == {("alice", "A"), ("bob", "B")}
+
+
+def test_delete_folder_permission_removes_only_that_grant():
+    db.set_folder_permission("alice", "A", "viewer")
+    db.set_folder_permission("alice", "B", "viewer")
+
+    db.delete_folder_permission("alice", "A")
+
+    assert [g["folder"] for g in db.list_folder_permissions("alice")] == ["B"]
+
+
+def test_delete_folder_permissions_for_user_removes_only_that_users_grants():
+    db.set_folder_permission("alice", "A", "viewer")
+    db.set_folder_permission("bob", "A", "viewer")
+
+    db.delete_folder_permissions_for_user("alice")
+
+    assert db.list_folder_permissions("alice") == []
+    assert len(db.list_folder_permissions("bob")) == 1
+
+
+# --- approval requests (human-in-the-loop, see engine.py's request_approval) --
+
+
+def test_create_approval_request_starts_pending():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+
+    request_id = db.create_approval_request(job_id, "Rechnung freigeben", "Details hier")
+
+    assert db.get_approval_decision(request_id) is None  # still pending
+
+
+def test_decide_approval_request_records_the_decision():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+    request_id = db.create_approval_request(job_id, "x", "")
+
+    decided = db.decide_approval_request(request_id, True, "passt", "alice")
+
+    assert decided is True
+    decision = db.get_approval_decision(request_id)
+    assert decision["approved"] is True
+    assert decision["comment"] == "passt"
+    assert decision["decided_by"] == "alice"
+    assert decision["decided_at"]
+
+
+def test_decide_approval_request_can_only_happen_once():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+    request_id = db.create_approval_request(job_id, "x", "")
+    db.decide_approval_request(request_id, True, "erste Entscheidung", "alice")
+
+    second = db.decide_approval_request(request_id, False, "zweite Entscheidung", "bob")
+
+    assert second is False
+    assert db.get_approval_decision(request_id)["comment"] == "erste Entscheidung"
+
+
+def test_decide_approval_request_returns_false_for_an_unknown_id():
+    assert db.decide_approval_request(99999, True, "", None) is False
+
+
+def test_cancel_approval_request_marks_it_cancelled_and_resolves_any_poller():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+    request_id = db.create_approval_request(job_id, "x", "")
+
+    db.cancel_approval_request(request_id)
+
+    # No longer "pending" - get_approval_decision resolves (as unapproved)
+    # instead of leaving an independent poller waiting forever.
+    decision = db.get_approval_decision(request_id)
+    assert decision is not None
+    assert decision["approved"] is False
+    [row] = db.list_approval_requests(status=None)
+    assert row["status"] == "cancelled"
+
+
+def test_cancel_approval_request_does_not_override_an_existing_decision():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+    request_id = db.create_approval_request(job_id, "x", "")
+    db.decide_approval_request(request_id, True, "genehmigt", "alice")
+
+    db.cancel_approval_request(request_id)
+
+    assert db.get_approval_decision(request_id)["approved"] is True
+
+
+def test_list_approval_requests_defaults_to_pending_only():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+    pending_id = db.create_approval_request(job_id, "pending one", "")
+    decided_id = db.create_approval_request(job_id, "decided one", "")
+    db.decide_approval_request(decided_id, True, "", None)
+
+    pending = db.list_approval_requests()
+
+    assert [r["id"] for r in pending] == [pending_id]
+
+
+def test_list_approval_requests_includes_the_job_name():
+    job_id = db.create_job("Rechnungsprüfung", {"name": "Rechnungsprüfung", "backend": "web", "steps": []})
+    db.create_approval_request(job_id, "x", "")
+
+    [row] = db.list_approval_requests()
+
+    assert row["job_name"] == "Rechnungsprüfung"
+
+
+def test_list_approval_requests_status_none_returns_every_status():
+    job_id = db.create_job("demo", {"name": "demo", "backend": "web", "steps": []})
+    a = db.create_approval_request(job_id, "a", "")
+    b = db.create_approval_request(job_id, "b", "")
+    c = db.create_approval_request(job_id, "c", "")
+    db.decide_approval_request(a, True, "", None)
+    db.cancel_approval_request(b)
+    # c stays pending
+
+    all_requests = db.list_approval_requests(status=None)
+
+    assert {r["id"] for r in all_requests} == {a, b, c}

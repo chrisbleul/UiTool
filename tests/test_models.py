@@ -220,6 +220,80 @@ def test_resolve_sub_workflows_does_not_loop_forever_on_a_cycle(workflows_dir):
     assert set(resolved) == {"a", "b"}
 
 
+# --- workflow folders ---------------------------------------------------------
+
+
+def test_workflow_path_resolves_a_plain_name(workflows_dir):
+    from uiflow.models import workflow_path
+
+    path = workflow_path("invoice")
+
+    assert path == workflows_dir / "invoice.yaml"
+
+
+def test_workflow_path_resolves_a_folder_qualified_name(workflows_dir):
+    from uiflow.models import workflow_path
+
+    path = workflow_path("Rechnungen/invoice")
+
+    assert path == workflows_dir / "Rechnungen" / "invoice.yaml"
+
+
+def test_workflow_path_drops_dot_dot_segments_instead_of_escaping(workflows_dir):
+    from uiflow.models import workflow_path
+
+    path = workflow_path("../../etc/evil")
+
+    assert workflows_dir in path.parents
+    assert path == workflows_dir / "etc" / "evil.yaml"
+
+
+def test_workflow_path_rejects_a_leading_dot_dot_that_would_otherwise_escape(workflows_dir):
+    from uiflow.models import workflow_path
+
+    path = workflow_path("..")
+
+    # every segment was dropped - falls back to the "workflow" default name,
+    # not to WORKFLOWS_DIR's own parent.
+    assert path == workflows_dir / "workflow.yaml"
+
+
+def test_workflow_save_creates_the_folder(workflows_dir):
+    Workflow(name="invoice", backend="web", steps=[]).save(workflows_dir / "Rechnungen" / "invoice.yaml")
+
+    assert (workflows_dir / "Rechnungen" / "invoice.yaml").exists()
+
+
+def test_list_workflows_includes_folder_qualified_names(workflows_dir):
+    from uiflow.models import list_workflows
+
+    write_workflow(workflows_dir, "top_level", [])
+    (workflows_dir / "Rechnungen").mkdir()
+    Workflow(name="invoice", backend="web", steps=[]).save(workflows_dir / "Rechnungen" / "invoice.yaml")
+
+    assert list_workflows() == ["Rechnungen/invoice", "top_level"]
+
+
+def test_list_workflows_excludes_the_object_repository_file(workflows_dir):
+    from uiflow.models import list_workflows
+    from uiflow.object_repository import REPOSITORY_FILENAME
+
+    write_workflow(workflows_dir, "demo", [])
+    (workflows_dir / REPOSITORY_FILENAME).write_text("scopes: {}", encoding="utf-8")
+
+    assert list_workflows() == ["demo"]
+
+
+def test_load_workflow_by_name_resolves_a_folder_qualified_name(workflows_dir):
+    from uiflow.models import load_workflow_by_name
+
+    Workflow(name="invoice", backend="web", steps=[]).save(workflows_dir / "Rechnungen" / "invoice.yaml")
+
+    loaded = load_workflow_by_name("Rechnungen/invoice")
+
+    assert loaded.name == "invoice"
+
+
 # --- declared workflow variables ---------------------------------------------
 
 

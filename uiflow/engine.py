@@ -14,6 +14,12 @@ logger = logging.getLogger("uiflow")
 # (executed-step number, step, variables snapshot, structural step path)
 OnBreakpoint = Callable[[int, Step, "dict[str, Any]", str], None]
 ShouldStop = Callable[[], bool]
+# (title, message, variables snapshot) -> decision dict, at minimum
+# {"approved": bool, "comment": str} - see _run_request_approval. Blocks
+# until a human decides (or the run is cancelled); the how (persisting a
+# request, polling for a decision) is entirely up to the caller, same as
+# OnBreakpoint's wait-for-resume loop (see orchestrator/worker.py).
+OnRequestApproval = Callable[[str, str, "dict[str, Any]"], "dict[str, Any]"]
 
 # {item.field} reads from the current queue item's payload (variables["item"]);
 # {global.name} from the installation-wide values (variables["global"], see the
@@ -100,8 +106,9 @@ class WorkflowEngine:
     backend - except a handful of action names the engine handles itself
     (`if`, `switch`, `for_each`, `try`, `run_workflow`, `assign`, `increment`,
     `read_excel`, `write_excel`, `http_request`, `get_credential`, `send_email`,
-    `read_emails`, `read_pdf`, `ocr_image`), since they operate on
-    workflow-run-scoped `variables` (or external services) rather than the UI.
+    `read_emails`, `read_pdf`, `ocr_image`, `request_approval`), since they
+    operate on workflow-run-scoped `variables` (or external services) rather
+    than the UI.
 
     Step numbering ("[N] ...") is a single counter across the whole run, in
     execution order - branches that aren't taken never consume a number, so
@@ -130,6 +137,18 @@ class WorkflowEngine:
         # to the job log / console in plain text.
         self._secrets: set[str] = set()
         self._sub_workflows: dict[str, Workflow] = {}
+        # See run()'s `dry_run` parameter - skips only the handful of
+        # engine-level actions with a genuine external side effect
+        # (http_request, send_email, read_emails, write_excel). Everything
+        # else - variables, control flow, expressions, and every
+        # backend-dispatched UI action (via `backend`, expected to be a
+        # DryRunBackend when this is set) - runs exactly as normal, since
+        # that's precisely what a dry run is meant to validate.
+        self._dry_run = False
+        # See run()'s `on_request_approval` parameter - None outside a context
+        # that can actually wait on a human (e.g. bare `uiflow run`), in which
+        # case a `request_approval` step raises rather than hanging forever.
+        self._on_request_approval: Optional[OnRequestApproval] = None
 
     def run(
         self,
@@ -139,7 +158,11 @@ class WorkflowEngine:
         variables: Optional[dict[str, Any]] = None,
         global_variables: Optional[dict[str, Any]] = None,
         sub_workflows: Optional[dict[str, Workflow]] = None,
+        dry_run: bool = False,
+        on_request_approval: Optional[OnRequestApproval] = None,
     ) -> None:
+        self._dry_run = dry_run
+        self._on_request_approval = on_request_approval
         self.variables = self._seed_declared_variables(workflow, dict(variables) if variables else {})
         # Installation-wide values, kept apart from the run's own variables so
         # they survive a sub-workflow's isolated scope and can't be overwritten
@@ -292,6 +315,8 @@ class WorkflowEngine:
             self._run_ocr_image(step, index)
         elif step.action == "fail":
             self._run_fail(step, index)
+        elif step.action == "request_approval":
+            self._run_request_approval(step, index)
         else:
             self._run_backend_step(step, index)
 
@@ -524,6 +549,38 @@ class WorkflowEngine:
             raise BusinessError(message)
         raise StepError(index, step, RuntimeError(message))
 
+    def _run_request_approval(self, step: Step, index: int) -> None:
+        """Human-in-the-loop: pauses the run until a person decides via
+        `on_request_approval` (see OnRequestApproval and, for the orchestrator
+        wiring, worker.py's on_request_approval). Cancellation while waiting
+        isn't handled here - like a breakpoint's wait-for-resume, the callback
+        itself decides when to give up, and the run's normal should_stop check
+        at the top of the *next* step catches it, same as it already does
+        after a breakpoint's wait loop returns."""
+        title = substitute_variables(step.params.get("title", ""), self.variables)
+        message = substitute_variables(step.params.get("message", ""), self.variables)
+        if not title:
+            raise StepError(index, step, ValueError("request_approval requires 'title'"))
+        if self._dry_run:
+            self._log("[%d] [dry-run] request_approval '%s' -> übersprungen (automatisch genehmigt)", index, title)
+            if step.save_as:
+                self.variables[step.save_as] = {"approved": True, "comment": "", "decided_by": None, "dry_run": True}
+            return
+        if self._on_request_approval is None:
+            raise StepError(
+                index, step,
+                RuntimeError(
+                    "request_approval braucht einen Genehmigungs-Handler (nur über den Orchestrator/Studio unterstützt)"
+                ),
+            )
+        self._log("[%d] request_approval '%s' -> wartet auf Entscheidung", index, title)
+        decision = self._on_request_approval(title, message, self._variables_snapshot())
+        self._log(
+            "[%d] request_approval '%s' -> %s", index, title, "genehmigt" if decision.get("approved") else "abgelehnt"
+        )
+        if step.save_as:
+            self.variables[step.save_as] = decision
+
     def _run_read_excel(self, step: Step, index: int) -> None:
         path = step.params.get("path")
         save_as = step.save_as or step.params.get("variable")
@@ -547,6 +604,12 @@ class WorkflowEngine:
             rows = safe_eval(data_expr, self._eval_scope())
         except ValueError as exc:
             raise StepError(index, step, exc) from exc
+        if self._dry_run:
+            row_list = list(rows)
+            self._log("[%d] [dry-run] write_excel '%s' -> würde %d Zeile(n) schreiben", index, path, len(row_list))
+            if step.save_as:
+                self.variables[step.save_as] = len(row_list)
+            return
         try:
             from .excel import write_excel_rows
 
@@ -562,6 +625,20 @@ class WorkflowEngine:
         url = resolved.get("url")
         if not url:
             raise StepError(index, step, ValueError("http_request requires 'url'"))
+        if self._dry_run:
+            self._log("[%d] [dry-run] http_request %s %s -> übersprungen", index, resolved.get("method", "GET"), url)
+            if step.save_as:
+                # Same shape as a real result (see http_client.send_http_request)
+                # so a later expression referencing e.g. result["json"] doesn't
+                # fail differently in a dry run than for a genuinely empty response.
+                self.variables[step.save_as] = {
+                    "status_code": 0,
+                    "headers": {},
+                    "text": "",
+                    "json": None,
+                    "dry_run": True,
+                }
+            return
         try:
             from .http_client import send_http_request
 
@@ -598,6 +675,11 @@ class WorkflowEngine:
 
     def _run_send_email(self, step: Step, index: int) -> None:
         resolved = substitute_variables(step.params, self.variables)
+        if self._dry_run:
+            self._log("[%d] [dry-run] send_email -> %s (übersprungen)", index, resolved.get("to"))
+            if step.save_as:
+                self.variables[step.save_as] = {"sent": False, "dry_run": True}
+            return
         try:
             from .email_client import send_email
 
@@ -622,6 +704,10 @@ class WorkflowEngine:
         if not step.save_as:
             raise StepError(index, step, ValueError("read_emails requires save_as"))
         resolved = substitute_variables(step.params, self.variables)
+        if self._dry_run:
+            self._log("[%d] [dry-run] read_emails -> übersprungen", index)
+            self.variables[step.save_as] = []
+            return
         try:
             from .email_client import read_emails
 

@@ -95,6 +95,21 @@ def _run_workflow_once(
             time.sleep(0.3)
         store.set_paused(job_id, None, None, path=None)
 
+    def on_request_approval(title: str, message: str, variables: dict[str, Any]) -> dict[str, Any]:
+        request_id = store.create_approval_request(job_id, title, message)
+        while True:
+            decision = store.get_approval_decision(request_id)
+            if decision is not None:
+                return decision
+            if store.is_stop_requested(job_id):
+                # Not resolved into a real approve/reject - just unblocks the
+                # wait. The workflow itself gets cancelled the normal way
+                # (should_stop, checked before the *next* step), same as a
+                # stop requested while paused at a breakpoint.
+                store.cancel_approval_request(request_id)
+                return {"approved": False, "comment": "", "decided_by": None, "cancelled": True}
+            time.sleep(1.0)
+
     backend = _make_backend(workflow)
     try:
         WorkflowEngine(backend).run(
@@ -106,6 +121,7 @@ def _run_workflow_once(
             # next run without re-queuing anything.
             global_variables=store.get_global_variables(),
             sub_workflows=sub_workflows,
+            on_request_approval=on_request_approval,
         )
     finally:
         stopped_while_debugging = reached_breakpoint and store.is_stop_requested(job_id)
@@ -120,18 +136,55 @@ def _run_workflow_once(
                     pass
 
 
-def _run_job(job: dict[str, Any], store: Any = db) -> None:
+# How often a job's heartbeat is refreshed while it runs (see _heartbeat_loop
+# below) and how long the sweep in db.sweep_stale_jobs waits before treating a
+# silent job as orphaned. The 4-6x margin between them is deliberate slack for
+# a slow DB write or a busy machine, not a tight deadline - this is meant to
+# catch a genuinely dead worker process, not penalize a merely slow one.
+HEARTBEAT_INTERVAL_SECONDS = 15.0
+
+
+def _heartbeat_loop(job_id: str, store: Any, interval: float, stop_event: threading.Event) -> None:
+    while not stop_event.wait(interval):
+        try:
+            store.heartbeat_job(job_id)
+        except Exception:  # noqa: BLE001 - a missed heartbeat must not crash the run itself
+            logger.warning("Heartbeat for job '%s' failed (will retry)", job_id, exc_info=True)
+
+
+def _run_job(job: dict[str, Any], store: Any = db, heartbeat_interval: float = HEARTBEAT_INTERVAL_SECONDS) -> None:
     job_id = job["id"]
     handler = _DbLogHandler(job_id, threading.get_ident(), store=store)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
+    # Keeps last_heartbeat_at fresh for as long as this job runs, independent of
+    # what the run itself is doing at any given moment - including sitting idle
+    # at a breakpoint waiting on a human, which must NOT look like a crashed
+    # worker to db.sweep_stale_jobs (see its docstring). Only this worker
+    # *process* dying stops the heartbeats.
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat_loop, args=(job_id, store, heartbeat_interval, heartbeat_stop), daemon=True
+    )
+    heartbeat_thread.start()
+
     workflow_dict = json.loads(job["workflow_json"])
     sub_workflows = {
         name: Workflow.from_raw(raw) for name, raw in json.loads(job.get("sub_workflows_json") or "{}").items()
     }
     queue_name = job["queue_name"]
+
+    def _finish(status: str, error_message: str | None = None) -> None:
+        store.finish_job(job_id, status, error_message)
+        if status == "error":
+            # store.notify_job_failed is a no-op for a RemoteStore - the
+            # Studio server already sends this itself when it handles the
+            # matching /api/worker/jobs/<id>/finish call (see studio/app.py),
+            # since a remote worker has no local SMTP-notification config to
+            # read in the first place.
+            store.notify_job_failed(job_id, job["name"], error_message)
 
     try:
         failed = 0
@@ -142,23 +195,25 @@ def _run_job(job: dict[str, Any], store: Any = db) -> None:
             logger.info("Running job '%s'", job["name"])
             _run_workflow_once(job_id, Workflow.from_raw(workflow_dict), sub_workflows=sub_workflows, store=store)
         if store.is_stop_requested(job_id):
-            store.finish_job(job_id, "cancelled")
+            _finish("cancelled")
         elif failed:
             # A queue-driven job keeps going past a failing item on purpose, but
             # it must not then report "success" - the job is only successful if
             # every item it processed ended up succeeding.
-            store.finish_job(job_id, "error", f"{failed} of {processed} queue item(s) failed permanently")
+            _finish("error", f"{failed} of {processed} queue item(s) failed permanently")
         else:
-            store.finish_job(job_id, "success")
+            _finish("success")
     except WorkflowCancelled:
-        store.finish_job(job_id, "cancelled")
+        _finish("cancelled")
     except StepError as exc:
         logger.error(str(exc))
-        store.finish_job(job_id, "error", str(exc))
+        _finish("error", str(exc))
     except Exception as exc:  # noqa: BLE001 - surface any failure instead of crashing the worker loop
         logger.error(str(exc))
-        store.finish_job(job_id, "error", str(exc))
+        _finish("error", str(exc))
     finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=2.0)
         logger.removeHandler(handler)
 
 
@@ -245,7 +300,11 @@ def _run_queue_driven(
 
 
 def run_worker_loop(
-    worker_id: str | None = None, poll_interval: float = 1.0, stop_event=None, store: Any = db
+    worker_id: str | None = None,
+    poll_interval: float = 1.0,
+    stop_event=None,
+    store: Any = db,
+    heartbeat_interval: float = HEARTBEAT_INTERVAL_SECONDS,
 ) -> None:
     """Blocks, repeatedly claiming and running queued jobs, until `stop_event`
     is set (if given) - used both by the standalone `uiflow worker` CLI command
@@ -261,24 +320,65 @@ def run_worker_loop(
         if job is None:
             time.sleep(poll_interval)
             continue
-        _run_job(job, store=store)
+        _run_job(job, store=store, heartbeat_interval=heartbeat_interval)
+
+
+# Safety valve for _schedule_is_due's catch-up loop below: a cron/calendar
+# combination where every occurrence for the foreseeable future is skipped
+# (e.g. "every Saturday" with skip_weekends on) would otherwise advance
+# forever without ever returning - this caps how many occurrences it will
+# walk past in one check, comfortably more than a year of even an hourly cron.
+_MAX_SCHEDULE_LOOKAHEAD_OCCURRENCES = 400
+
+
+def _is_occurrence_skipped(fire_time, skip_weekends: bool, holiday_dates: set[str]) -> bool:
+    if skip_weekends and fire_time.weekday() >= 5:  # 5=Saturday, 6=Sunday
+        return True
+    return bool(holiday_dates) and fire_time.date().isoformat() in holiday_dates
 
 
 def _schedule_is_due(schedule: dict[str, Any]) -> bool:
+    """True if this schedule has an occurrence at or before now that hasn't
+    run yet and isn't skipped by its business-calendar settings
+    (skip_weekends/skip_holidays, see db.py's holidays table). A skipped
+    occurrence is walked past, not fired late - the loop keeps advancing
+    through past occurrences (skipped or not) until it finds one that's
+    either due-and-not-skipped (True) or still in the future (False), so a
+    schedule catches up to the next *valid* occurrence rather than getting
+    stuck retrying the same skipped one forever (last_run_at only advances
+    when a schedule actually fires - see run_scheduler_loop)."""
     from croniter import croniter
 
     last_run = schedule["last_run_at"]
     base = datetime.fromisoformat(last_run) if last_run else datetime.fromisoformat(schedule["created_at"])
-    next_fire = croniter(schedule["cron_expr"], base).get_next(datetime)
-    return next_fire <= datetime.now(next_fire.tzinfo)
+    skip_weekends = bool(schedule.get("skip_weekends"))
+    skip_holidays = bool(schedule.get("skip_holidays"))
+    holiday_dates = db.list_holiday_dates() if skip_holidays else set()
+
+    cron = croniter(schedule["cron_expr"], base)
+    for _ in range(_MAX_SCHEDULE_LOOKAHEAD_OCCURRENCES):
+        next_fire = cron.get_next(datetime)
+        if next_fire > datetime.now(next_fire.tzinfo):
+            return False
+        if not _is_occurrence_skipped(next_fire, skip_weekends, holiday_dates):
+            return True
+    return False
 
 
-def run_scheduler_loop(poll_interval: float = 20.0, stop_event=None) -> None:
-    """Blocks, periodically checking enabled schedules (see orchestrator/db.py's
-    `schedules` table) and enqueuing a job for any whose cron expression is due
-    - a lightweight cron trigger, separate from run_worker_loop (which executes
-    jobs) since a schedule only *creates* jobs, the regular worker loop (or a
-    standalone `uiflow worker` process) still claims and runs them."""
+def run_scheduler_loop(
+    poll_interval: float = 20.0, stop_event=None, stale_job_timeout: float = db.STALE_JOB_TIMEOUT_SECONDS
+) -> None:
+    """Blocks, periodically (a) checking enabled schedules (see
+    orchestrator/db.py's `schedules` table) and enqueuing a job for any whose
+    cron expression is due, and (b) sweeping jobs whose worker has gone silent
+    (see db.sweep_stale_jobs) - a lightweight maintenance loop, separate from
+    run_worker_loop (which executes jobs) since neither responsibility here
+    executes anything itself: a schedule only *creates* jobs and the sweep
+    only *settles* orphaned ones, the regular worker loop (or a standalone
+    `uiflow worker` process, local or remote) still claims and runs them.
+    Always uses the local `db` module directly - unlike run_worker_loop, this
+    loop is deliberately server-side only (see README's "Orchestrator über
+    eine Maschine hinaus")."""
     db.init_db()
     logger.info("Scheduler started")
     while stop_event is None or not stop_event.is_set():
@@ -301,6 +401,11 @@ def run_scheduler_loop(poll_interval: float = 20.0, stop_event=None) -> None:
             )
             db.mark_schedule_ran(schedule["id"])
             logger.info("Schedule '%s' fired -> new job enqueued", schedule["name"])
+
+        stale = db.sweep_stale_jobs(stale_job_timeout)
+        for job_id in stale:
+            logger.warning("Job '%s' had no heartbeat for %.0fs - marked as error", job_id, stale_job_timeout)
+
         if stop_event is not None:
             stop_event.wait(poll_interval)
         else:

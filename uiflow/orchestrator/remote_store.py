@@ -76,6 +76,9 @@ class RemoteStore:
     def add_log(self, job_id: str, level: str, message: str) -> None:
         self._post(f"/api/worker/jobs/{quote(job_id)}/logs", {"level": level, "message": message})
 
+    def heartbeat_job(self, job_id: str) -> None:
+        self._post(f"/api/worker/jobs/{quote(job_id)}/heartbeat")
+
     def is_stop_requested(self, job_id: str) -> bool:
         return bool(self._get(f"/api/worker/jobs/{quote(job_id)}/control")["stop_requested"])
 
@@ -97,6 +100,22 @@ class RemoteStore:
 
     def finish_job(self, job_id: str, status: str, error_message: str | None = None) -> None:
         self._post(f"/api/worker/jobs/{quote(job_id)}/finish", {"status": status, "error_message": error_message})
+
+    def notify_job_failed(self, job_id: str, job_name: str, error_message: str | None) -> None:
+        # A no-op here on purpose: the Studio server already sends this
+        # itself, from inside the same /api/worker/jobs/<id>/finish call
+        # finish_job() above just made (see studio/app.py) - a remote worker
+        # has no local notification settings/credentials to read anyway.
+        pass
+
+    def create_approval_request(self, job_id: str, title: str, message: str) -> int:
+        return self._post(f"/api/worker/jobs/{quote(job_id)}/approval_requests", {"title": title, "message": message})["id"]
+
+    def get_approval_decision(self, request_id: int) -> dict[str, Any] | None:
+        return self._get(f"/api/worker/approval_requests/{request_id}")
+
+    def cancel_approval_request(self, request_id: int) -> None:
+        self._post(f"/api/worker/approval_requests/{request_id}/cancel")
 
     def get_global_variables(self) -> dict[str, Any]:
         return self._get("/api/worker/globals")

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
+import re
 import secrets
+import threading
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -13,9 +17,29 @@ from flask import Flask, Response, jsonify, redirect, request, send_from_directo
 from werkzeug.security import check_password_hash
 
 from .. import models
+from ..engine import StepError, WorkflowEngine
 from ..models import Workflow, resolve_sub_workflows
 from ..orchestrator import db
 from .schema import ACTION_SCHEMAS, activity_catalog
+
+
+class _ListLogHandler(logging.Handler):
+    """Captures this request's own log lines into an in-memory list - same
+    thread-filtering reasoning as orchestrator/worker.py's _DbLogHandler, just
+    collecting into a list instead of writing to SQLite, since a dry-run
+    validation (see /api/validate) is synchronous and has no job row of its
+    own to persist against."""
+
+    def __init__(self, sink: list[str], thread_id: int):
+        super().__init__()
+        self._sink = sink
+        self._thread_id = thread_id
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.thread != self._thread_id:
+            return
+        self._sink.append(self.format(record))
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -30,6 +54,10 @@ _RESERVED_GLOBAL_NAMES = ("global", "item", "var")
 # frictionless single-user mode has no notion of roles at all.
 _ROLE_ORDER = {"viewer": 0, "operator": 1, "admin": 2}
 
+# Stands in for folder="" (the top-level, "no folder") in a URL path segment,
+# which can never itself be empty (see delete_folder_permission_route).
+ROOT_FOLDER_TOKEN = "_root_"
+
 
 def _required_role(method: str, path: str) -> str:
     """Minimum role a request needs, once multi-user mode is active.
@@ -37,16 +65,82 @@ def _required_role(method: str, path: str) -> str:
     variables) is admin-only; any other state-changing request needs at least
     "operator"; a plain read (GET) only needs to be logged in at all
     ("viewer")."""
-    if path.startswith("/api/users") or path.startswith("/api/credentials") or path.startswith("/api/globals"):
+    if (
+        path.startswith("/api/users")
+        or path.startswith("/api/credentials")
+        or path.startswith("/api/globals")
+        or path.startswith("/api/audit-log")
+        or path.startswith("/api/notifications")
+        or path.startswith("/api/folder-permissions")
+    ):
         return "admin"
     if path.startswith("/api/worker/"):
         # A remote worker executes workflows and reads global variables via
         # this namespace (see remote_store.RemoteStore) - operational access,
         # not a plain read, regardless of HTTP method.
         return "operator"
+    if path == "/api/validate":
+        # A dry run changes nothing (see its own docstring) - a diagnostic
+        # check, not a write, despite being a POST (it needs a request body).
+        return "viewer"
     if method == "GET":
         return "viewer"
     return "operator"
+
+
+_WORKFLOW_VERSION_SUFFIX_RE = re.compile(r"^(?P<name>.+?)/versions(?:/\d+(?:/restore)?)?$")
+
+
+def _workflow_name_from_request() -> str | None:
+    """The workflow this request targets, if any - a specific workflow
+    endpoint's <path:name>, or /api/run's body (which may name a workflow
+    that was never saved at all; folder scoping still applies to it exactly
+    as if it had been, since name is the only identity a workflow has either
+    way). None for anything else (including the bare /api/workflows list,
+    deliberately not folder-filtered - see _effective_role's docstring)."""
+    if request.path == "/api/run" and request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        name = data.get("name")
+        return name if isinstance(name, str) and name else None
+    prefix = "/api/workflows/"
+    if not request.path.startswith(prefix):
+        return None
+    rest = request.path[len(prefix):]
+    if not rest:
+        return None
+    match = _WORKFLOW_VERSION_SUFFIX_RE.match(rest)
+    return match.group("name") if match else rest
+
+
+def _folder_of(workflow_name: str) -> str:
+    idx = workflow_name.rfind("/")
+    return workflow_name[:idx] if idx != -1 else ""
+
+
+def _ancestor_folders(folder: str) -> list[str]:
+    """Most specific first: "a/b/c" -> ["a/b/c", "a/b", "a", ""] - a grant on
+    a parent folder also covers everything nested under it."""
+    parts = folder.split("/") if folder else []
+    return ["/".join(parts[:i]) for i in range(len(parts), -1, -1)]
+
+
+def _effective_role(username: str, global_role: str, workflow_name: str) -> str:
+    """The role this user actually has for this specific workflow: their
+    global role, unless they hold *any* folder_permissions grant at all - in
+    which case only a grant matching this workflow's folder (or an ancestor
+    of it) counts, and anything else resolves to "none" (always denied, see
+    _ROLE_ORDER, which has no entry for it - not a silent fallback to their
+    global role). An admin is never folder-restricted."""
+    if global_role == "admin":
+        return "admin"
+    grants = {g["folder"]: g["role"] for g in db.list_folder_permissions(username)}
+    if not grants:
+        return global_role
+    for candidate in _ancestor_folders(_folder_of(workflow_name)):
+        if candidate in grants:
+            return grants[candidate]
+    return "none"
+
 
 # One entry per in-flight recording session (unaffected by the orchestrator -
 # a recording is a live interactive picking session tied to one browser tab,
@@ -59,6 +153,13 @@ def _safe_workflow_path(name: str) -> Path:
     # `run_workflow` action - otherwise the Studio could save a sub-workflow
     # into a different directory than the one a run resolves names against.
     return models.workflow_path(name)
+
+
+def _workflow_identity(path: Path) -> str:
+    """The folder-qualified name a workflow file is keyed by in
+    workflow_versions (e.g. "Rechnungen/invoice") - `path.stem` alone would
+    collide between same-named workflows in different folders."""
+    return path.relative_to(models.WORKFLOWS_DIR).with_suffix("").as_posix()
 
 
 def create_app() -> Flask:
@@ -90,8 +191,10 @@ def create_app() -> Flask:
                     return jsonify({"error": "unauthenticated"}), 401
                 return redirect("/login")
             role = session.get("role", "viewer")
+            workflow_name = _workflow_name_from_request()
+            effective_role = _effective_role(username, role, workflow_name) if workflow_name is not None else role
             required = _required_role(request.method, request.path)
-            if _ROLE_ORDER.get(role, -1) < _ROLE_ORDER[required]:
+            if _ROLE_ORDER.get(effective_role, -1) < _ROLE_ORDER[required]:
                 return jsonify({"error": "forbidden"}), 403
             return None
         if not studio_password:
@@ -101,6 +204,34 @@ def create_app() -> Flask:
         if request.path.startswith("/api/"):
             return jsonify({"error": "unauthenticated"}), 401
         return redirect("/login")
+
+    @app.after_request
+    def audit_log(response: Response) -> Response:
+        # Every state-changing API call, regardless of outcome - a rejected
+        # attempt (401/403/400) is exactly as auditable as a successful one.
+        # GETs (plain reads) are deliberately not logged, matching how
+        # _required_role treats them - noisy and rarely what an audit trail is
+        # for. request.path already names the target for almost every route
+        # (e.g. "DELETE /api/users/bob"), see the audit_log table's own
+        # comment in orchestrator/db.py. /api/worker/* is excluded too - that's
+        # a worker process's own claim/heartbeat/log traffic (every 15s per
+        # running job, or more), not an administrative action; the job/queue
+        # tables are already that traffic's own durable record. /api/validate
+        # is excluded too - a dry run changes nothing (see its own docstring),
+        # so it's diagnostic noise in a trail meant for actual state changes.
+        if (
+            request.method != "GET"
+            and not request.path.startswith("/api/worker/")
+            and request.path != "/api/validate"
+            and (request.path.startswith("/api/") or request.path == "/login")
+        ):
+            db.add_audit_entry(
+                session.get("username"),
+                session.get("role"),
+                f"{request.method} {request.path}",
+                response.status_code,
+            )
+        return response
 
     @app.get("/login")
     def login_form() -> Response:
@@ -158,21 +289,16 @@ def create_app() -> Flask:
 
     @app.get("/api/workflows")
     def list_workflows() -> Response:
-        from ..object_repository import REPOSITORY_FILENAME
+        return jsonify(models.list_workflows())
 
-        names = sorted(
-            p.stem for p in models.WORKFLOWS_DIR.glob("*.yaml") if p.name != REPOSITORY_FILENAME
-        )
-        return jsonify(names)
-
-    @app.get("/api/workflows/<name>")
+    @app.get("/api/workflows/<path:name>")
     def get_workflow(name: str) -> Response:
         path = _safe_workflow_path(name)
         if not path.exists():
             return jsonify({"error": "not found"}), 404
         return jsonify(Workflow.load(path).to_dict())
 
-    @app.post("/api/workflows/<name>")
+    @app.post("/api/workflows/<path:name>")
     def save_workflow(name: str) -> Response:
         data = request.get_json(force=True)
         try:
@@ -180,22 +306,108 @@ def create_app() -> Flask:
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         path = _safe_workflow_path(name)
+        identity = _workflow_identity(path)
         # Saving the workflow you have open is meant to overwrite, so that stays
         # the default. Writing under a *different* name (rename, duplicate, "save
         # as") is not - it would destroy an unrelated workflow with no warning -
         # so those callers pass ?overwrite=false and handle the 409.
         if request.args.get("overwrite", "true").lower() in ("false", "0") and path.exists():
-            return jsonify({"error": f"Workflow '{path.stem}' existiert bereits"}), 409
+            return jsonify({"error": f"Workflow '{identity}' existiert bereits"}), 409
+        if path.exists():
+            # Archives what the file *was*, not what it becomes - the file
+            # itself is always the newest version, so it's never duplicated
+            # into workflow_versions (see db.add_workflow_version).
+            db.add_workflow_version(identity, path.read_text(encoding="utf-8"), session.get("username"))
         workflow.save(path)
-        return jsonify({"saved": path.name})
+        return jsonify({"saved": identity})
 
-    @app.delete("/api/workflows/<name>")
+    @app.delete("/api/workflows/<path:name>")
     def delete_workflow(name: str) -> Response:
         path = _safe_workflow_path(name)
         if not path.exists():
             return jsonify({"error": "not found"}), 404
         path.unlink()
+        db.delete_workflow_versions(_workflow_identity(path))
+        # A folder is nothing but a grouping of workflow files (see
+        # models.workflow_path) - once the last one in it is gone, an empty
+        # directory left behind would be pure clutter, not a "folder" anyone
+        # can still do anything with. Walks upward in case removing it also
+        # emptied its own parent folder.
+        parent = path.parent
+        while parent != models.WORKFLOWS_DIR and not any(parent.iterdir()):
+            parent.rmdir()
+            parent = parent.parent
         return jsonify({"deleted": name})
+
+    @app.get("/api/workflows/<path:name>/versions")
+    def list_workflow_versions_route(name: str) -> Response:
+        return jsonify(db.list_workflow_versions(_workflow_identity(_safe_workflow_path(name))))
+
+    @app.get("/api/workflows/<path:name>/versions/<int:version_id>")
+    def get_workflow_version_route(name: str, version_id: int) -> Response:
+        version = db.get_workflow_version(version_id)
+        if version is None or version["workflow_name"] != _workflow_identity(_safe_workflow_path(name)):
+            return jsonify({"error": "not found"}), 404
+        return jsonify(version)
+
+    @app.post("/api/workflows/<path:name>/versions/<int:version_id>/restore")
+    def restore_workflow_version_route(name: str, version_id: int) -> Response:
+        version = db.get_workflow_version(version_id)
+        path = _safe_workflow_path(name)
+        if version is None or version["workflow_name"] != _workflow_identity(path):
+            return jsonify({"error": "not found"}), 404
+        if path.exists():
+            # Restoring is itself just another save - the state right before
+            # the restore must stay recoverable too, not get silently lost.
+            db.add_workflow_version(_workflow_identity(path), path.read_text(encoding="utf-8"), session.get("username"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(version["content_yaml"], encoding="utf-8")
+        return jsonify({"restored": version_id})
+
+    @app.post("/api/validate")
+    def validate_workflow() -> Response:
+        """Runs the given (possibly unsaved) workflow through the real engine
+        against a DryRunBackend - the same expression evaluation, control
+        flow, and variable handling as a real run, but no real browser/
+        desktop app, network call, or e-mail is touched (see engine.py's
+        `dry_run` and backends/dry_run.py). Synchronous: there is no real I/O
+        to wait on, so unlike /api/run this doesn't go through the job queue
+        at all - the result is ephemeral, not part of job history."""
+        data = request.get_json(force=True)
+        try:
+            workflow = Workflow.from_raw(data)
+        except ValueError as exc:
+            return jsonify({"success": False, "error": str(exc), "log": []}), 400
+
+        from ..backends.dry_run import DryRunBackend
+        from ..cli import _backend_class
+
+        sub_workflows = {
+            name: Workflow.from_raw(raw) for name, raw in resolve_sub_workflows(workflow).items()
+        }
+
+        log_lines: list[str] = []
+        handler = _ListLogHandler(log_lines, threading.get_ident())
+        handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        logger = logging.getLogger("uiflow")
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        try:
+            backend = DryRunBackend(_backend_class(workflow.backend))
+            engine = WorkflowEngine(backend)
+            engine.run(
+                workflow,
+                global_variables=db.get_global_variables(),
+                sub_workflows=sub_workflows,
+                dry_run=True,
+            )
+            return jsonify({"success": True, "log": log_lines})
+        except StepError as exc:
+            return jsonify({"success": False, "error": str(exc), "step_index": exc.index, "log": log_lines})
+        except Exception as exc:  # noqa: BLE001 - surface any validation failure instead of a 500
+            return jsonify({"success": False, "error": str(exc), "log": log_lines})
+        finally:
+            logger.removeHandler(handler)
 
     @app.post("/api/run")
     def run_workflow() -> Response:
@@ -313,6 +525,11 @@ def create_app() -> Flask:
         db.add_log(job_id, data["level"], data["message"])
         return jsonify({"ok": True})
 
+    @app.post("/api/worker/jobs/<job_id>/heartbeat")
+    def worker_heartbeat(job_id: str) -> Response:
+        db.heartbeat_job(job_id)
+        return jsonify({"ok": True})
+
     @app.get("/api/worker/jobs/<job_id>/control")
     def worker_job_control(job_id: str) -> Response:
         return jsonify({"stop_requested": db.is_stop_requested(job_id)})
@@ -331,6 +548,29 @@ def create_app() -> Flask:
     def worker_job_finish(job_id: str) -> Response:
         data = request.get_json(force=True)
         db.finish_job(job_id, data["status"], data.get("error_message"))
+        if data["status"] == "error":
+            # The remote worker's own RemoteStore.notify_job_failed is a
+            # no-op (it has no local notification settings/credentials to
+            # read) - this is the one place that call was skipped for, so the
+            # notification still has to fire from somewhere.
+            job = db.get_job(job_id)
+            if job is not None:
+                db.notify_job_failed(job_id, job["name"], data.get("error_message"))
+        return jsonify({"ok": True})
+
+    @app.post("/api/worker/jobs/<job_id>/approval_requests")
+    def worker_create_approval_request(job_id: str) -> Response:
+        data = request.get_json(force=True)
+        request_id = db.create_approval_request(job_id, data["title"], data.get("message", ""))
+        return jsonify({"id": request_id})
+
+    @app.get("/api/worker/approval_requests/<int:request_id>")
+    def worker_get_approval_decision(request_id: int) -> Response:
+        return jsonify(db.get_approval_decision(request_id))
+
+    @app.post("/api/worker/approval_requests/<int:request_id>/cancel")
+    def worker_cancel_approval_request(request_id: int) -> Response:
+        db.cancel_approval_request(request_id)
         return jsonify({"ok": True})
 
     @app.get("/api/worker/globals")
@@ -604,7 +844,59 @@ def create_app() -> Flask:
         if username == session.get("username"):
             return jsonify({"error": "Kann den eigenen Account nicht selbst löschen"}), 400
         db.delete_user(username)
+        db.delete_folder_permissions_for_user(username)
         return jsonify({"deleted": username})
+
+    @app.get("/api/folder-permissions")
+    def list_folder_permissions_route() -> Response:
+        return jsonify(db.list_folder_permissions(request.args.get("username")))
+
+    @app.post("/api/folder-permissions")
+    def set_folder_permission_route() -> Response:
+        data = request.get_json(force=True) or {}
+        username = (data.get("username") or "").strip()
+        folder = (data.get("folder") or "").strip("/")
+        role = data.get("role")
+        if not username or role not in db.VALID_ROLES:
+            return jsonify({"error": "username and a valid role are required"}), 400
+        if db.get_user(username) is None:
+            return jsonify({"error": f"Unbekannter Benutzer '{username}'"}), 400
+        db.set_folder_permission(username, folder, role)
+        return jsonify({"username": username, "folder": folder, "role": role})
+
+    @app.delete("/api/folder-permissions/<username>/<path:folder_token>")
+    def delete_folder_permission_route(username: str, folder_token: str) -> Response:
+        # A URL path segment can't be empty (Werkzeug's <path:...> converter
+        # requires at least one character), so the top-level/root folder -
+        # folder="" everywhere else - needs a stand-in token here.
+        folder = "" if folder_token == ROOT_FOLDER_TOKEN else folder_token
+        db.delete_folder_permission(username, folder)
+        return jsonify({"deleted": True})
+
+    @app.get("/api/audit-log")
+    def get_audit_log() -> Response:
+        limit = request.args.get("limit", default=200, type=int)
+        return jsonify(db.list_audit_entries(limit=limit))
+
+    @app.get("/api/actions")
+    def list_actions() -> Response:
+        """The Action Center: every `request_approval` step currently waiting
+        on a human (see engine.py/worker.py). Any logged-in user can see this
+        list (matches viewer's read access elsewhere); deciding one requires
+        "operator" (see _required_role's default for a non-GET request)."""
+        return jsonify(db.list_approval_requests(status="pending"))
+
+    @app.post("/api/actions/<int:request_id>/decide")
+    def decide_action(request_id: int) -> Response:
+        data = request.get_json(force=True) or {}
+        approved = data.get("approved")
+        if not isinstance(approved, bool):
+            return jsonify({"error": "'approved' (true/false) is required"}), 400
+        comment = (data.get("comment") or "").strip()
+        decided = db.decide_approval_request(request_id, approved, comment, session.get("username"))
+        if not decided:
+            return jsonify({"error": "Anfrage nicht gefunden oder bereits entschieden"}), 404
+        return jsonify({"decided": True})
 
     @app.get("/api/credentials")
     def list_credentials() -> Response:
@@ -738,7 +1030,14 @@ def create_app() -> Flask:
         except (CroniterBadCronError, ValueError) as exc:
             return jsonify({"error": f"Invalid cron expression: {exc}"}), 400
 
-        schedule_id = db.create_schedule(name, cron_expr, workflow.to_dict(), queue_name=data.get("queue_name"))
+        schedule_id = db.create_schedule(
+            name,
+            cron_expr,
+            workflow.to_dict(),
+            queue_name=data.get("queue_name"),
+            skip_weekends=bool(data.get("skip_weekends")),
+            skip_holidays=bool(data.get("skip_holidays")),
+        )
         return jsonify({"id": schedule_id})
 
     @app.post("/api/schedules/<int:schedule_id>/toggle")
@@ -753,6 +1052,58 @@ def create_app() -> Flask:
     def delete_schedule_route(schedule_id: int) -> Response:
         db.delete_schedule(schedule_id)
         return jsonify({"deleted": schedule_id})
+
+    @app.get("/api/holidays")
+    def list_holidays_route() -> Response:
+        return jsonify(db.list_holidays())
+
+    @app.post("/api/holidays")
+    def add_holiday_route() -> Response:
+        data = request.get_json(force=True) or {}
+        date = (data.get("date") or "").strip()
+        if not date:
+            return jsonify({"error": "date required"}), 400
+        try:
+            datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            return jsonify({"error": "date must be YYYY-MM-DD"}), 400
+        db.add_holiday(date, (data.get("name") or "").strip() or None)
+        return jsonify({"date": date})
+
+    @app.delete("/api/holidays/<date>")
+    def delete_holiday_route(date: str) -> Response:
+        db.delete_holiday(date)
+        return jsonify({"deleted": date})
+
+    @app.get("/api/notifications")
+    def get_notification_settings_route() -> Response:
+        return jsonify(db.get_notification_settings())
+
+    @app.post("/api/notifications")
+    def set_notification_settings_route() -> Response:
+        data = request.get_json(force=True) or {}
+        db.set_notification_settings(
+            enabled=bool(data.get("enabled")),
+            smtp_host=data.get("smtp_host") or None,
+            smtp_port=int(data.get("smtp_port") or 587),
+            use_tls=bool(data.get("use_tls", True)),
+            username=data.get("username") or None,
+            from_addr=data.get("from_addr") or None,
+            to_addr=data.get("to_addr") or None,
+            credential_name=data.get("credential_name") or None,
+        )
+        return jsonify(db.get_notification_settings())
+
+    @app.post("/api/notifications/test")
+    def send_test_notification_route() -> Response:
+        try:
+            db.send_notification_email(
+                "uiflow: Testbenachrichtigung",
+                "Falls diese E-Mail ankommt, ist die Konfiguration für Fehlerbenachrichtigungen korrekt.",
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced to the admin testing their SMTP config
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"sent": True})
 
     @app.get("/api/screenshot")
     def get_screenshot() -> Response:

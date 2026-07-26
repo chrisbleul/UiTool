@@ -162,6 +162,33 @@ def test_operator_can_write_workflows_but_not_manage_users_or_credentials(multiu
     assert client.post("/api/globals", json={"name": "x", "value": "1"}).status_code == 403
 
 
+def test_audit_log_endpoint_requires_admin_in_multiuser_mode(multiuser_app):
+    viewer = multiuser_app.test_client()
+    _login(viewer, "view1", "viewpass")
+    assert viewer.get("/api/audit-log").status_code == 403
+
+    operator = multiuser_app.test_client()
+    _login(operator, "op1", "oppass")
+    assert operator.get("/api/audit-log").status_code == 403
+
+    admin = multiuser_app.test_client()
+    _login(admin, "admin1", "adminpass")
+    assert admin.get("/api/audit-log").status_code == 200
+
+
+def test_audit_log_records_the_acting_username_and_role(multiuser_app):
+    admin = multiuser_app.test_client()
+    _login(admin, "admin1", "adminpass")
+
+    admin.post("/api/globals", json={"name": "x", "value": "1"})
+
+    entries = admin.get("/api/audit-log").get_json()
+    entry = next(e for e in entries if e["action"] == "POST /api/globals")
+    assert entry["username"] == "admin1"
+    assert entry["role"] == "admin"
+    assert entry["status_code"] == 200
+
+
 def test_admin_can_manage_users(multiuser_app):
     client = multiuser_app.test_client()
     _login(client, "admin1", "adminpass")
@@ -242,6 +269,200 @@ def _workflow(name: str, url: str) -> dict:
     return {"name": name, "backend": "web", "steps": [{"action": "navigate", "url": url}]}
 
 
+# --- granular folder permissions (see studio/app.py's _effective_role) -------
+
+
+def test_a_user_with_no_folder_grants_is_unaffected_by_the_feature(multiuser_app):
+    # op1 has zero folder_permissions rows - their global "operator" role
+    # must apply everywhere exactly as before this feature existed, in any
+    # folder or none at all.
+    client = multiuser_app.test_client()
+    _login(client, "op1", "oppass")
+
+    assert client.post("/api/workflows/Rechnungswesen/invoice", json=_workflow("invoice", "https://a")).status_code == 200
+    assert client.post("/api/workflows/top_level", json=_workflow("top_level", "https://a")).status_code == 200
+
+
+def test_a_folder_grant_restricts_access_outside_that_folder(multiuser_app):
+    db.set_folder_permission("op1", "Rechnungswesen", "operator")
+    client = multiuser_app.test_client()
+    _login(client, "op1", "oppass")
+
+    # inside the granted folder: works, at operator level
+    assert client.post("/api/workflows/Rechnungswesen/invoice", json=_workflow("invoice", "https://a")).status_code == 200
+    # outside it: denied, even though op1's *global* role is operator
+    res = client.post("/api/workflows/Personal/mahnung", json=_workflow("mahnung", "https://b"))
+    assert res.status_code == 403
+    res = client.post("/api/workflows/top_level", json=_workflow("top_level", "https://b"))
+    assert res.status_code == 403
+
+
+def test_a_folder_grant_can_be_more_restrictive_than_the_global_role(multiuser_app):
+    # op1 is a global operator, but only a *viewer* inside Rechnungswesen -
+    # a folder grant can narrow access, not just widen it.
+    db.set_folder_permission("op1", "Rechnungswesen", "viewer")
+    admin = multiuser_app.test_client()
+    _login(admin, "admin1", "adminpass")
+    admin.post("/api/workflows/Rechnungswesen/invoice", json=_workflow("invoice", "https://a"))
+
+    client = multiuser_app.test_client()
+    _login(client, "op1", "oppass")
+
+    assert client.get("/api/workflows/Rechnungswesen/invoice").status_code == 200
+    res = client.post("/api/workflows/Rechnungswesen/invoice", json=_workflow("invoice", "https://b"))
+    assert res.status_code == 403
+
+
+def test_a_folder_grant_can_widen_a_viewers_access(multiuser_app):
+    # view1 is a global viewer, but an operator inside Rechnungswesen specifically.
+    db.set_folder_permission("view1", "Rechnungswesen", "operator")
+    client = multiuser_app.test_client()
+    _login(client, "view1", "viewpass")
+
+    assert client.post("/api/workflows/Rechnungswesen/invoice", json=_workflow("invoice", "https://a")).status_code == 200
+    # still just a viewer everywhere else
+    res = client.post("/api/workflows/top_level", json=_workflow("top_level", "https://b"))
+    assert res.status_code == 403
+
+
+def test_a_grant_on_a_parent_folder_covers_a_nested_subfolder(multiuser_app):
+    db.set_folder_permission("op1", "Rechnungswesen", "operator")
+    client = multiuser_app.test_client()
+    _login(client, "op1", "oppass")
+
+    res = client.post(
+        "/api/workflows/Rechnungswesen/Mahnwesen/erste_mahnung", json=_workflow("erste_mahnung", "https://a")
+    )
+
+    assert res.status_code == 200
+
+
+def test_the_most_specific_grant_wins_over_a_parent_folder_grant(multiuser_app):
+    db.set_folder_permission("op1", "Rechnungswesen", "viewer")
+    db.set_folder_permission("op1", "Rechnungswesen/Mahnwesen", "operator")
+    client = multiuser_app.test_client()
+    _login(client, "op1", "oppass")
+
+    # the more specific grant (operator) applies, not the parent's (viewer)
+    res = client.post(
+        "/api/workflows/Rechnungswesen/Mahnwesen/erste_mahnung", json=_workflow("erste_mahnung", "https://a")
+    )
+    assert res.status_code == 200
+    # a sibling folder still only has the parent's grant
+    res = client.post("/api/workflows/Rechnungswesen/other/x", json=_workflow("x", "https://a"))
+    assert res.status_code == 403
+
+
+def test_a_folder_scoped_user_needs_an_explicit_root_grant_for_top_level_workflows(multiuser_app):
+    db.set_folder_permission("op1", "Rechnungswesen", "operator")
+    client = multiuser_app.test_client()
+    _login(client, "op1", "oppass")
+
+    res = client.post("/api/workflows/top_level", json=_workflow("top_level", "https://a"))
+    assert res.status_code == 403
+
+    db.set_folder_permission("op1", "", "viewer")
+    assert client.get("/api/workflows/top_level").status_code == 404  # readable now, just doesn't exist yet
+
+
+def test_folder_scoping_applies_to_api_run_based_on_the_payload_name(multiuser_app):
+    db.set_folder_permission("op1", "Rechnungswesen", "operator")
+    client = multiuser_app.test_client()
+    _login(client, "op1", "oppass")
+
+    res = client.post("/api/run", json=_workflow("Rechnungswesen/invoice", "https://a"))
+    assert res.status_code == 200
+
+    res = client.post("/api/run", json=_workflow("Personal/mahnung", "https://a"))
+    assert res.status_code == 403
+
+
+def test_workflow_list_is_not_folder_filtered(multiuser_app):
+    # deliberate scope limit (see _workflow_name_from_request's docstring):
+    # the bare list endpoint shows every name regardless of folder grants.
+    admin = multiuser_app.test_client()
+    _login(admin, "admin1", "adminpass")
+    admin.post("/api/workflows/Rechnungswesen/invoice", json=_workflow("invoice", "https://a"))
+    admin.post("/api/workflows/Personal/mahnung", json=_workflow("mahnung", "https://a"))
+    db.set_folder_permission("op1", "Rechnungswesen", "operator")
+
+    client = multiuser_app.test_client()
+    _login(client, "op1", "oppass")
+
+    names = client.get("/api/workflows").get_json()
+    assert set(names) == {"Rechnungswesen/invoice", "Personal/mahnung"}
+
+
+def test_folder_permissions_never_restrict_an_admin(multiuser_app):
+    # granting an admin a folder permission is a strange thing to do, but
+    # must not lock them out of everything else - see _effective_role.
+    db.set_folder_permission("admin1", "Rechnungswesen", "viewer")
+    client = multiuser_app.test_client()
+    _login(client, "admin1", "adminpass")
+
+    res = client.post("/api/workflows/Personal/mahnung", json=_workflow("mahnung", "https://a"))
+    assert res.status_code == 200
+
+
+def test_deleting_a_user_removes_their_folder_permissions(multiuser_app):
+    db.set_folder_permission("op1", "Rechnungswesen", "operator")
+    admin = multiuser_app.test_client()
+    _login(admin, "admin1", "adminpass")
+
+    admin.delete("/api/users/op1")
+
+    assert db.list_folder_permissions("op1") == []
+
+
+def test_folder_permissions_endpoint_crud_and_admin_gating(multiuser_app):
+    operator = multiuser_app.test_client()
+    _login(operator, "op1", "oppass")
+    assert operator.get("/api/folder-permissions").status_code == 403
+    assert operator.post("/api/folder-permissions", json={}).status_code == 403
+
+    admin = multiuser_app.test_client()
+    _login(admin, "admin1", "adminpass")
+
+    res = admin.post("/api/folder-permissions", json={"username": "op1", "folder": "Rechnungswesen", "role": "viewer"})
+    assert res.status_code == 200
+
+    grants = admin.get("/api/folder-permissions?username=op1").get_json()
+    assert grants == [{"id": grants[0]["id"], "username": "op1", "folder": "Rechnungswesen", "role": "viewer"}]
+
+    res = admin.delete("/api/folder-permissions/op1/Rechnungswesen")
+    assert res.status_code == 200
+    assert admin.get("/api/folder-permissions?username=op1").get_json() == []
+
+
+def test_folder_permissions_endpoint_uses_a_token_for_the_root_folder(multiuser_app):
+    admin = multiuser_app.test_client()
+    _login(admin, "admin1", "adminpass")
+    admin.post("/api/folder-permissions", json={"username": "op1", "folder": "", "role": "viewer"})
+
+    res = admin.delete("/api/folder-permissions/op1/_root_")
+
+    assert res.status_code == 200
+    assert admin.get("/api/folder-permissions?username=op1").get_json() == []
+
+
+def test_folder_permissions_endpoint_rejects_an_unknown_username(multiuser_app):
+    admin = multiuser_app.test_client()
+    _login(admin, "admin1", "adminpass")
+
+    res = admin.post("/api/folder-permissions", json={"username": "nope", "folder": "A", "role": "viewer"})
+
+    assert res.status_code == 400
+
+
+def test_folder_permissions_endpoint_rejects_an_unknown_role(multiuser_app):
+    admin = multiuser_app.test_client()
+    _login(admin, "admin1", "adminpass")
+
+    res = admin.post("/api/folder-permissions", json={"username": "op1", "folder": "A", "role": "superadmin"})
+
+    assert res.status_code == 400
+
+
 def test_api_run_snapshots_referenced_sub_workflows_into_the_job(client):
     client.post(
         "/api/workflows/teilprozess",
@@ -258,6 +479,78 @@ def test_api_run_snapshots_referenced_sub_workflows_into_the_job(client):
 
     detail = client.get(f"/api/jobs/{job_id}").get_json()
     assert detail["sub_workflows"]["teilprozess"]["steps"] == [{"action": "navigate", "url": "sub"}]
+
+
+def test_validate_endpoint_reports_success_for_a_valid_workflow(client):
+    workflow = _workflow("demo", "https://x")
+
+    res = client.post("/api/validate", json=workflow)
+
+    assert res.status_code == 200
+    data = res.get_json()
+    assert data["success"] is True
+    assert isinstance(data["log"], list) and len(data["log"]) > 0
+
+
+def test_validate_endpoint_reports_a_step_error_with_its_index(client):
+    workflow = {
+        "name": "demo",
+        "backend": "web",
+        "steps": [{"action": "if", "condition": "nicht_deklariert == 1", "then": []}],
+    }
+
+    res = client.post("/api/validate", json=workflow)
+
+    data = res.get_json()
+    assert data["success"] is False
+    assert data["step_index"] == 1
+    assert "nicht_deklariert" in data["error"]
+
+
+def test_validate_endpoint_rejects_a_malformed_workflow(client):
+    res = client.post("/api/validate", json={"backend": "not-a-real-backend", "steps": []})
+
+    assert res.status_code == 400
+    assert res.get_json()["success"] is False
+
+
+def test_validate_endpoint_never_sends_a_real_email(client, monkeypatch):
+    def _boom(**kwargs):
+        raise AssertionError("must not send a real e-mail from /api/validate")
+
+    monkeypatch.setattr("uiflow.email_client.send_email", _boom)
+    workflow = {
+        "name": "demo",
+        "backend": "web",
+        "steps": [{"action": "send_email", "to": "a@x.de", "subject": "s", "body": "b"}],
+    }
+
+    res = client.post("/api/validate", json=workflow)
+
+    assert res.get_json()["success"] is True
+
+
+def test_validate_endpoint_does_not_create_a_job(client):
+    client.post("/api/validate", json=_workflow("demo", "https://x"))
+
+    assert client.get("/api/jobs").get_json() == []
+
+
+def test_validate_endpoint_is_not_recorded_in_the_audit_log(client):
+    client.post("/api/validate", json=_workflow("demo", "https://x"))
+
+    entries = client.get("/api/audit-log").get_json()
+    assert not any(e["action"] == "POST /api/validate" for e in entries)
+
+
+def test_validate_endpoint_reachable_by_a_viewer_in_multiuser_mode(multiuser_app):
+    viewer = multiuser_app.test_client()
+    _login(viewer, "view1", "viewpass")
+
+    res = viewer.post("/api/validate", json=_workflow("demo", "https://x"))
+
+    assert res.status_code == 200
+    assert res.get_json()["success"] is True
 
 
 def test_worker_claim_endpoint_claims_the_oldest_queued_job(client):
@@ -336,6 +629,24 @@ def test_worker_job_finish_endpoint_marks_the_job_done(client):
     assert detail["error_message"] == "boom"
 
 
+def test_worker_job_finish_endpoint_notifies_on_error_for_a_remote_worker(client, monkeypatch):
+    # A remote worker's own RemoteStore.notify_job_failed is a no-op (see its
+    # docstring) - the server has to do this itself when it handles a remote
+    # worker's finish call, which is exactly what this endpoint is.
+    captured = {}
+    monkeypatch.setattr("uiflow.email_client.send_email", lambda **kwargs: captured.update(kwargs))
+    client.post(
+        "/api/notifications",
+        json={"enabled": True, "smtp_host": "smtp.example.com", "smtp_port": 587, "to_addr": "ops@example.com"},
+    )
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+
+    client.post(f"/api/worker/jobs/{job_id}/finish", json={"status": "error", "error_message": "boom"})
+
+    assert captured["to"] == "ops@example.com"
+    assert "boom" in captured["body"]
+
+
 def test_worker_globals_endpoint_matches_the_studio_globals(client):
     client.post("/api/globals", json={"name": "basis_url", "value": "https://intern"})
 
@@ -405,6 +716,130 @@ def test_worker_api_requires_at_least_operator_in_multiuser_mode(multiuser_app):
     operator = multiuser_app.test_client()
     _login(operator, "op1", "oppass")
     assert operator.post("/api/worker/claim", json={"worker_id": "w"}).status_code == 200
+
+
+# --- human-in-the-loop approvals (request_approval step + Action Center) -----
+
+
+def test_worker_create_approval_request_endpoint_returns_an_id(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+
+    res = client.post(
+        f"/api/worker/jobs/{job_id}/approval_requests", json={"title": "Rechnung freigeben", "message": "Details"}
+    )
+
+    assert res.status_code == 200
+    assert isinstance(res.get_json()["id"], int)
+
+
+def test_worker_get_approval_decision_endpoint_returns_null_while_pending(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+    request_id = client.post(
+        f"/api/worker/jobs/{job_id}/approval_requests", json={"title": "x", "message": ""}
+    ).get_json()["id"]
+
+    res = client.get(f"/api/worker/approval_requests/{request_id}")
+
+    assert res.status_code == 200
+    assert res.get_json() is None
+
+
+def test_worker_get_approval_decision_endpoint_returns_the_decision_once_decided(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+    request_id = client.post(
+        f"/api/worker/jobs/{job_id}/approval_requests", json={"title": "x", "message": ""}
+    ).get_json()["id"]
+    client.post(f"/api/actions/{request_id}/decide", json={"approved": True, "comment": "ok"})
+
+    res = client.get(f"/api/worker/approval_requests/{request_id}")
+
+    decision = res.get_json()
+    assert decision["approved"] is True
+    assert decision["comment"] == "ok"
+    assert decision["decided_by"] is None
+    assert decision["decided_at"]
+
+
+def test_worker_cancel_approval_request_endpoint_marks_it_cancelled(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+    request_id = client.post(
+        f"/api/worker/jobs/{job_id}/approval_requests", json={"title": "x", "message": ""}
+    ).get_json()["id"]
+
+    res = client.post(f"/api/worker/approval_requests/{request_id}/cancel")
+
+    assert res.status_code == 200
+    # no longer pending, so it drops out of the Action Center's default listing
+    assert client.get("/api/actions").get_json() == []
+
+
+def test_list_actions_endpoint_returns_only_pending_requests(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+    pending = client.post(
+        f"/api/worker/jobs/{job_id}/approval_requests", json={"title": "wartet", "message": ""}
+    ).get_json()["id"]
+    decided = client.post(
+        f"/api/worker/jobs/{job_id}/approval_requests", json={"title": "erledigt", "message": ""}
+    ).get_json()["id"]
+    client.post(f"/api/actions/{decided}/decide", json={"approved": True})
+
+    actions = client.get("/api/actions").get_json()
+
+    assert [a["id"] for a in actions] == [pending]
+    assert actions[0]["title"] == "wartet"
+    assert actions[0]["job_id"] == job_id
+
+
+def test_decide_action_endpoint_requires_a_boolean_approved(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+    request_id = client.post(
+        f"/api/worker/jobs/{job_id}/approval_requests", json={"title": "x", "message": ""}
+    ).get_json()["id"]
+
+    res = client.post(f"/api/actions/{request_id}/decide", json={"comment": "hm"})
+
+    assert res.status_code == 400
+
+
+def test_decide_action_endpoint_returns_404_for_an_already_decided_request(client):
+    job_id = client.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+    request_id = client.post(
+        f"/api/worker/jobs/{job_id}/approval_requests", json={"title": "x", "message": ""}
+    ).get_json()["id"]
+    client.post(f"/api/actions/{request_id}/decide", json={"approved": True})
+
+    res = client.post(f"/api/actions/{request_id}/decide", json={"approved": False})
+
+    assert res.status_code == 404
+
+
+def test_decide_action_endpoint_records_the_deciding_username_in_multiuser_mode(multiuser_app):
+    operator = multiuser_app.test_client()
+    _login(operator, "op1", "oppass")
+    job_id = operator.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+    request_id = operator.post(
+        f"/api/worker/jobs/{job_id}/approval_requests", json={"title": "x", "message": ""}
+    ).get_json()["id"]
+
+    operator.post(f"/api/actions/{request_id}/decide", json={"approved": True})
+
+    decision = db.get_approval_decision(request_id)
+    assert decision["decided_by"] == "op1"
+
+
+def test_actions_list_is_readable_by_a_viewer_but_deciding_needs_at_least_operator(multiuser_app):
+    operator = multiuser_app.test_client()
+    _login(operator, "op1", "oppass")
+    job_id = operator.post("/api/run", json=_workflow("x", "https://a")).get_json()["job_id"]
+    request_id = operator.post(
+        f"/api/worker/jobs/{job_id}/approval_requests", json={"title": "x", "message": ""}
+    ).get_json()["id"]
+
+    viewer = multiuser_app.test_client()
+    _login(viewer, "view1", "viewpass")
+
+    assert viewer.get("/api/actions").status_code == 200
+    assert viewer.post(f"/api/actions/{request_id}/decide", json={"approved": True}).status_code == 403
 
 
 def test_inspect_web_endpoint_reports_match_count(client, monkeypatch):
@@ -564,6 +999,183 @@ def test_overwrite_false_still_creates_a_workflow_that_does_not_exist(client):
     assert client.get("/api/workflows/fresh").status_code == 200
 
 
+def test_first_save_of_a_new_workflow_creates_no_version(client):
+    client.post("/api/workflows/report", json=_workflow("report", "https://original"))
+
+    assert client.get("/api/workflows/report/versions").get_json() == []
+
+
+def test_overwriting_a_workflow_archives_the_previous_content_as_a_version(client):
+    client.post("/api/workflows/report", json=_workflow("report", "https://original"))
+    client.post("/api/workflows/report", json=_workflow("report", "https://updated"))
+
+    versions = client.get("/api/workflows/report/versions").get_json()
+    assert len(versions) == 1
+    version = client.get(f"/api/workflows/report/versions/{versions[0]['id']}").get_json()
+    assert "https://original" in version["content_yaml"]
+    # the live file is the new content, not duplicated into the version list
+    assert client.get("/api/workflows/report").get_json()["steps"][0]["url"] == "https://updated"
+
+
+def test_multiple_saves_produce_newest_first_version_history(client):
+    client.post("/api/workflows/report", json=_workflow("report", "https://v1"))
+    client.post("/api/workflows/report", json=_workflow("report", "https://v2"))
+    client.post("/api/workflows/report", json=_workflow("report", "https://v3"))
+
+    versions = client.get("/api/workflows/report/versions").get_json()
+    assert len(versions) == 2  # v1 and v2 were archived, v3 is the live file
+    contents = [client.get(f"/api/workflows/report/versions/{v['id']}").get_json()["content_yaml"] for v in versions]
+    assert "https://v2" in contents[0]  # newest archived version first
+    assert "https://v1" in contents[1]
+
+
+def test_restoring_a_version_writes_it_back_and_archives_the_pre_restore_state(client):
+    client.post("/api/workflows/report", json=_workflow("report", "https://v1"))
+    client.post("/api/workflows/report", json=_workflow("report", "https://v2"))
+    [only_version] = client.get("/api/workflows/report/versions").get_json()
+
+    res = client.post(f"/api/workflows/report/versions/{only_version['id']}/restore")
+
+    assert res.status_code == 200
+    assert client.get("/api/workflows/report").get_json()["steps"][0]["url"] == "https://v1"
+    # the state right before the restore (v2) must not be lost either
+    versions = client.get("/api/workflows/report/versions").get_json()
+    assert len(versions) == 2
+    contents = [client.get(f"/api/workflows/report/versions/{v['id']}").get_json()["content_yaml"] for v in versions]
+    assert any("https://v2" in c for c in contents)
+
+
+def test_restore_endpoint_rejects_a_version_belonging_to_a_different_workflow(client):
+    client.post("/api/workflows/report", json=_workflow("report", "https://v1"))
+    client.post("/api/workflows/report", json=_workflow("report", "https://v2"))
+    [version] = client.get("/api/workflows/report/versions").get_json()
+    client.post("/api/workflows/other", json=_workflow("other", "https://x"))
+
+    res = client.post(f"/api/workflows/other/versions/{version['id']}/restore")
+
+    assert res.status_code == 404
+
+
+def test_deleting_a_workflow_also_deletes_its_version_history(client):
+    client.post("/api/workflows/report", json=_workflow("report", "https://v1"))
+    client.post("/api/workflows/report", json=_workflow("report", "https://v2"))
+
+    client.delete("/api/workflows/report")
+
+    # the file is gone, so a version list for it must not error - it's just empty
+    assert client.get("/api/workflows/report/versions").get_json() == []
+
+
+def test_workflow_version_records_the_acting_username(multiuser_app):
+    admin = multiuser_app.test_client()
+    _login(admin, "admin1", "adminpass")
+    admin.post("/api/workflows/report", json=_workflow("report", "https://v1"))
+    admin.post("/api/workflows/report", json=_workflow("report", "https://v2"))
+
+    [version] = admin.get("/api/workflows/report/versions").get_json()
+
+    assert version["saved_by"] == "admin1"
+
+
+# --- workflow folders --------------------------------------------------------
+
+
+def test_folder_qualified_workflow_can_be_saved_and_loaded(client):
+    res = client.post("/api/workflows/Rechnungen/invoice", json=_workflow("invoice", "https://x"))
+    assert res.status_code == 200
+    assert res.get_json()["saved"] == "Rechnungen/invoice"
+
+    detail = client.get("/api/workflows/Rechnungen/invoice").get_json()
+    assert detail["steps"][0]["url"] == "https://x"
+
+
+def test_workflows_list_includes_folder_qualified_names(client):
+    client.post("/api/workflows/top_level", json=_workflow("top_level", "https://a"))
+    client.post("/api/workflows/Rechnungen/invoice", json=_workflow("invoice", "https://b"))
+
+    names = client.get("/api/workflows").get_json()
+
+    assert names == ["Rechnungen/invoice", "top_level"]
+
+
+def test_folder_qualified_workflow_can_be_deleted(client):
+    client.post("/api/workflows/Rechnungen/invoice", json=_workflow("invoice", "https://x"))
+
+    res = client.delete("/api/workflows/Rechnungen/invoice")
+
+    assert res.status_code == 200
+    assert client.get("/api/workflows").get_json() == []
+
+
+def test_deleting_the_last_workflow_in_a_folder_removes_the_empty_folder(client):
+    from uiflow import models
+
+    client.post("/api/workflows/Rechnungen/invoice", json=_workflow("invoice", "https://x"))
+    assert (models.WORKFLOWS_DIR / "Rechnungen").exists()
+
+    client.delete("/api/workflows/Rechnungen/invoice")
+
+    assert not (models.WORKFLOWS_DIR / "Rechnungen").exists()
+    assert models.WORKFLOWS_DIR.exists()  # the top-level directory itself is untouched
+
+
+def test_deleting_one_of_two_workflows_in_a_folder_keeps_the_folder(client):
+    from uiflow import models
+
+    client.post("/api/workflows/Rechnungen/invoice", json=_workflow("invoice", "https://x"))
+    client.post("/api/workflows/Rechnungen/reminder", json=_workflow("reminder", "https://y"))
+
+    client.delete("/api/workflows/Rechnungen/invoice")
+
+    assert (models.WORKFLOWS_DIR / "Rechnungen").exists()
+    assert client.get("/api/workflows").get_json() == ["Rechnungen/reminder"]
+
+
+def test_same_named_workflows_in_different_folders_have_independent_version_history(client):
+    client.post("/api/workflows/Rechnungen/invoice", json=_workflow("invoice", "https://a-v1"))
+    client.post("/api/workflows/Mahnungen/invoice", json=_workflow("invoice", "https://b-v1"))
+
+    client.post("/api/workflows/Rechnungen/invoice", json=_workflow("invoice", "https://a-v2"))
+
+    rechnungen_versions = client.get("/api/workflows/Rechnungen/invoice/versions").get_json()
+    mahnungen_versions = client.get("/api/workflows/Mahnungen/invoice/versions").get_json()
+    assert len(rechnungen_versions) == 1  # only Rechnungen/invoice was overwritten a second time
+    assert len(mahnungen_versions) == 0
+
+    version = client.get(f"/api/workflows/Rechnungen/invoice/versions/{rechnungen_versions[0]['id']}").get_json()
+    assert "https://a-v1" in version["content_yaml"]
+
+
+def test_restoring_a_folder_qualified_version_does_not_leak_into_another_folder(client):
+    client.post("/api/workflows/Rechnungen/invoice", json=_workflow("invoice", "https://v1"))
+    client.post("/api/workflows/Rechnungen/invoice", json=_workflow("invoice", "https://v2"))
+    client.post("/api/workflows/Mahnungen/invoice", json=_workflow("invoice", "https://other"))
+    [version] = client.get("/api/workflows/Rechnungen/invoice/versions").get_json()
+
+    res = client.post(f"/api/workflows/Mahnungen/invoice/versions/{version['id']}/restore")
+
+    assert res.status_code == 404
+    assert client.get("/api/workflows/Mahnungen/invoice").get_json()["steps"][0]["url"] == "https://other"
+
+
+def test_run_workflow_resolves_a_folder_qualified_sub_workflow(client):
+    client.post(
+        "/api/workflows/Bausteine/login",
+        json={"name": "login", "backend": "web", "steps": [{"action": "navigate", "url": "https://sub"}]},
+    )
+    haupt = {
+        "name": "haupt",
+        "backend": "web",
+        "steps": [{"action": "run_workflow", "workflow": "Bausteine/login"}],
+    }
+
+    res = client.post("/api/run", json=haupt)
+    job_id = res.get_json()["job_id"]
+
+    detail = client.get(f"/api/jobs/{job_id}").get_json()
+    assert detail["sub_workflows"]["Bausteine/login"]["steps"] == [{"action": "navigate", "url": "https://sub"}]
+
+
 class _FakeKeyring:
     def __init__(self):
         self.store = {}
@@ -616,6 +1228,48 @@ def test_create_and_list_schedule_via_api(client):
     assert "workflow_json" not in schedule
 
 
+def test_create_schedule_stores_skip_flags_via_api(client):
+    workflow = {"name": "demo", "backend": "web", "steps": []}
+    res = client.post(
+        "/api/schedules",
+        json={
+            "name": "nightly",
+            "cron_expr": "0 2 * * *",
+            "workflow": workflow,
+            "skip_weekends": True,
+            "skip_holidays": True,
+        },
+    )
+
+    schedule_id = res.get_json()["id"]
+    [schedule] = client.get("/api/schedules").get_json()
+    assert schedule["id"] == schedule_id
+    assert schedule["skip_weekends"] == 1
+    assert schedule["skip_holidays"] == 1
+
+
+def test_holidays_endpoint_add_list_and_delete(client):
+    res = client.post("/api/holidays", json={"date": "2026-12-25", "name": "Weihnachten"})
+    assert res.status_code == 200
+    client.post("/api/holidays", json={"date": "2026-01-01"})
+
+    holidays = client.get("/api/holidays").get_json()
+    assert [h["date"] for h in holidays] == ["2026-01-01", "2026-12-25"]
+    assert next(h for h in holidays if h["date"] == "2026-12-25")["name"] == "Weihnachten"
+
+    res = client.delete("/api/holidays/2026-01-01")
+    assert res.status_code == 200
+    assert [h["date"] for h in client.get("/api/holidays").get_json()] == ["2026-12-25"]
+
+
+def test_holidays_endpoint_requires_a_date(client):
+    assert client.post("/api/holidays", json={"name": "x"}).status_code == 400
+
+
+def test_holidays_endpoint_rejects_a_malformed_date(client):
+    assert client.post("/api/holidays", json={"date": "25.12.2026"}).status_code == 400
+
+
 def test_create_schedule_rejects_invalid_cron(client):
     workflow = {"name": "demo", "backend": "web", "steps": []}
     res = client.post("/api/schedules", json={"name": "bad", "cron_expr": "not-a-cron", "workflow": workflow})
@@ -633,6 +1287,76 @@ def test_toggle_and_delete_schedule_via_api(client):
     res = client.delete(f"/api/schedules/{schedule_id}")
     assert res.status_code == 200
     assert client.get("/api/schedules").get_json() == []
+
+
+def test_notifications_endpoint_defaults_to_disabled(client):
+    settings = client.get("/api/notifications").get_json()
+
+    assert settings["enabled"] is False
+    assert settings["smtp_host"] is None
+
+
+def test_notifications_endpoint_stores_settings(client):
+    res = client.post(
+        "/api/notifications",
+        json={
+            "enabled": True,
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 465,
+            "use_tls": False,
+            "username": "bot@example.com",
+            "from_addr": "bot@example.com",
+            "to_addr": "ops@example.com",
+            "credential_name": "smtp_password",
+        },
+    )
+
+    assert res.status_code == 200
+    settings = client.get("/api/notifications").get_json()
+    assert settings["enabled"] is True
+    assert settings["smtp_host"] == "smtp.example.com"
+    assert settings["smtp_port"] == 465
+    assert settings["to_addr"] == "ops@example.com"
+
+
+def test_notifications_test_endpoint_reports_a_clear_error_when_not_configured(client):
+    res = client.post("/api/notifications/test")
+
+    assert res.status_code == 400
+    assert "error" in res.get_json()
+
+
+def test_notifications_test_endpoint_sends_when_configured(client, monkeypatch):
+    captured = {}
+    monkeypatch.setattr("uiflow.email_client.send_email", lambda **kwargs: captured.update(kwargs))
+    client.post(
+        "/api/notifications",
+        json={
+            "enabled": True,
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 587,
+            "use_tls": True,
+            "to_addr": "ops@example.com",
+        },
+    )
+
+    res = client.post("/api/notifications/test")
+
+    assert res.status_code == 200
+    assert res.get_json() == {"sent": True}
+    assert captured["to"] == "ops@example.com"
+    assert "Test" in captured["subject"]
+
+
+def test_notifications_endpoint_requires_admin_in_multiuser_mode(multiuser_app):
+    operator = multiuser_app.test_client()
+    _login(operator, "op1", "oppass")
+    assert operator.get("/api/notifications").status_code == 403
+    assert operator.post("/api/notifications", json={}).status_code == 403
+
+    admin = multiuser_app.test_client()
+    _login(admin, "admin1", "adminpass")
+    assert admin.get("/api/notifications").status_code == 200
 
 
 def test_activities_endpoint_lists_every_action_with_catalog_metadata(client):
@@ -697,6 +1421,53 @@ def test_globals_endpoint_parses_json_values_but_keeps_plain_text(client):
 
 def test_globals_endpoint_requires_a_name(client):
     assert client.post("/api/globals", json={"name": "", "value": "x"}).status_code == 400
+
+
+def test_audit_log_is_reachable_without_admin_outside_multiuser_mode(client):
+    # _required_role's admin gate is only consulted once db.any_users_exist() -
+    # single-user mode has no accounts to gate by, same as credentials/globals.
+    assert client.get("/api/audit-log").status_code == 200
+
+
+def test_audit_log_records_a_successful_write_with_a_null_identity_in_single_user_mode(client):
+    client.post("/api/globals", json={"name": "x", "value": "1"})
+
+    entries = client.get("/api/audit-log").get_json()
+    entry = next(e for e in entries if e["action"] == "POST /api/globals")
+    assert entry["username"] is None
+    assert entry["role"] is None
+    assert entry["status_code"] == 200
+
+
+def test_audit_log_records_a_failed_attempt_too(client):
+    client.post("/api/globals", json={"name": "", "value": "x"})  # rejected, 400
+
+    entries = client.get("/api/audit-log").get_json()
+    entry = next(e for e in entries if e["action"] == "POST /api/globals")
+    assert entry["status_code"] == 400
+
+
+def test_audit_log_does_not_record_plain_reads(client):
+    client.get("/api/workflows")
+
+    entries = client.get("/api/audit-log").get_json()
+    assert not any(e["action"] == "GET /api/workflows" for e in entries)
+
+
+def test_audit_log_does_not_record_worker_api_traffic(client):
+    client.post("/api/worker/claim", json={"worker_id": "w1"})
+
+    entries = client.get("/api/audit-log").get_json()
+    assert not any("/api/worker/" in e["action"] for e in entries)
+
+
+def test_audit_log_newest_entries_come_first(client):
+    client.post("/api/globals", json={"name": "a", "value": "1"})
+    client.post("/api/globals", json={"name": "b", "value": "2"})
+
+    entries = [e for e in client.get("/api/audit-log").get_json() if e["action"] == "POST /api/globals"]
+    assert len(entries) >= 2
+    assert entries[0]["id"] > entries[1]["id"]
 
 
 def test_globals_endpoint_refuses_a_reserved_namespace_name(client):

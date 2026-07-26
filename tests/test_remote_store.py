@@ -243,3 +243,14 @@ def test_init_db_is_a_no_op(fake):
     store.init_db()
 
     assert fake.calls == []
+
+
+def test_notify_job_failed_is_a_no_op(fake):
+    # The Studio server sends this itself from inside the matching
+    # /api/worker/jobs/<id>/finish call (see studio/app.py) - a remote worker
+    # has no local notification settings/credentials to read.
+    store = RemoteStore("http://host:8787", session=fake)
+
+    store.notify_job_failed("job-1", "demo", "boom")
+
+    assert fake.calls == []

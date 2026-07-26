@@ -136,20 +136,57 @@ class Workflow:
         return result
 
     def save(self, path: str | Path) -> None:
-        Path(path).write_text(
+        path = Path(path)
+        # A folder-qualified name (see workflow_path) needs its subdirectory
+        # to exist before the file can be written into it.
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
             yaml.safe_dump(self.to_dict(), sort_keys=False, allow_unicode=True),
             encoding="utf-8",
         )
 
 
 def workflow_path(name: str) -> Path:
-    """Resolves a workflow *name* to its file in WORKFLOWS_DIR. Any directory
-    part is discarded, so a name coming from a workflow definition can't reach
-    outside that directory."""
-    filename = Path(name).name
+    """Resolves a workflow *name* to its file in WORKFLOWS_DIR - "folder/sub/
+    name" resolves to a real subdirectory there, purely for organizing a
+    large number of workflows (see list_workflows below); a folder carries no
+    other meaning of its own (no separate permissions, no config). Any ".",
+    ".." or empty path segment is silently dropped - not just the *directory*
+    part discarded outright like before folders existed - so a name coming
+    from a workflow definition (run_workflow) or the Studio API can never
+    reach outside WORKFLOWS_DIR, the same guarantee as before, just no longer
+    at the cost of throwing away a legitimate folder segment too."""
+    parts = [p for p in Path(name).parts if p not in ("", ".", "..")]
+    if not parts:
+        parts = ["workflow"]
+    filename = parts[-1]
     if not filename.endswith(".yaml"):
         filename += ".yaml"
-    return WORKFLOWS_DIR / filename
+    candidate = WORKFLOWS_DIR.joinpath(*parts[:-1], filename)
+    try:
+        candidate.relative_to(WORKFLOWS_DIR)
+    except ValueError:
+        # An anchored segment (e.g. a Windows drive letter "C:\\", or a UNC
+        # path) makes joinpath discard WORKFLOWS_DIR entirely instead of
+        # nesting under it, however unlikely a legitimate name is to contain
+        # one - fall back to a flat, sanitized filename directly inside it.
+        candidate = WORKFLOWS_DIR / Path(filename).name
+    return candidate
+
+
+def list_workflows() -> list[str]:
+    """Every workflow's folder-qualified name ("invoice" or "Rechnungen/
+    invoice"), sorted, excluding the Object Repository file (see
+    object_repository.REPOSITORY_FILENAME, which deliberately isn't a
+    workflow - checked by filename alone since it only ever lives directly in
+    WORKFLOWS_DIR, never inside a folder)."""
+    from .object_repository import REPOSITORY_FILENAME
+
+    return sorted(
+        p.relative_to(WORKFLOWS_DIR).with_suffix("").as_posix()
+        for p in WORKFLOWS_DIR.rglob("*.yaml")
+        if p.name != REPOSITORY_FILENAME
+    )
 
 
 def load_workflow_by_name(name: str) -> Workflow:

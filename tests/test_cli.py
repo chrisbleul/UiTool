@@ -82,6 +82,53 @@ def test_create_user_accepts_matching_prompted_passwords(monkeypatch):
     assert check_password_hash(db.get_user("alice")["password_hash"], "s3cret")
 
 
+def test_build_parser_accepts_run_dry_run_flag():
+    parser = cli.build_parser()
+
+    args = parser.parse_args(["run", "workflow.yaml", "--dry-run"])
+
+    assert args.dry_run is True
+    assert args.func is cli.cmd_run
+
+
+def test_build_parser_run_dry_run_defaults_to_false():
+    parser = cli.build_parser()
+
+    args = parser.parse_args(["run", "workflow.yaml"])
+
+    assert args.dry_run is False
+
+
+def test_cmd_run_dry_run_never_touches_a_real_backend(tmp_path, monkeypatch, capsys):
+    from uiflow.models import Step, Workflow
+
+    class _RealWebBackend:
+        def navigate(self, url):
+            raise AssertionError("a dry run must never call the real backend")
+
+    monkeypatch.setattr(cli, "_backend_class", lambda name: _RealWebBackend)
+    workflow_path = tmp_path / "demo.yaml"
+    Workflow(name="demo", backend="web", steps=[Step("navigate", {"url": "https://x"})]).save(workflow_path)
+
+    code = cli.cmd_run(argparse.Namespace(workflow=str(workflow_path), headless=True, dry_run=True))
+
+    assert code == 0
+    assert "Dry-Run erfolgreich" in capsys.readouterr().out
+
+
+def test_cmd_run_dry_run_reports_a_step_error(tmp_path):
+    from uiflow.models import Step, Workflow
+
+    workflow_path = tmp_path / "bad.yaml"
+    Workflow(
+        name="demo", backend="web", steps=[Step("if", {"condition": "nicht_deklariert == 1", "then": []})]
+    ).save(workflow_path)
+
+    code = cli.cmd_run(argparse.Namespace(workflow=str(workflow_path), headless=True, dry_run=True))
+
+    assert code == 1
+
+
 def test_build_parser_accepts_create_user_command():
     parser = cli.build_parser()
 
@@ -117,13 +164,38 @@ def test_build_parser_accepts_worker_remote_flags():
     assert args.func is cli.cmd_worker
 
 
-def _worker_args(worker_id="robot-1", poll_interval=1.0, remote_url=None, remote_username=None, remote_password=None):
+def test_build_parser_worker_heartbeat_interval_defaults_to_15_seconds():
+    parser = cli.build_parser()
+
+    args = parser.parse_args(["worker"])
+
+    assert args.heartbeat_interval == 15.0
+
+
+def test_build_parser_accepts_scheduler_stale_job_timeout():
+    parser = cli.build_parser()
+
+    args = parser.parse_args(["scheduler", "--stale-job-timeout", "45"])
+
+    assert args.stale_job_timeout == 45.0
+    assert args.func is cli.cmd_scheduler
+
+
+def _worker_args(
+    worker_id="robot-1",
+    poll_interval=1.0,
+    remote_url=None,
+    remote_username=None,
+    remote_password=None,
+    heartbeat_interval=15.0,
+):
     return argparse.Namespace(
         worker_id=worker_id,
         poll_interval=poll_interval,
         remote_url=remote_url,
         remote_username=remote_username,
         remote_password=remote_password,
+        heartbeat_interval=heartbeat_interval,
     )
 
 
@@ -134,7 +206,7 @@ def test_cmd_worker_runs_locally_without_remote_url(monkeypatch):
     code = cli.cmd_worker(_worker_args())
 
     assert code == 0
-    assert calls == [{"worker_id": "robot-1", "poll_interval": 1.0}]
+    assert calls == [{"worker_id": "robot-1", "poll_interval": 1.0, "heartbeat_interval": 15.0}]
 
 
 def test_cmd_worker_logs_in_and_passes_a_remote_store_when_remote_url_is_given(monkeypatch):

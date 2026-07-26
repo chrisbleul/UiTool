@@ -202,6 +202,19 @@ die auch ein lokaler Worker letztlich anspricht (`orchestrator/worker.py` kennt 
 austauschbaren `store` — lokal `orchestrator/db.py` direkt, remote `orchestrator/remote_store.py` über
 HTTP; die Ausführungslogik selbst ist in beiden Fällen identisch).
 
+**Heartbeat & automatisches Requeuing bei einem abgestürzten Worker**: jeder laufende Job schreibt
+alle 15s einen Heartbeat (`--heartbeat-interval` bei `uiflow worker`), unabhängig davon, was der
+Workflow gerade tut — auch während er an einem Haltepunkt auf eine Person wartet, damit ein
+wartender Job nicht wie ein abgestürzter aussieht. `uiflow scheduler` prüft bei jedem Durchlauf, ob
+ein `running`-Job seit `--stale-job-timeout` (Standard 90s) keinen Heartbeat mehr geschrieben hat —
+sein Worker ist dann vermutlich abgestürzt (oder seine Maschine ausgefallen). So ein Job wird als
+`error` markiert; ein Queue-Item, das er noch `in_progress` hielt, geht dabei automatisch zurück in
+die Queue (`new`, ohne einen Retry zu verbrauchen — es wurde ja nie tatsächlich versucht-und-
+fehlgeschlagen, sein Worker ist nur verschwunden), sodass ein anderer Worker es aufgreifen kann.
+Ein einzelner, nicht queue-gesteuerter Job wird dabei bewusst **nicht** automatisch neu gestartet —
+seine Seiteneffekte bis zum Absturz sind unbekannt, "als Fehler markieren, damit ihn jemand bewusst
+erneut anstößt" ist die einzige sichere automatische Reaktion.
+
 **Jobs sind jetzt durable**: Status, Zeitstempel und die komplette Log-Historie überleben einen
 Neustart des Studio-Prozesses und sind über die API abrufbar, nicht nur live per SSE:
 
@@ -526,6 +539,29 @@ steps:
     save_as: eingang                # -> Liste von {subject, from, date, body}
 ```
 
+### Genehmigung anfordern (Human-in-the-loop)
+
+```yaml
+steps:
+  - action: request_approval
+    title: "Rechnung {var.betrag}€ freigeben"   # kurz, erlaubt {var.x}/{item.x}
+    message: "Lieferant: {var.lieferant}"        # optional, Kontext für die entscheidende Person
+    save_as: entscheidung           # -> {approved: bool, comment: str, decided_by: str|None}
+
+  - action: if
+    condition: "entscheidung['approved']"
+    then: [{action: assign, variable: status, value: "freigegeben"}]
+    else: [{action: fail, message: "Freigabe abgelehnt: {var.entscheidung}", type: business}]
+```
+
+Pausiert den Workflow-Lauf, bis jemand die Anfrage im Studio-Tab **Aktionen** (dem "Action Center")
+genehmigt oder ablehnt — siehe den eigenen Abschnitt "Action Center" unten. Eine Ablehnung ist selbst
+kein Fehler, sondern nur ein Wert in `save_as`; ob eine Ablehnung den Workflow abbricht (wie im Beispiel
+oben über `fail`) oder nur einen anderen Zweig nimmt, entscheidet der Workflow-Autor über ein normales
+`if`. Nur über den Orchestrator (Studio oder `uiflow worker`) nutzbar — ein bloßes `uiflow run
+workflow.yaml` ohne Orchestrator bricht mit einer klaren Fehlermeldung ab, weil dort niemand da ist, der
+entscheiden könnte.
+
 ## Deklarierte Workflow-Variablen
 
 Bislang entstand jede Workflow-eigene Variable stillschweigend beim ersten `assign` — nirgends stand,
@@ -698,6 +734,13 @@ dem Worker, siehe `--no-worker`); eigenständig läuft er über:
 python -m uiflow.cli scheduler
 ```
 
+**Business-Kalender**: die zwei Häkchen beim Anlegen eines Zeitplans, **Nur an Werktagen** (überspringt
+Samstag/Sonntag) und **Feiertage überspringen** (überspringt Daten aus der weiter unten im selben Tab
+gepflegten, Installations-weiten Feiertagsliste), sorgen dafür, dass ein Cron-Ausdruck allein nicht
+reicht, um z.B. "jeden Werktag um 2 Uhr, außer an Feiertagen" abzubilden. Eine übersprungene Ausführung
+wird nicht verspätet nachgeholt, sobald wieder ein gültiger Tag kommt — sie fällt schlicht aus; die
+nächste reguläre, nicht übersprungene Ausführung zählt ganz normal.
+
 ## Login (optional)
 
 `uiflow studio` läuft standardmäßig ohne Anmeldung — als lokales Single-User-Tool auf `127.0.0.1`.
@@ -737,6 +780,166 @@ dass sich eine Installation versehentlich aussperrt). Solange kein einziger Benu
 verhält sich `uiflow studio` exakt wie zuvor (kein Login oder das einfache `UIFLOW_STUDIO_PASSWORD`-Gate)
 — die Umstellung ist rein additiv und ändert nichts an bestehenden Installationen.
 
+## Audit-Log
+
+Tab **Audit-Log** (nur für Admins sichtbar, siehe Rollen oben) — jeder verändernde API-Aufruf wird
+protokolliert: wer (Benutzername, sofern Multi-User-Modus aktiv), was (`METHODE /api/pfad` — bei
+dieser API praktisch immer selbsterklärend, z.B. `DELETE /api/users/bob`), wann und mit welchem
+HTTP-Status. **Auch abgelehnte Versuche** (401/403/400) werden aufgezeichnet, nicht nur erfolgreiche
+— gerade die sind für ein Audit-Log oft die interessanteren. Lesende Aufrufe (GET) werden bewusst
+nicht protokolliert (zu viel Rauschen, kein Sicherheits-relevantes Ereignis), ebenso wenig der interne
+Worker-Datenverkehr (`/api/worker/*` — Claiming/Heartbeat/Logging, siehe Remote-Worker oben, das wäre
+tausende Einträge pro Job); die Job-Historie unter **Runs** ist dessen eigene, bereits vollständige
+Aufzeichnung. In der Studio-Oberfläche über `GET /api/audit-log?limit=200` abrufbar (Standard: die
+letzten 200 Einträge, neueste zuerst).
+
+## Proaktive Fehlerbenachrichtigung
+
+Tab **Benachrichtigungen** (nur für Admins sichtbar) — verschickt automatisch eine E-Mail, sobald ein
+Job endgültig fehlschlägt (`status: error`, egal ob ein einzelner Workflow-Lauf oder ein Queue-Item,
+das seine Wiederholungen aufgebraucht hat), unabhängig vom Workflow-Inhalt. Anders als ein eigener
+`send_email`-Schritt (den ein Workflow-Autor pro Workflow selbst einbauen müsste) ist das eine
+Installations-weite Einstellung: SMTP-Server/Port/TLS, Absender, Empfänger, und ein Anmeldedaten-Name
+(siehe Tab **Anmeldedaten**), aus dem das SMTP-Passwort nachgeschlagen wird — das Passwort selbst wird
+nirgends in dieser Einstellung eingegeben oder gespeichert. Der Button **Test senden** verschickt sofort
+eine Testnachricht und zeigt einen echten SMTP-Fehler an (z.B. eine falsche Anmeldung), statt ihn erst
+beim nächsten echten Fehlschlag zu bemerken.
+
+Funktioniert unabhängig davon, ob der fehlgeschlagene Job lokal oder über einen Remote-Worker (siehe
+oben) lief: `orchestrator/db.py`s `notify_job_failed()` läuft entweder direkt im lokalen Worker-Prozess
+oder — für einen Remote-Worker, der keinen lokalen Zugriff auf diese Einstellung hätte — im
+Studio-Server selbst, sobald der die passende `/api/worker/jobs/<id>/finish`-Meldung entgegennimmt. Ein
+Fehlschlag beim Versenden selbst (falsches SMTP-Passwort, Netzwerkproblem) lässt den eigentlichen Job
+nicht zusätzlich fehlschlagen — er wird nur als Warnung geloggt.
+
+## Workflow-Versionierung
+
+Jedes **Speichern** über einen bereits bestehenden Workflow archiviert dessen bisherigen Inhalt zuerst
+als neue Version, bevor die Datei überschrieben wird — die lebende YAML-Datei in `workflows/` ist
+selbst immer die neueste Version und wird nicht zusätzlich dupliziert. Über den Verlaufs-Button (🕐,
+neben jedem Workflow im Tab **Workflows**) öffnet sich eine Liste früherer Stände (Zeitstempel,
+anlegende Person sofern Multi-User-Modus aktiv, Inhalt einsehbar über "Inhalt anzeigen") mit einem
+**Wiederherstellen**-Button pro Eintrag. Wiederherstellen ist selbst nur ein weiteres Speichern: der
+Stand unmittelbar davor wird ebenfalls archiviert, geht also nicht verloren, auch wenn man sich beim
+Wiederherstellen "vertut". Pro Workflow werden die letzten 50 Versionen aufgehoben, ältere werden beim
+nächsten Speichern automatisch entfernt; löscht man den Workflow selbst, wird auch sein gesamter
+Verlauf gelöscht (ein Wiederherstellen hätte ohnehin keine Datei mehr, in die es schreiben könnte).
+Bewusst eine einfache eigene Versions-Tabelle statt echtem Git im Hintergrund — kein Diff zwischen zwei
+Ständen, kein Branching, nur linearer Verlauf mit Wiederherstellen.
+
+## Workflow-Ordner
+
+Ein Workflow-Name darf `/` enthalten (z.B. `Rechnungswesen/rechnung_buchen`) — er landet dann als
+echte Unterordner-Struktur in `workflows/` (`workflows/Rechnungswesen/rechnung_buchen.yaml`), rein zur
+Gruppierung bei vielen Workflows. Ein Ordner hat sonst keine eigene Bedeutung: keine eigene
+Konfiguration — nur ein Namensraum (optional lassen sich pro Benutzer trotzdem Rechte daran hängen,
+siehe "Granulare Berechtigungen (Ordner-Rechte)" unten). Einfach beim Speichern (Feld "Workflow-Name" im
+Builder) mit `/` eintragen; im Tab **Workflows** werden Einträge automatisch nach Ordner gruppiert
+angezeigt (mit Kopfzeile pro Ordner, sobald mehr als eine Gruppe existiert), sortiert so, dass alle
+Einträge eines Ordners zusammenbleiben statt durch alphabetisch dazwischenliegende andere Namen
+auseinandergerissen zu werden. Löscht man den letzten Workflow in einem Ordner, wird der leere Ordner
+automatisch mit entfernt. Ein `run_workflow`-Schritt kann einen ordner-qualifizierten Namen genauso
+referenzieren wie einen ohne Ordner. Zwei Workflows mit demselben Namen in unterschiedlichen Ordnern
+(z.B. `Rechnungswesen/mahnung` und `Personal/mahnung`) sind vollständig unabhängig, auch in ihrem
+Verlauf (siehe "Workflow-Versionierung" oben).
+
+`..`- oder leere Pfadsegmente in einem Namen werden beim Auflösen stillschweigend verworfen (nicht der
+gesamte Name wie früher, nur die gefährlichen Teile) — ein Name kann also nie außerhalb von
+`workflows/` auflösen, egal woher er kommt (Studio-API oder ein `run_workflow`-Verweis).
+
+## Granulare Berechtigungen (Ordner-Rechte)
+
+Zusätzlich zu den drei globalen Rollen (siehe "Benutzer & Rollen (RBAC)" oben) lässt sich pro Benutzer
+optional eine feinere Einschränkung *pro Workflow-Ordner* vergeben — im Tab **Benutzer** unter dem
+Abschnitt "Ordner-Berechtigungen" (nur für Admins sichtbar). Das Modell ist bewusst **opt-in und
+additiv**:
+
+- Ein Benutzer **ohne** einen einzigen Ordner-Eintrag ist von dieser Funktion komplett unberührt — seine
+  globale Rolle gilt wie gewohnt überall, nichts ändert sich an bestehenden Installationen.
+- Sobald ein Benutzer **irgendeinen** Ordner-Eintrag hat, wechselt er in einen ordner-beschränkten
+  Modus: Zugriff auf einen konkreten Workflow gibt es nur noch dort, wo ein passender Eintrag existiert
+  (der Ordner selbst oder ein übergeordneter Ordner — ein Eintrag auf `Rechnungswesen` deckt automatisch
+  auch `Rechnungswesen/Mahnwesen` mit ab, der spezifischste Treffer gewinnt). Für jeden nicht getroffenen
+  Ordner (auch die oberste Ebene, dafür extra ein Eintrag mit leerem Ordnernamen nötig) ist der Zugriff
+  **verweigert**, unabhängig von der globalen Rolle.
+- Ein Ordner-Eintrag kann die globale Rolle sowohl **einschränken** (z.B. global `operator`, aber nur
+  `viewer` in einem bestimmten Ordner) als auch **erweitern** (z.B. global `viewer`, aber `operator` in
+  einem bestimmten Ordner).
+- **Admins sind nie betroffen** — ein Admin-Konto behält immer vollen Zugriff, egal welche Ordner-Einträge
+  für es existieren.
+
+Gilt für alle Endpunkte, die einen konkreten Workflow-Namen ansprechen (Öffnen, Speichern, Löschen,
+Ausführen über `/api/run`, Versionsverlauf samt Wiederherstellen). Die reine Auflistung
+(`GET /api/workflows`, ohne Namen) ist bewusst **nicht** gefiltert — ein ordner-beschränkter Benutzer
+sieht also weiterhin alle Namen in der Liste, bekommt aber beim Öffnen eines nicht freigegebenen
+Workflows eine Ablehnung. Löscht man einen Benutzer, werden auch alle seine Ordner-Einträge automatisch
+mit entfernt.
+
+Bewusst (noch) **nicht** umgesetzt, obwohl in der ursprünglichen Idee "pro Workflow/Ordner/**Queue**"
+genannt: Queues haben keine eigenen granularen Rechte, nur Workflow-Ordner. Auch keine
+Wildcard-/Glob-Muster für Ordnernamen — nur echte Ordner-Hierarchie (Elternordner deckt Kinder ab).
+
+## Action Center (Human-in-the-loop-Genehmigungen)
+
+Ein `request_approval`-Schritt (siehe "Genehmigung anfordern" oben) pausiert seinen Workflow-Lauf, bis
+eine Person im Studio-Tab **Aktionen** entscheidet — bewusst **asynchron**: anders als ein Haltepunkt
+(siehe Builder), der direkt am Studio hängen bleibt und nur von der Person fortgesetzt werden kann, die
+den Lauf gerade vor sich hat, kann eine Genehmigungsanfrage von *jeder* berechtigten Person zu einem
+späteren Zeitpunkt entschieden werden — auch jemand anderem als der Person, die den Lauf gestartet hat.
+Sehen kann die Liste offener Anfragen jeder angemeldete Nutzer, entscheiden (Genehmigen/Ablehnen, mit
+optionalem Kommentar) erfordert mindestens die Rolle **Operator**. Genehmigt/abgelehnt landet als
+`{approved, comment, decided_by, decided_at}` in der Variable aus `save_as` — eine Ablehnung lässt den
+Job selbst nicht fehlschlagen (siehe oben), sie ist nur ein Wert, auf den der Workflow reagiert.
+
+Technisch blockiert der wartende Workflow-Lauf seinen Worker-Thread (Polling, ähnlich einem Haltepunkt-
+Pause), verbraucht dabei aber keine CPU-Zeit und wird durch den bestehenden Heartbeat-Mechanismus (siehe
+"Heartbeat & automatisches Requeuing" oben) nicht als abgestürzt erkannt — der Heartbeat läuft in einem
+eigenen Thread unabhängig vom wartenden Schritt weiter. Funktioniert auch mit einem Remote-Worker (siehe
+oben): die Anfrage wird über dieselbe `/api/worker/*`-API erstellt/abgefragt wie andere
+Orchestrator-Zustände. Bricht man den Lauf während des Wartens ab (Button **Stoppen**), wird die
+Anfrage automatisch als storniert markiert und verschwindet aus der Liste offener Anfragen, statt dort
+verwaist liegen zu bleiben.
+
+Im **Dry-Run-Modus** (siehe unten) wird ein `request_approval`-Schritt übersprungen und automatisch als
+genehmigt behandelt, statt wirklich auf eine Person zu warten — eine Validierung darf nicht hängen bleiben.
+
+Bewusst **nicht** umgesetzt: keine sichtbare Historie bereits entschiedener Anfragen im Action Center
+(nur die aktuell offenen), keine Eskalation/Erinnerung, wenn eine Anfrage lange offen bleibt, und keine
+Mehrfach-Genehmigung ("zwei von drei müssen zustimmen") — eine Anfrage kennt nur eine einzige, finale
+Entscheidung.
+
+## Dry-Run-Modus (Workflows validieren ohne echte Ausführung)
+
+Der Button **Validieren** im Builder (neben "Flowchart") führt den aktuell geöffneten (auch
+ungespeicherten) Workflow durch dieselbe Engine wie ein echter Lauf — Variablen, Kontrollfluss,
+Python-Ausdrücke in `if`/`switch`/`assign` funktionieren identisch —, aber gegen ein
+`DryRunBackend`: jede UI-Aktion (`click`, `type`, `navigate`, ...) wird zu einer No-Operation, die nur
+loggt, was sie täte, statt einen echten Browser oder eine echte Desktop-Anwendung anzufassen. Fängt
+damit genau die Fehler ab, die sonst erst beim echten Lauf auffallen würden: Tippfehler in
+Python-Ausdrücken, Verweise auf nie deklarierte Variablen, eine falsch geschriebene Aktion. Läuft
+synchron im Request (keine echte Wartezeit, kein `time.sleep` bei `wait`-Schritten) und landet nicht in
+der Job-Historie oder im Audit-Log — eine Validierung verändert nichts.
+
+Auch die wenigen Engine-Aktionen mit einem echten externen Seiteneffekt werden dabei übersprungen statt
+wirklich ausgeführt: `http_request` (kein echter Netzwerkaufruf), `send_email`/`read_emails` (keine
+echte SMTP-/IMAP-Verbindung), `write_excel` (keine echte Datei geschrieben), `request_approval` (wartet
+nicht wirklich auf eine Person, sondern gilt automatisch als genehmigt, siehe "Action Center" oben) —
+jeweils mit einem neutralen Platzhalter-Ergebnis, damit eine nachfolgende Auswertung von `save_as` nicht
+zusätzlich fehlschlägt. `read_excel`/`read_pdf`/`ocr_image`/`get_credential` laufen dagegen bewusst echt
+(reine lokale Lesevorgänge ohne Seiteneffekt — validiert nebenbei, dass der Dateipfad/Anmeldedaten-Name
+stimmt). Ein `run_workflow`-Schritt validiert den referenzierten Unterprozess automatisch mit, rekursiv.
+
+Auch über die CLI nutzbar, ohne Studio:
+
+```powershell
+python -m uiflow.cli run workflow.yaml --dry-run
+```
+
+Was das nicht fängt: einen falsch geschriebenen **Parameternamen** (z.B. `selectr` statt `selector`) —
+das `DryRunBackend` nimmt jedes Schlüsselwortargument klaglos an, ein echter Backend-Aufruf würde ein
+unbekanntes Argument ablehnen. Ein unbekannter **Aktionsname** wird dagegen erkannt (derselbe "Backend
+hat keine Aktion" wie bei einem echten Lauf).
+
 ## Tests
 
 ```powershell
@@ -754,10 +957,10 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
   direkt zu öffnen — ein Worker auf einer anderen Maschine ohne jeden Datei-Zugriff auf diese Datenbank
   funktioniert damit genauso wie einer auf derselben Maschine. `uiflow scheduler` bleibt bewusst
   serverseitig (er *erzeugt* nur Jobs in derselben Queue, die dann ganz normal von jedem Worker —
-  lokal oder remote — abgeholt werden), ebenso wie Studios eingebetteter Scheduler-Thread. Was bewusst
-  fehlt: kein automatisches Requeuing, wenn ein Remote-Worker mitten in einem Job abstürzt (der Job
-  bleibt `running`, bis er manuell gestoppt oder von Hand erneut eingereiht wird) — dafür bräuchte es
-  ein Heartbeat/Lease-Verfahren, das es heute weder für lokale noch für Remote-Worker gibt.
+  lokal oder remote — abgeholt werden), ebenso wie Studios eingebetteter Scheduler-Thread. Ein
+  abgestürzter Worker (lokal oder remote) wird über den Heartbeat/Sweep-Mechanismus erkannt und sein
+  Job/Queue-Item automatisch abgeräumt bzw. requeued — siehe "Heartbeat & automatisches Requeuing"
+  oben.
 - ~~**Echtes Multi-User-/Rechte-System**~~ — erledigt: `uiflow create-user` legt einzelne Konten mit
   Rollen (`viewer`/`operator`/`admin`) an, siehe "Benutzer & Rollen (RBAC)" oben. Was bewusst fehlt: keine
   Gruppen/Teams, keine fein granularen Rechte pro Workflow oder Queue (nur die drei globalen Rollen), kein
@@ -804,40 +1007,32 @@ gemockten Backend bzw. temporärer SQLite-Datei, ohne echten Browser/Windows-App
 Unten gesammelt, aber noch nicht bewertet oder gegen den tatsächlichen Bedarf geprüft — einfach
 Ideen, was als Nächstes sinnvoll sein könnte. Reihenfolge ist keine Priorität.
 
-- **Worker-Heartbeat & automatisches Requeuing**: stürzt ein Worker (lokal oder remote, siehe oben)
-  mitten in einem Job ab, bleibt der Job für immer auf `running` stehen — niemand markiert ihn als
-  abgebrochen oder reiht ihn erneut ein. Bräuchte einen periodischen Heartbeat pro laufendem Job
-  (`last_heartbeat_at`-Spalte) und einen Sweep, der Jobs ohne aktuellen Heartbeat nach einem Timeout
-  wieder auf `queued` zurücksetzt (oder als `error` markiert, je nach Retry-Semantik).
-- **Granulare Berechtigungen pro Workflow/Ordner/Queue**: RBAC kennt heute nur drei globale Rollen
-  (viewer/operator/admin, siehe "Benutzer & Rollen" oben) — kein "Team A darf nur Workflows in Ordner
-  X sehen/starten". Setzt vermutlich eine Ordner-/Projektstruktur (siehe unten) als Voraussetzung
-  voraus, bevor sich Rechte überhaupt sinnvoll darauf beziehen lassen.
-- **Audit-Log**: wer hat wann welchen Workflow gespeichert, gestartet, gestoppt, ein Credential
-  geändert oder einen Benutzer angelegt? Mit RBAC gibt es jetzt einzelne Konten, aber keine Historie
-  ihrer Aktionen — relevant, sobald mehr als eine Person an derselben Installation arbeitet.
-- **Proaktive Fehlerbenachrichtigung** (E-Mail/Slack/Webhook, wenn ein Job oder Queue-Item endgültig
-  fehlschlägt): heute muss man aktiv die Runs-Ansicht oder `/api/jobs?status=error` abfragen. Die
-  Bausteine (`send_email`-Aktion, `http_request`) existieren im Workflow selbst bereits — hier ginge es
-  um eine Orchestrator-seitige Benachrichtigung, unabhängig vom Workflow-Inhalt.
-- **Workflow-Versionierung**: "Speichern" überschreibt die YAML-Datei ohne Historie — kein Diff
-  zwischen zwei Ständen, kein Zurückrollen auf eine ältere Version direkt im Studio. Ließe sich
-  entweder über echtes Git im Hintergrund lösen oder über eine einfache eigene Versions-Tabelle
-  (ähnlich den Job-Snapshots, die es für einzelne Läufe schon gibt).
-- **Testbarkeit von Workflows**: ein "Dry-Run"-Modus, der Ausdrücke/Variablen/Selektoren gegen einen
-  Fake-Backend validiert, ohne den echten Browser/Desktop anzufassen — würde Tippfehler in Python-
-  Ausdrücken oder fehlende Variablen schon beim Speichern statt erst beim echten Lauf auffangen.
-- **Business-Kalender für Zeitpläne**: Cron-Ausdrücke allein kennen keine Feiertage oder "nur an
-  Werktagen" — ein Zeitplan, der z.B. jeden Monatsersten läuft, feuert damit auch an einem Feiertag
-  oder Wochenende, falls der auf den Ersten fällt.
-- **Human-in-the-loop / Action Center**: ein Schritt-Typ, der auf eine menschliche Entscheidung wartet
-  (z.B. "Rechnung > 10.000€ manuell freigeben") über ein Web-Formular — nicht dasselbe wie ein
-  Haltepunkt, der eine Person direkt am Studio voraussetzt, sondern eine asynchrone Freigabe, die auch
-  jemand anderes später erledigen kann.
-- **Ordner-/Projektstruktur**: Workflows, Queues und Credentials liegen heute alle flach nebeneinander
-  (`workflows/*.yaml`, eine gemeinsame Queue-/Credential-Liste). Ab einer gewissen Anzahl Workflows
-  fehlt eine Gruppierung (Ordner oder Projekte) — auch Voraussetzung für granulare Rechte pro Ordner
-  (siehe oben).
+- ~~**Granulare Berechtigungen pro Workflow/Ordner/Queue**~~ — für Workflow-Ordner erledigt, siehe
+  "Granulare Berechtigungen (Ordner-Rechte)" oben (opt-in pro Benutzer, Ordner-Eintrag kann global
+  einschränken oder erweitern, Admins immer ausgenommen). Was bewusst fehlt: **Queue**-Ebene ist trotz
+  des Namens der Idee nicht abgedeckt (keine granularen Rechte pro Queue, nur pro Workflow-Ordner), und
+  keine Wildcard-/Glob-Muster für Ordnernamen (nur echte Eltern-Kind-Hierarchie).
+- ~~**Proaktive Fehlerbenachrichtigung**~~ — als E-Mail erledigt, siehe "Proaktive
+  Fehlerbenachrichtigung" oben. Was fehlt: Slack- oder Webhook-Kanäle statt/zusätzlich zu E-Mail — die
+  Einstellung kennt aktuell nur SMTP.
+- ~~**Workflow-Versionierung**~~ — erledigt, siehe "Workflow-Versionierung" oben (eigene
+  Versions-Tabelle, kein Git). Was bewusst fehlt: kein Diff zwischen zwei Ständen (nur die volle
+  YAML jeder Version einsehbar), kein Branching — nur linearer Verlauf mit Wiederherstellen.
+- ~~**Testbarkeit von Workflows**~~ — erledigt, siehe "Dry-Run-Modus" oben (Button **Validieren** im
+  Builder, auch per `uiflow run --dry-run`). Was bewusst fehlt: kein echtes Unit-Test-Framework mit
+  Assertions über einzelne Schritte hinweg — nur "läuft der ganze Workflow strukturell durch, ohne
+  Ausdrucks-/Variablenfehler", kein Prüfen eines falsch geschriebenen Parameternamens (siehe oben).
+- ~~**Business-Kalender für Zeitpläne**~~ — erledigt, siehe "Zeitpläne (Scheduling)" oben
+  ("Nur an Werktagen" / "Feiertage überspringen"). Was bewusst fehlt: keine wiederkehrenden Regeln für
+  Feiertage (z.B. "jeder erste Montag im Monat") — nur einzelne, von Hand gepflegte Kalenderdaten.
+- ~~**Human-in-the-loop / Action Center**~~ — erledigt, siehe "Action Center (Human-in-the-loop-
+  Genehmigungen)" oben und den Schritt `request_approval`. Was bewusst fehlt: keine Historie bereits
+  entschiedener Anfragen (nur die aktuell offenen), keine Eskalation/Erinnerung bei lange offenen
+  Anfragen, keine Mehrfach-Genehmigung ("zwei von drei müssen zustimmen").
+- ~~**Ordner-/Projektstruktur**~~ — für Workflows erledigt, siehe "Workflow-Ordner" oben (Name mit
+  `/`, echte Unterordner in `workflows/`, Gruppierung im Tab **Workflows**). Was bewusst fehlt: Queues
+  und Anmeldedaten liegen weiterhin flach (eine gemeinsame Liste je) — Ordner sind reine Namensräume,
+  kein Projekt-Konzept mit eigener Konfiguration oder Mitgliedschaft.
 - **Reporting/Analytics über die Zeit**: die Übersicht zeigt heute eine Momentaufnahme (Erfolgsquote,
   offene Queue-Items). Ein Trend über Zeit (Erfolgsquote pro Woche, durchschnittliche Laufzeit pro
   Workflow, Engpässe in einer Queue) fehlt.

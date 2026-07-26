@@ -15,6 +15,17 @@ let recordingSource = null;
 
 const el = (id) => document.getElementById(id);
 
+// A workflow name may be folder-qualified ("Rechnungen/invoice", see
+// models.workflow_path) - plain encodeURIComponent(name) would escape that
+// "/" as "%2F", which a Flask <path:name> route does not decode back into a
+// segment separator (by design - RFC 3986 leaves that ambiguous, and Flask
+// errs toward not silently reinterpreting it). Encode each segment on its
+// own instead, so the "/" stays a real path separator and everything else
+// (spaces, unicode, ...) is still safely escaped.
+function encodeWorkflowName(name) {
+  return name.split("/").map(encodeURIComponent).join("/");
+}
+
 // --- icons: one consistent, monochrome SVG set (currentColor) instead of
 // mixed emoji, so icon-only controls render identically across platforms ---
 function icon(inner) {
@@ -35,6 +46,7 @@ const ICONS = {
   trash: icon('<path d="M4 7h16"/><path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/><path d="M6 7l1 13a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-13"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>'),
   document: icon('<path d="M7 3h7l4 4v14a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M14 3v4h4"/>'),
   check: icon('<polyline points="5 13 9 17 19 7"/>'),
+  history: icon('<circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 16 14"/>'),
 };
 
 // --- toasts + confirm modal: replace native alert()/confirm(), which break out
@@ -160,7 +172,7 @@ async function loadWorkflowList() {
 }
 
 async function loadWorkflow(name) {
-  const res = await fetch(`/api/workflows/${encodeURIComponent(name)}`);
+  const res = await fetch(`/api/workflows/${encodeWorkflowName(name)}`);
   if (!res.ok) return;
   const data = await res.json();
   el("wf-name").value = data.name;
@@ -1517,7 +1529,7 @@ function currentWorkflowPayload() {
 }
 
 function saveWorkflowAs(name, payload, { overwrite }) {
-  return fetch(`/api/workflows/${encodeURIComponent(name)}?overwrite=${overwrite}`, {
+  return fetch(`/api/workflows/${encodeWorkflowName(name)}?overwrite=${overwrite}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -1671,6 +1683,37 @@ async function runWorkflow() {
   source.onerror = () => {
     source.close();
   };
+}
+
+async function validateWorkflow() {
+  const payload = currentWorkflowPayload();
+
+  el("log-output").textContent = "";
+  el("log-screenshot").classList.add("hidden");
+  el("log-status").textContent = "Validiere...";
+  el("log-status").className = "";
+  el("btn-continue").classList.add("hidden");
+  el("btn-stop").classList.add("hidden");
+  el("log-panel").classList.remove("hidden");
+  clearPausedHighlight();
+  hideVariablesWatch();
+
+  const res = await fetch("/api/validate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  for (const line of data.log || []) appendLog(line);
+  if (data.success) {
+    appendLog(">> Dry-Run erfolgreich - keine Fehler in Ausdrücken/Variablen/Struktur gefunden.");
+    el("log-status").textContent = "Dry-Run erfolgreich";
+    el("log-status").className = "status-success";
+  } else {
+    appendLog("Fehler: " + data.error);
+    el("log-status").textContent = "Dry-Run fehlgeschlagen";
+    el("log-status").className = "status-error";
+  }
 }
 
 async function continueRun() {
@@ -1995,6 +2038,153 @@ async function addUser() {
   toast(`Benutzer "${username}" angelegt.`, "success");
 }
 
+function folderPermissionUrlToken(folder) {
+  return folder === "" ? "_root_" : encodeWorkflowName(folder);
+}
+
+async function renderFolderPermissionsPanel() {
+  const container = el("folder-permissions-list");
+  container.innerHTML = "Lädt...";
+  const res = await fetch("/api/folder-permissions");
+  if (!res.ok) {
+    container.innerHTML = '<p style="color:var(--muted)">Nur für Admins sichtbar.</p>';
+    return;
+  }
+  const grants = await res.json();
+  if (grants.length === 0) {
+    container.innerHTML = '<p style="color:var(--muted)">Noch keine Ordner-Berechtigungen vergeben.</p>';
+    return;
+  }
+  container.innerHTML = "";
+  for (const grant of grants) {
+    const row = document.createElement("div");
+    row.className = "list-row";
+
+    const label = document.createElement("span");
+    label.className = "list-row-name";
+    label.textContent = `${grant.username} — ${grant.folder === "" ? "(oberste Ebene)" : grant.folder}`;
+
+    const meta = document.createElement("span");
+    meta.className = "list-row-meta";
+    meta.textContent = ROLE_LABELS[grant.role] || grant.role;
+
+    const delBtn = document.createElement("button");
+    delBtn.className = "btn-icon danger";
+    delBtn.textContent = "✕";
+    delBtn.title = "Löschen";
+    delBtn.setAttribute("aria-label", `Ordner-Berechtigung für "${grant.username}" löschen`);
+    delBtn.addEventListener("click", async () => {
+      if (!(await confirmDialog(`Ordner-Berechtigung für "${grant.username}" (${grant.folder || "oberste Ebene"}) wirklich löschen?`))) return;
+      await fetch(`/api/folder-permissions/${encodeURIComponent(grant.username)}/${folderPermissionUrlToken(grant.folder)}`, {
+        method: "DELETE",
+      });
+      renderFolderPermissionsPanel();
+      toast("Ordner-Berechtigung gelöscht.", "success");
+    });
+
+    row.append(label, meta, delBtn);
+    container.appendChild(row);
+  }
+}
+
+async function addFolderPermission() {
+  const username = el("folderperm-username").value.trim();
+  const folder = el("folderperm-folder").value.trim().replace(/^\/+|\/+$/g, "");
+  const role = el("folderperm-role").value;
+  if (!username) {
+    toast("Bitte einen Benutzernamen angeben.", "error");
+    return;
+  }
+  const res = await fetch("/api/folder-permissions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, folder, role }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    toast("Hinzufügen fehlgeschlagen: " + (data.error || res.status), "error");
+    return;
+  }
+  el("folderperm-username").value = "";
+  el("folderperm-folder").value = "";
+  await renderFolderPermissionsPanel();
+  toast(`Ordner-Berechtigung für "${username}" gespeichert.`, "success");
+}
+
+async function renderActionsPanel() {
+  const container = el("actions-list");
+  container.innerHTML = "Lädt...";
+  const res = await fetch("/api/actions");
+  if (!res.ok) {
+    container.innerHTML = '<p style="color:var(--muted)">Nur für angemeldete Benutzer sichtbar.</p>';
+    return;
+  }
+  const actions = await res.json();
+  if (actions.length === 0) {
+    container.innerHTML = '<p style="color:var(--muted)">Keine offenen Genehmigungen.</p>';
+    return;
+  }
+  container.innerHTML = "";
+  for (const action of actions) {
+    const row = document.createElement("div");
+    row.className = "list-row action-row";
+
+    const info = document.createElement("div");
+    info.style.flex = "1";
+    info.style.minWidth = "220px";
+    const title = document.createElement("div");
+    title.className = "list-row-name";
+    title.textContent = action.title;
+    const meta = document.createElement("div");
+    meta.className = "list-row-meta";
+    meta.textContent = `${action.job_name || action.job_id} · ${new Date(action.requested_at).toLocaleString()}`;
+    info.append(title, meta);
+    if (action.message) {
+      const msg = document.createElement("div");
+      msg.className = "action-message";
+      msg.textContent = action.message;
+      info.appendChild(msg);
+    }
+
+    const controls = document.createElement("div");
+    controls.className = "action-controls";
+
+    const commentInput = document.createElement("input");
+    commentInput.type = "text";
+    commentInput.className = "action-comment";
+    commentInput.placeholder = "Kommentar (optional)";
+
+    const approveBtn = document.createElement("button");
+    approveBtn.className = "btn";
+    approveBtn.textContent = "Genehmigen";
+    approveBtn.addEventListener("click", () => decideAction(action.id, true, commentInput.value));
+
+    const rejectBtn = document.createElement("button");
+    rejectBtn.className = "btn btn-danger";
+    rejectBtn.textContent = "Ablehnen";
+    rejectBtn.addEventListener("click", () => decideAction(action.id, false, commentInput.value));
+
+    controls.append(commentInput, approveBtn, rejectBtn);
+    row.append(info, controls);
+    container.appendChild(row);
+  }
+}
+
+async function decideAction(id, approved, comment) {
+  const res = await fetch(`/api/actions/${id}/decide`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ approved, comment }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    toast("Entscheidung fehlgeschlagen: " + (data.error || res.status), "error");
+    return;
+  }
+  await renderActionsPanel();
+  toast(approved ? "Genehmigt." : "Abgelehnt.", "success");
+}
+
 async function loadCurrentUser() {
   const res = await fetch("/api/me");
   if (!res.ok) return;
@@ -2007,6 +2197,8 @@ function applyRoleVisibility() {
   el("tab-btn-credentials").classList.toggle("hidden", !isAdmin);
   el("tab-btn-globals").classList.toggle("hidden", !isAdmin);
   el("tab-btn-users").classList.toggle("hidden", !currentUser.multiuser || !isAdmin);
+  el("tab-btn-audit").classList.toggle("hidden", !isAdmin);
+  el("tab-btn-notifications").classList.toggle("hidden", !isAdmin);
 
   const userBox = el("current-user");
   if (currentUser.multiuser && currentUser.username) {
@@ -2015,6 +2207,90 @@ function applyRoleVisibility() {
   } else {
     userBox.classList.add("hidden");
   }
+}
+
+async function renderAuditLogPanel() {
+  const container = el("audit-log-list");
+  container.innerHTML = "Lädt...";
+  const res = await fetch("/api/audit-log");
+  if (!res.ok) {
+    container.innerHTML = '<p style="color:var(--muted)">Nur für Admins sichtbar.</p>';
+    return;
+  }
+  const entries = await res.json();
+  if (entries.length === 0) {
+    container.innerHTML = '<p style="color:var(--muted)">Noch keine Einträge.</p>';
+    return;
+  }
+  container.innerHTML = "";
+  for (const entry of entries) {
+    const row = document.createElement("div");
+    row.className = "list-row";
+
+    const badge = document.createElement("span");
+    badge.className = `audit-status-badge ${entry.status_code < 400 ? "ok" : "fail"}`;
+    badge.textContent = entry.status_code;
+
+    const info = document.createElement("div");
+    info.style.flex = "1";
+    info.style.minWidth = "0";
+    const label = document.createElement("div");
+    label.className = "list-row-name";
+    label.textContent = entry.action;
+    const meta = document.createElement("div");
+    meta.className = "list-row-meta";
+    meta.textContent = `${entry.username ? entry.username + " · " : ""}${new Date(entry.ts).toLocaleString()}`;
+    info.append(label, meta);
+
+    row.append(badge, info);
+    container.appendChild(row);
+  }
+}
+
+async function renderNotificationsPanel() {
+  const res = await fetch("/api/notifications");
+  if (!res.ok) return; // not an admin - the tab itself is already hidden for that case
+  const settings = await res.json();
+  el("notif-enabled").checked = settings.enabled;
+  el("notif-smtp-host").value = settings.smtp_host || "";
+  el("notif-smtp-port").value = settings.smtp_port || 587;
+  el("notif-use-tls").checked = settings.use_tls;
+  el("notif-username").value = settings.username || "";
+  el("notif-from").value = settings.from_addr || "";
+  el("notif-to").value = settings.to_addr || "";
+  el("notif-credential").value = settings.credential_name || "";
+}
+
+async function saveNotificationSettings() {
+  const res = await fetch("/api/notifications", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      enabled: el("notif-enabled").checked,
+      smtp_host: el("notif-smtp-host").value.trim(),
+      smtp_port: parseInt(el("notif-smtp-port").value, 10) || 587,
+      use_tls: el("notif-use-tls").checked,
+      username: el("notif-username").value.trim(),
+      from_addr: el("notif-from").value.trim(),
+      to_addr: el("notif-to").value.trim(),
+      credential_name: el("notif-credential").value.trim(),
+    }),
+  });
+  if (!res.ok) {
+    toast("Speichern fehlgeschlagen.", "error");
+    return;
+  }
+  toast("Benachrichtigungseinstellungen gespeichert.", "success");
+}
+
+async function sendTestNotification() {
+  const res = await fetch("/api/notifications/test", { method: "POST" });
+  const data = await res.json();
+  if (!res.ok) {
+    toast("Test fehlgeschlagen: " + (data.error || res.status), "error");
+    return;
+  }
+  toast("Testbenachrichtigung gesendet.", "success");
 }
 
 // --- declared workflow variables (per-workflow, saved as part of its own
@@ -2308,6 +2584,95 @@ function closeFlowchartOverlay() {
   el("flowchart-overlay").classList.add("hidden");
 }
 
+// --- workflow version history -----------------------------------------------
+
+let versionsOverlayWorkflow = null;
+
+async function openVersionsOverlay(name) {
+  versionsOverlayWorkflow = name;
+  el("versions-title").textContent = `Verlauf: ${name}`;
+  el("versions-overlay").classList.remove("hidden");
+  await renderVersionsList();
+}
+
+function closeVersionsOverlay() {
+  el("versions-overlay").classList.add("hidden");
+  versionsOverlayWorkflow = null;
+}
+
+async function renderVersionsList() {
+  const name = versionsOverlayWorkflow;
+  const container = el("versions-list");
+  container.innerHTML = "Lädt...";
+  const versions = await (await fetch(`/api/workflows/${encodeWorkflowName(name)}/versions`)).json();
+  if (versions.length === 0) {
+    container.innerHTML = '<p style="color:var(--muted)">Noch keine früheren Versionen — erst ab dem zweiten "Speichern" gibt es etwas zu archivieren.</p>';
+    return;
+  }
+  container.innerHTML = "";
+  for (const version of versions) {
+    const row = document.createElement("div");
+
+    const head = document.createElement("div");
+    head.className = "list-row";
+
+    const info = document.createElement("div");
+    info.style.flex = "1";
+    info.style.minWidth = "0";
+    const label = document.createElement("div");
+    label.className = "list-row-name";
+    label.textContent = new Date(version.saved_at).toLocaleString();
+    const meta = document.createElement("div");
+    meta.className = "list-row-meta";
+    meta.textContent = version.saved_by || "unbekannt";
+    info.append(label, meta);
+
+    const viewBtn = document.createElement("button");
+    viewBtn.className = "btn-icon";
+    viewBtn.innerHTML = ICONS.document;
+    viewBtn.title = "Inhalt anzeigen";
+    viewBtn.setAttribute("aria-label", "Inhalt dieser Version anzeigen");
+
+    const restoreBtn = document.createElement("button");
+    restoreBtn.className = "btn";
+    restoreBtn.textContent = "Wiederherstellen";
+    restoreBtn.addEventListener("click", async () => {
+      if (!(await confirmDialog(`Diesen Stand von "${name}" wiederherstellen? Der aktuelle Stand wird dabei selbst archiviert.`, "Wiederherstellen"))) return;
+      const res = await fetch(`/api/workflows/${encodeWorkflowName(name)}/versions/${version.id}/restore`, {
+        method: "POST",
+      });
+      if (!res.ok) {
+        toast("Wiederherstellen fehlgeschlagen.", "error");
+        return;
+      }
+      toast(`"${name}" wiederhergestellt.`, "success");
+      await renderVersionsList();
+      if (el("wf-load").value === name) await loadWorkflow(name);
+    });
+
+    head.append(info, viewBtn, restoreBtn);
+
+    const preview = document.createElement("pre");
+    preview.className = "version-preview hidden";
+    viewBtn.addEventListener("click", async () => {
+      if (!preview.classList.contains("hidden")) {
+        preview.classList.add("hidden");
+        return;
+      }
+      if (!preview.textContent) {
+        const detail = await (
+          await fetch(`/api/workflows/${encodeWorkflowName(name)}/versions/${version.id}`)
+        ).json();
+        preview.textContent = detail.content_yaml;
+      }
+      preview.classList.remove("hidden");
+    });
+
+    row.append(head, preview);
+    container.appendChild(row);
+  }
+}
+
 async function addCredential() {
   const name = el("credential-name").value.trim();
   const value = el("credential-value").value;
@@ -2365,6 +2730,8 @@ async function renderSchedulesPanel() {
     meta.textContent =
       cronDescription(s.cron_expr) +
       (s.queue_name ? ` · Queue: ${s.queue_name}` : "") +
+      (s.skip_weekends ? " · nur Werktage" : "") +
+      (s.skip_holidays ? " · ohne Feiertage" : "") +
       (s.last_run_at ? ` · zuletzt: ${new Date(s.last_run_at).toLocaleString()}` : " · noch nie gelaufen");
     info.append(name, meta);
 
@@ -2407,7 +2774,14 @@ async function addSchedule() {
   const res = await fetch("/api/schedules", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, cron_expr: cronExpr, workflow: payload, queue_name: queueName || undefined }),
+    body: JSON.stringify({
+      name,
+      cron_expr: cronExpr,
+      workflow: payload,
+      queue_name: queueName || undefined,
+      skip_weekends: el("schedule-skip-weekends").checked,
+      skip_holidays: el("schedule-skip-holidays").checked,
+    }),
   });
   const data = await res.json();
   if (!res.ok) {
@@ -2416,8 +2790,61 @@ async function addSchedule() {
   }
   el("schedule-name").value = "";
   el("schedule-cron").value = "";
+  el("schedule-skip-weekends").checked = false;
+  el("schedule-skip-holidays").checked = false;
   await renderSchedulesPanel();
   toast(`Zeitplan "${name}" angelegt.`, "success");
+}
+
+async function renderHolidaysPanel() {
+  const container = el("holidays-list");
+  container.innerHTML = "Lädt...";
+  const holidays = await (await fetch("/api/holidays")).json();
+  if (holidays.length === 0) {
+    container.innerHTML = '<p style="color:var(--muted)">Noch keine Feiertage gepflegt.</p>';
+    return;
+  }
+  container.innerHTML = "";
+  for (const holiday of holidays) {
+    const row = document.createElement("div");
+    row.className = "list-row";
+    const label = document.createElement("span");
+    label.className = "list-row-name";
+    label.textContent = holiday.name ? `${holiday.date} — ${holiday.name}` : holiday.date;
+    const delBtn = document.createElement("button");
+    delBtn.className = "btn-icon danger";
+    delBtn.textContent = "✕";
+    delBtn.title = "Löschen";
+    delBtn.setAttribute("aria-label", `Feiertag "${holiday.date}" löschen`);
+    delBtn.addEventListener("click", async () => {
+      await fetch(`/api/holidays/${holiday.date}`, { method: "DELETE" });
+      renderHolidaysPanel();
+    });
+    row.append(label, delBtn);
+    container.appendChild(row);
+  }
+}
+
+async function addHoliday() {
+  const date = el("holiday-date").value;
+  const name = el("holiday-name").value.trim();
+  if (!date) {
+    toast("Bitte ein Datum wählen.", "error");
+    return;
+  }
+  const res = await fetch("/api/holidays", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ date, name }),
+  });
+  if (!res.ok) {
+    toast("Hinzufügen fehlgeschlagen.", "error");
+    return;
+  }
+  el("holiday-date").value = "";
+  el("holiday-name").value = "";
+  await renderHolidaysPanel();
+  toast(`Feiertag "${date}" hinzugefügt.`, "success");
 }
 
 function escapeHtml(text) {
@@ -2488,7 +2915,7 @@ function startInlineRename(row, oldName, mode) {
       cleanup();
       return;
     }
-    const data = await (await fetch(`/api/workflows/${encodeURIComponent(oldName)}`)).json();
+    const data = await (await fetch(`/api/workflows/${encodeWorkflowName(oldName)}`)).json();
     data.name = newName;
     // Never clobber a different workflow that happens to carry the target name:
     // ask the server to refuse first, then let the user decide (the edit stays
@@ -2508,7 +2935,7 @@ function startInlineRename(row, oldName, mode) {
       return;
     }
     if (mode === "rename") {
-      await fetch(`/api/workflows/${encodeURIComponent(oldName)}`, { method: "DELETE" });
+      await fetch(`/api/workflows/${encodeWorkflowName(oldName)}`, { method: "DELETE" });
     }
     await renderWorkflowsPanel();
     await loadWorkflowList();
@@ -2530,6 +2957,11 @@ function startInlineRename(row, oldName, mode) {
   input.select();
 }
 
+function workflowFolderOf(name) {
+  const slashIndex = name.lastIndexOf("/");
+  return slashIndex === -1 ? null : name.slice(0, slashIndex);
+}
+
 async function renderWorkflowsPanel() {
   const container = el("workflows-list");
   container.innerHTML = "Lädt...";
@@ -2539,13 +2971,40 @@ async function renderWorkflowsPanel() {
     return;
   }
   container.innerHTML = "";
-  for (const name of names) {
+  // /api/workflows sorts as one flat list of names, so an unrelated
+  // top-level name can sort *between* two entries of the same folder (plain
+  // ASCII order puts every "Aaa"-starting name before every "aaa"-starting
+  // one, regardless of folder) - group by folder first, alphabetically
+  // within it second, so every folder's rows (and "Ohne Ordner"'s) end up
+  // contiguous under one header instead of split across several.
+  const sortedNames = [...names].sort((a, b) => {
+    const folderA = workflowFolderOf(a) || "";
+    const folderB = workflowFolderOf(b) || "";
+    return folderA === folderB ? a.localeCompare(b) : folderA.localeCompare(folderB);
+  });
+  // a header per folder is only worth showing once there's more than one
+  // group at all (a flat installation with no folders in use stays a plain
+  // list, not "Ohne Ordner" shown once above everything).
+  const showFolderHeaders = new Set(names.map(workflowFolderOf)).size > 1;
+  let currentFolder;
+  for (const name of sortedNames) {
+    const folder = workflowFolderOf(name);
+    const displayName = folder === null ? name : name.slice(folder.length + 1);
+
+    if (showFolderHeaders && folder !== currentFolder) {
+      currentFolder = folder;
+      const header = document.createElement("div");
+      header.className = "workflow-folder-head";
+      header.textContent = folder === null ? "Ohne Ordner" : folder;
+      container.appendChild(header);
+    }
+
     const row = document.createElement("div");
     row.className = "list-row";
 
     const label = document.createElement("span");
     label.className = "list-row-name";
-    label.textContent = name;
+    label.textContent = displayName;
 
     const openBtn = document.createElement("button");
     openBtn.className = "btn-icon";
@@ -2571,6 +3030,13 @@ async function renderWorkflowsPanel() {
     duplicateBtn.setAttribute("aria-label", `Workflow "${name}" duplizieren`);
     duplicateBtn.addEventListener("click", () => startInlineRename(row, name, "duplicate"));
 
+    const historyBtn = document.createElement("button");
+    historyBtn.className = "btn-icon";
+    historyBtn.innerHTML = ICONS.history;
+    historyBtn.title = "Verlauf (frühere Versionen)";
+    historyBtn.setAttribute("aria-label", `Verlauf von Workflow "${name}"`);
+    historyBtn.addEventListener("click", () => openVersionsOverlay(name));
+
     const delBtn = document.createElement("button");
     delBtn.className = "btn-icon danger";
     delBtn.innerHTML = ICONS.trash;
@@ -2578,13 +3044,13 @@ async function renderWorkflowsPanel() {
     delBtn.setAttribute("aria-label", `Workflow "${name}" löschen`);
     delBtn.addEventListener("click", async () => {
       if (!(await confirmDialog(`Workflow "${name}" wirklich löschen?`))) return;
-      await fetch(`/api/workflows/${encodeURIComponent(name)}`, { method: "DELETE" });
+      await fetch(`/api/workflows/${encodeWorkflowName(name)}`, { method: "DELETE" });
       await renderWorkflowsPanel();
       await loadWorkflowList();
       toast(`Workflow "${name}" gelöscht.`, "success");
     });
 
-    row.append(label, openBtn, renameBtn, duplicateBtn, delBtn);
+    row.append(label, openBtn, renameBtn, duplicateBtn, historyBtn, delBtn);
     container.appendChild(row);
   }
 }
@@ -2719,8 +3185,17 @@ function switchTab(name) {
   if (name === "queues") renderQueuesPanel();
   if (name === "credentials") renderCredentialsPanel();
   if (name === "globals") renderGlobalsPanel();
-  if (name === "schedules") renderSchedulesPanel();
-  if (name === "users") renderUsersPanel();
+  if (name === "schedules") {
+    renderSchedulesPanel();
+    renderHolidaysPanel();
+  }
+  if (name === "actions") renderActionsPanel();
+  if (name === "users") {
+    renderUsersPanel();
+    renderFolderPermissionsPanel();
+  }
+  if (name === "audit") renderAuditLogPanel();
+  if (name === "notifications") renderNotificationsPanel();
 }
 
 function startNewWorkflow() {
@@ -2756,6 +3231,7 @@ function init() {
   });
   el("btn-save").addEventListener("click", saveWorkflow);
   el("btn-run").addEventListener("click", runWorkflow);
+  el("btn-validate").addEventListener("click", validateWorkflow);
   el("btn-continue").addEventListener("click", continueRun);
   el("btn-stop").addEventListener("click", stopRun);
   el("btn-undo").addEventListener("click", undo);
@@ -2770,6 +3246,10 @@ function init() {
   el("flowchart-overlay").addEventListener("click", (e) => {
     if (e.target === el("flowchart-overlay")) closeFlowchartOverlay();
   });
+  el("btn-close-versions").addEventListener("click", closeVersionsOverlay);
+  el("versions-overlay").addEventListener("click", (e) => {
+    if (e.target === el("versions-overlay")) closeVersionsOverlay();
+  });
   el("btn-logout").addEventListener("click", async () => {
     await fetch("/logout", { method: "POST" });
     location.href = "/";
@@ -2782,7 +3262,11 @@ function init() {
   el("btn-add-credential").addEventListener("click", addCredential);
   el("btn-add-global").addEventListener("click", addGlobal);
   el("btn-add-schedule").addEventListener("click", addSchedule);
+  el("btn-add-holiday").addEventListener("click", addHoliday);
   el("btn-add-user").addEventListener("click", addUser);
+  el("btn-add-folder-permission").addEventListener("click", addFolderPermission);
+  el("btn-save-notifications").addEventListener("click", saveNotificationSettings);
+  el("btn-test-notification").addEventListener("click", sendTestNotification);
   el("btn-refresh-runs").addEventListener("click", renderRunsView);
   el("btn-quick-new-workflow").addEventListener("click", () => {
     startNewWorkflow();

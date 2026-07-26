@@ -15,29 +15,48 @@ def _cli_breakpoint(index: int, step: Step, variables: dict) -> None:
     input()
 
 
-def _make_backend(name: str, headless: bool, browser_channel: str | None = None):
+def _backend_class(name: str):
     if name == "web":
         from .backends.web import WebBackend
 
-        return WebBackend(headless=headless, channel=browser_channel)
+        return WebBackend
     if name == "desktop":
         from .backends.desktop import DesktopBackend
 
-        return DesktopBackend()
+        return DesktopBackend
     raise ValueError(f"Unknown backend '{name}'")
+
+
+def _make_backend(name: str, headless: bool, browser_channel: str | None = None):
+    cls = _backend_class(name)
+    if name == "web":
+        return cls(headless=headless, channel=browser_channel)
+    return cls()
 
 
 def cmd_run(args: argparse.Namespace) -> int:
     from .orchestrator import db
 
     workflow = Workflow.load(args.workflow)
-    backend = _make_backend(workflow.backend, headless=args.headless, browser_channel=workflow.browser_channel)
+    if args.dry_run:
+        from .backends.dry_run import DryRunBackend
+
+        backend = DryRunBackend(_backend_class(workflow.backend))
+    else:
+        backend = _make_backend(workflow.backend, headless=args.headless, browser_channel=workflow.browser_channel)
     engine = WorkflowEngine(backend)
     # The same global variables a job run would see, so running a workflow
     # straight from the CLI isn't subtly different from queuing it.
     db.init_db()
     try:
-        engine.run(workflow, on_breakpoint=_cli_breakpoint, global_variables=db.get_global_variables())
+        engine.run(
+            workflow,
+            on_breakpoint=None if args.dry_run else _cli_breakpoint,
+            global_variables=db.get_global_variables(),
+            dry_run=args.dry_run,
+        )
+        if args.dry_run:
+            print("Dry-Run erfolgreich - keine Fehler in Ausdrücken/Variablen/Struktur gefunden.")
         return 0
     except StepError as exc:
         logging.error(str(exc))
@@ -112,7 +131,11 @@ def cmd_worker(args: argparse.Namespace) -> int:
     else:
         print(f"uiflow worker '{args.worker_id or '(auto)'}' polling for jobs (Ctrl+C to stop)")
 
-    kwargs: dict = {"worker_id": args.worker_id, "poll_interval": args.poll_interval}
+    kwargs: dict = {
+        "worker_id": args.worker_id,
+        "poll_interval": args.poll_interval,
+        "heartbeat_interval": args.heartbeat_interval,
+    }
     if store is not None:
         kwargs["store"] = store
     run_worker_loop(**kwargs)
@@ -120,11 +143,12 @@ def cmd_worker(args: argparse.Namespace) -> int:
 
 
 def cmd_scheduler(args: argparse.Namespace) -> int:
-    """Run a standalone scheduler that enqueues jobs for due cron schedules (see orchestrator/db.py)."""
+    """Run a standalone scheduler that enqueues jobs for due cron schedules and
+    sweeps jobs whose worker has gone silent (see orchestrator/db.py)."""
     from .orchestrator.worker import run_scheduler_loop
 
     print("uiflow scheduler polling for due schedules (Ctrl+C to stop)")
-    run_scheduler_loop(poll_interval=args.poll_interval)
+    run_scheduler_loop(poll_interval=args.poll_interval, stale_job_timeout=args.stale_job_timeout)
     return 0
 
 
@@ -178,6 +202,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_p = sub.add_parser("run", help="Run a workflow YAML file")
     run_p.add_argument("workflow", help="Path to workflow YAML file")
     run_p.add_argument("--headless", action="store_true", help="Run the web backend headless")
+    run_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate expressions/variables/structure against a fake backend - no real browser/desktop app, "
+        "network call, or e-mail is touched",
+    )
     run_p.set_defaults(func=cmd_run)
 
     inspect_p = sub.add_parser(
@@ -213,10 +243,24 @@ def build_parser() -> argparse.ArgumentParser:
     worker_p.add_argument(
         "--remote-password", default=None, help="Prompted interactively if omitted (with --remote-url)"
     )
+    worker_p.add_argument(
+        "--heartbeat-interval",
+        type=float,
+        default=15.0,
+        help="Seconds between heartbeats while a job is running, so 'uiflow scheduler' can tell a crashed "
+        "worker apart from one still working (default: 15)",
+    )
     worker_p.set_defaults(func=cmd_worker)
 
     scheduler_p = sub.add_parser("scheduler", help="Run a standalone scheduler that enqueues jobs for due cron schedules")
     scheduler_p.add_argument("--poll-interval", type=float, default=20.0, help="Seconds between schedule checks")
+    scheduler_p.add_argument(
+        "--stale-job-timeout",
+        type=float,
+        default=90.0,
+        help="Seconds without a heartbeat before a running job is treated as orphaned (its worker likely "
+        "crashed): marked 'error', any queue item it still held is handed back to the queue (default: 90)",
+    )
     scheduler_p.set_defaults(func=cmd_scheduler)
 
     user_p = sub.add_parser(
