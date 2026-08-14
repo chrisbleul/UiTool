@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install -e ".[dev]"
+      - run: python -m pytest tests/ -q
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      # Kein Docker/GHCR fuer diese App -- deploy.sh macht auf der Instanz
+      # ein "git checkout <sha>" und startet den systemd-Service neu (siehe
+      # infra/deploy.sh). Der Deploy-Key ist auf der EC2 per "command=" in
+      # authorized_keys auf den registry-basierten Wrapper aus dem
+      # cgo-platform-Repo (/srv/platform/deploy-ssh-wrapper.sh)
+      # festgenagelt -- er kann dort nichts ausser "uiflow <sha>" fuer per
+      # Registry erlaubte Apps ausfuehren. Siehe
+      # docs/arbeitsanweisung-app-plattform.md Abschnitt 9 im
+      # cgo-platform-Repo.
+      - name: Deploy auf die EC2
+        run: |
+          install -m 600 -D /dev/null ~/.ssh/id_deploy
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_deploy
+          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_deploy \
+            ubuntu@${{ secrets.DEPLOY_HOST }} "uiflow ${{ github.sha }}"
