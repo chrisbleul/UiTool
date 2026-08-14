@@ -1,3 +1,14 @@
+// Laeuft auf cgo-app.de unter /uiflow (Plattform-Vertrag Abschnitt 3.2)
+// oder eigenstaendig unter "" -- nginx (falls vorhanden) schneidet den
+// Praefix vor der Flask-App ab, der Browser braucht ihn aber trotzdem in
+// jeder absoluten Pfadangabe. Wird aus dem eigenen Skript-Tag-Pfad
+// abgeleitet, damit Standalone-Betrieb (ohne Praefix) unveraendert weiterlaeuft.
+const API_BASE = (() => {
+  const scriptSrc = document.currentScript ? document.currentScript.src : "";
+  const match = new URL(scriptSrc, location.href).pathname.match(/^(.*)\/static\/app\.js$/);
+  return match ? match[1] : "";
+})();
+
 let schema = { web: {}, desktop: {} };
 let repositoryEntries = []; // Object Repository: [{scope, name, fields}, ...] - see /api/repository
 let currentUser = { username: null, role: null, multiuser: false };
@@ -143,17 +154,17 @@ function updateUndoButton() {
 }
 
 async function loadSchema() {
-  const res = await fetch("/api/schema");
+  const res = await fetch(`${API_BASE}/api/schema`);
   schema = await res.json();
 }
 
 async function loadRepository() {
-  const res = await fetch("/api/repository");
+  const res = await fetch(`${API_BASE}/api/repository`);
   repositoryEntries = await res.json();
 }
 
 async function loadWorkflowList() {
-  const res = await fetch("/api/workflows");
+  const res = await fetch(`${API_BASE}/api/workflows`);
   const names = await res.json();
   const select = el("wf-load");
   select.innerHTML = '<option value="">Workflow laden...</option>';
@@ -172,7 +183,7 @@ async function loadWorkflowList() {
 }
 
 async function loadWorkflow(name) {
-  const res = await fetch(`/api/workflows/${encodeWorkflowName(name)}`);
+  const res = await fetch(`${API_BASE}/api/workflows/${encodeWorkflowName(name)}`);
   if (!res.ok) return;
   const data = await res.json();
   el("wf-name").value = data.name;
@@ -312,7 +323,7 @@ let catalog = { categories: [], activities: {} };
 let catalogIndex = new Map(); // "backend/action" -> catalog entry
 
 async function loadCatalog() {
-  catalog = await (await fetch("/api/activities")).json();
+  catalog = await (await fetch(`${API_BASE}/api/activities`)).json();
   catalogIndex = new Map();
   for (const [backend, entries] of Object.entries(catalog.activities || {})) {
     for (const entry of entries) catalogIndex.set(`${backend}/${entry.name}`, entry);
@@ -1168,7 +1179,7 @@ async function saveStepAsRepositoryElement(step, hasSelectorField) {
   const name = window.prompt('Name für dieses Element (z.B. "Anmelden-Knopf"):', "");
   if (!name) return;
 
-  const res = await fetch("/api/repository", {
+  const res = await fetch(`${API_BASE}/api/repository`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ scope, name, fields }),
@@ -1195,7 +1206,7 @@ async function addFallbackForReferencedElement(step, hasSelectorField) {
   const fields = await pickRawFields(hasSelectorField);
   if (!fields) return;
 
-  const res = await fetch(`/api/repository/${encodeURIComponent(scope)}/${encodeURIComponent(name)}/fallback`, {
+  const res = await fetch(`${API_BASE}/api/repository/${encodeURIComponent(scope)}/${encodeURIComponent(name)}/fallback`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ fields }),
@@ -1301,7 +1312,7 @@ async function pickRawFields(hasSelectorField) {
     }
     const banner = showPickStatus("Browser öffnet sich – bitte im Fenster auf das gewünschte Element klicken...");
     try {
-      const res = await fetch("/api/pick/web", {
+      const res = await fetch(`${API_BASE}/api/pick/web`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url }),
@@ -1335,7 +1346,7 @@ async function pickRawFields(hasSelectorField) {
       : "Bitte jetzt auf das gewünschte Element im Zielfenster klicken..."
   );
   try {
-    const res = await fetch("/api/pick/desktop", {
+    const res = await fetch(`${API_BASE}/api/pick/desktop`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ delay, ...(scope || {}) }),
@@ -1383,7 +1394,7 @@ async function inspectWebSelector(step) {
   }
   let data;
   try {
-    const res = await fetch("/api/inspect/web", {
+    const res = await fetch(`${API_BASE}/api/inspect/web`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url, selector }),
@@ -1429,7 +1440,7 @@ async function inspectDesktopSelector(step) {
   }
   let data;
   try {
-    const res = await fetch("/api/inspect/desktop", {
+    const res = await fetch(`${API_BASE}/api/inspect/desktop`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ...scope, selector }),
@@ -1477,7 +1488,7 @@ async function startRecording() {
     toast("Aufnahme benötigt einen Scope: der erste Schritt muss 'launch' oder 'connect' sein.", "error");
     return;
   }
-  const res = await fetch("/api/record/start", {
+  const res = await fetch(`${API_BASE}/api/record/start`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(scope),
@@ -1490,7 +1501,7 @@ async function startRecording() {
   currentRecordId = data.record_id;
   renderSteps();
 
-  const source = new EventSource(`/api/record/${currentRecordId}/stream`);
+  const source = new EventSource(`${API_BASE}/api/record/${currentRecordId}/stream`);
   recordingSource = source;
   source.addEventListener("step", (event) => {
     const s = JSON.parse(event.data);
@@ -1514,7 +1525,7 @@ async function startRecording() {
 
 async function stopRecording() {
   if (!currentRecordId) return;
-  await fetch(`/api/record/${currentRecordId}/stop`, { method: "POST" });
+  await fetch(`${API_BASE}/api/record/${currentRecordId}/stop`, { method: "POST" });
 }
 
 function currentWorkflowPayload() {
@@ -1529,7 +1540,7 @@ function currentWorkflowPayload() {
 }
 
 function saveWorkflowAs(name, payload, { overwrite }) {
-  return fetch(`/api/workflows/${encodeWorkflowName(name)}?overwrite=${overwrite}`, {
+  return fetch(`${API_BASE}/api/workflows/${encodeWorkflowName(name)}?overwrite=${overwrite}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -1626,7 +1637,7 @@ async function runWorkflow() {
   clearPausedHighlight();
   hideVariablesWatch();
 
-  const res = await fetch("/api/run", {
+  const res = await fetch(`${API_BASE}/api/run`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -1640,7 +1651,7 @@ async function runWorkflow() {
   }
   const { job_id } = await res.json();
   currentJobId = job_id;
-  const source = new EventSource(`/api/run/${job_id}/stream`);
+  const source = new EventSource(`${API_BASE}/api/run/${job_id}/stream`);
 
   source.onmessage = (event) => {
     appendLog(JSON.parse(event.data));
@@ -1698,7 +1709,7 @@ async function validateWorkflow() {
   clearPausedHighlight();
   hideVariablesWatch();
 
-  const res = await fetch("/api/validate", {
+  const res = await fetch(`${API_BASE}/api/validate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -1722,14 +1733,14 @@ async function continueRun() {
   el("log-status").textContent = "Läuft...";
   el("log-status").className = "";
   clearPausedHighlight();
-  await fetch(`/api/run/${currentJobId}/continue`, { method: "POST" });
+  await fetch(`${API_BASE}/api/run/${currentJobId}/continue`, { method: "POST" });
 }
 
 async function stopRun() {
   if (!currentJobId) return;
   el("btn-stop").disabled = true;
   el("log-status").textContent = "Wird gestoppt...";
-  await fetch(`/api/run/${currentJobId}/stop`, { method: "POST" });
+  await fetch(`${API_BASE}/api/run/${currentJobId}/stop`, { method: "POST" });
 }
 
 function showScreenshotIfAny(payload) {
@@ -1744,7 +1755,7 @@ function showScreenshotIfAny(payload) {
 }
 
 async function loadQueueNames() {
-  const res = await fetch("/api/queues");
+  const res = await fetch(`${API_BASE}/api/queues`);
   const queues = await res.json();
   const datalist = el("queue-names");
   datalist.innerHTML = "";
@@ -1794,7 +1805,7 @@ async function renderQueuesPanel() {
     delQueueBtn.setAttribute("aria-label", `Queue "${q.name}" löschen`);
     delQueueBtn.addEventListener("click", async () => {
       if (!(await confirmDialog(`Queue "${q.name}" inklusive aller Items wirklich löschen?`))) return;
-      await fetch(`/api/queues/${encodeURIComponent(q.name)}`, { method: "DELETE" });
+      await fetch(`${API_BASE}/api/queues/${encodeURIComponent(q.name)}`, { method: "DELETE" });
       await renderQueuesPanel();
       await loadQueueNames();
       toast(`Queue "${q.name}" gelöscht.`, "success");
@@ -1807,7 +1818,7 @@ async function renderQueuesPanel() {
     counts.innerHTML = statusBadges(q);
     card.appendChild(counts);
 
-    const items = await (await fetch(`/api/queues/${encodeURIComponent(q.name)}/items`)).json();
+    const items = await (await fetch(`${API_BASE}/api/queues/${encodeURIComponent(q.name)}/items`)).json();
     if (items.length > 0) {
       const table = document.createElement("table");
       table.className = "queue-items-table";
@@ -1830,7 +1841,7 @@ async function renderQueuesPanel() {
 async function renderCredentialsPanel() {
   const container = el("credentials-list");
   container.innerHTML = "Lädt...";
-  const names = await (await fetch("/api/credentials")).json();
+  const names = await (await fetch(`${API_BASE}/api/credentials`)).json();
   if (names.length === 0) {
     container.innerHTML = '<p style="color:var(--muted)">Noch keine Anmeldedaten gespeichert.</p>';
     return;
@@ -1849,7 +1860,7 @@ async function renderCredentialsPanel() {
     delBtn.setAttribute("aria-label", `Anmeldedaten "${name}" löschen`);
     delBtn.addEventListener("click", async () => {
       if (!(await confirmDialog(`Anmeldedaten "${name}" wirklich löschen?`))) return;
-      await fetch(`/api/credentials/${encodeURIComponent(name)}`, { method: "DELETE" });
+      await fetch(`${API_BASE}/api/credentials/${encodeURIComponent(name)}`, { method: "DELETE" });
       renderCredentialsPanel();
       toast(`Anmeldedaten "${name}" gelöscht.`, "success");
     });
@@ -1861,7 +1872,7 @@ async function renderCredentialsPanel() {
 async function renderGlobalsPanel() {
   const container = el("globals-list");
   container.innerHTML = "Lädt...";
-  const entries = await (await fetch("/api/globals")).json();
+  const entries = await (await fetch(`${API_BASE}/api/globals`)).json();
   if (entries.length === 0) {
     container.innerHTML = '<p style="color:var(--muted)">Noch keine globalen Variablen gespeichert.</p>';
     return;
@@ -1902,7 +1913,7 @@ async function renderGlobalsPanel() {
     delBtn.setAttribute("aria-label", `Globale Variable "${entry.name}" löschen`);
     delBtn.addEventListener("click", async () => {
       if (!(await confirmDialog(`Globale Variable "${entry.name}" wirklich löschen?`))) return;
-      await fetch(`/api/globals/${encodeURIComponent(entry.name)}`, { method: "DELETE" });
+      await fetch(`${API_BASE}/api/globals/${encodeURIComponent(entry.name)}`, { method: "DELETE" });
       renderGlobalsPanel();
       toast(`Globale Variable "${entry.name}" gelöscht.`, "success");
     });
@@ -1919,7 +1930,7 @@ async function addGlobal() {
     toast("Bitte einen Namen angeben.", "error");
     return;
   }
-  const res = await fetch("/api/globals", {
+  const res = await fetch(`${API_BASE}/api/globals`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name, value }),
@@ -1942,7 +1953,7 @@ const ROLE_LABELS = { viewer: "Viewer", operator: "Operator", admin: "Admin" };
 async function renderUsersPanel() {
   const container = el("users-list");
   container.innerHTML = "Lädt...";
-  const res = await fetch("/api/users");
+  const res = await fetch(`${API_BASE}/api/users`);
   if (!res.ok) {
     container.innerHTML = '<p style="color:var(--muted)">Nur für Admins sichtbar.</p>';
     return;
@@ -1977,7 +1988,7 @@ async function renderUsersPanel() {
       roleSelect.appendChild(opt);
     }
     roleSelect.addEventListener("change", async () => {
-      const res2 = await fetch(`/api/users/${encodeURIComponent(user.username)}`, {
+      const res2 = await fetch(`${API_BASE}/api/users/${encodeURIComponent(user.username)}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ role: roleSelect.value }),
@@ -1999,7 +2010,7 @@ async function renderUsersPanel() {
     delBtn.disabled = user.username === currentUser.username;
     delBtn.addEventListener("click", async () => {
       if (!(await confirmDialog(`Benutzer "${user.username}" wirklich löschen?`))) return;
-      const res2 = await fetch(`/api/users/${encodeURIComponent(user.username)}`, { method: "DELETE" });
+      const res2 = await fetch(`${API_BASE}/api/users/${encodeURIComponent(user.username)}`, { method: "DELETE" });
       const data = await res2.json();
       if (!res2.ok) {
         toast("Löschen fehlgeschlagen: " + (data.error || res2.status), "error");
@@ -2022,7 +2033,7 @@ async function addUser() {
     toast("Bitte Benutzername und Passwort angeben.", "error");
     return;
   }
-  const res = await fetch("/api/users", {
+  const res = await fetch(`${API_BASE}/api/users`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username, password, role }),
@@ -2045,7 +2056,7 @@ function folderPermissionUrlToken(folder) {
 async function renderFolderPermissionsPanel() {
   const container = el("folder-permissions-list");
   container.innerHTML = "Lädt...";
-  const res = await fetch("/api/folder-permissions");
+  const res = await fetch(`${API_BASE}/api/folder-permissions`);
   if (!res.ok) {
     container.innerHTML = '<p style="color:var(--muted)">Nur für Admins sichtbar.</p>';
     return;
@@ -2075,7 +2086,7 @@ async function renderFolderPermissionsPanel() {
     delBtn.setAttribute("aria-label", `Ordner-Berechtigung für "${grant.username}" löschen`);
     delBtn.addEventListener("click", async () => {
       if (!(await confirmDialog(`Ordner-Berechtigung für "${grant.username}" (${grant.folder || "oberste Ebene"}) wirklich löschen?`))) return;
-      await fetch(`/api/folder-permissions/${encodeURIComponent(grant.username)}/${folderPermissionUrlToken(grant.folder)}`, {
+      await fetch(`${API_BASE}/api/folder-permissions/${encodeURIComponent(grant.username)}/${folderPermissionUrlToken(grant.folder)}`, {
         method: "DELETE",
       });
       renderFolderPermissionsPanel();
@@ -2095,7 +2106,7 @@ async function addFolderPermission() {
     toast("Bitte einen Benutzernamen angeben.", "error");
     return;
   }
-  const res = await fetch("/api/folder-permissions", {
+  const res = await fetch(`${API_BASE}/api/folder-permissions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username, folder, role }),
@@ -2114,7 +2125,7 @@ async function addFolderPermission() {
 async function renderActionsPanel() {
   const container = el("actions-list");
   container.innerHTML = "Lädt...";
-  const res = await fetch("/api/actions");
+  const res = await fetch(`${API_BASE}/api/actions`);
   if (!res.ok) {
     container.innerHTML = '<p style="color:var(--muted)">Nur für angemeldete Benutzer sichtbar.</p>';
     return;
@@ -2171,7 +2182,7 @@ async function renderActionsPanel() {
 }
 
 async function decideAction(id, approved, comment) {
-  const res = await fetch(`/api/actions/${id}/decide`, {
+  const res = await fetch(`${API_BASE}/api/actions/${id}/decide`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ approved, comment }),
@@ -2186,7 +2197,7 @@ async function decideAction(id, approved, comment) {
 }
 
 async function loadCurrentUser() {
-  const res = await fetch("/api/me");
+  const res = await fetch(`${API_BASE}/api/me`);
   if (!res.ok) return;
   currentUser = await res.json();
   applyRoleVisibility();
@@ -2212,7 +2223,7 @@ function applyRoleVisibility() {
 async function renderAuditLogPanel() {
   const container = el("audit-log-list");
   container.innerHTML = "Lädt...";
-  const res = await fetch("/api/audit-log");
+  const res = await fetch(`${API_BASE}/api/audit-log`);
   if (!res.ok) {
     container.innerHTML = '<p style="color:var(--muted)">Nur für Admins sichtbar.</p>';
     return;
@@ -2248,7 +2259,7 @@ async function renderAuditLogPanel() {
 }
 
 async function renderNotificationsPanel() {
-  const res = await fetch("/api/notifications");
+  const res = await fetch(`${API_BASE}/api/notifications`);
   if (!res.ok) return; // not an admin - the tab itself is already hidden for that case
   const settings = await res.json();
   el("notif-enabled").checked = settings.enabled;
@@ -2262,7 +2273,7 @@ async function renderNotificationsPanel() {
 }
 
 async function saveNotificationSettings() {
-  const res = await fetch("/api/notifications", {
+  const res = await fetch(`${API_BASE}/api/notifications`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -2284,7 +2295,7 @@ async function saveNotificationSettings() {
 }
 
 async function sendTestNotification() {
-  const res = await fetch("/api/notifications/test", { method: "POST" });
+  const res = await fetch(`${API_BASE}/api/notifications/test`, { method: "POST" });
   const data = await res.json();
   if (!res.ok) {
     toast("Test fehlgeschlagen: " + (data.error || res.status), "error");
@@ -2604,7 +2615,7 @@ async function renderVersionsList() {
   const name = versionsOverlayWorkflow;
   const container = el("versions-list");
   container.innerHTML = "Lädt...";
-  const versions = await (await fetch(`/api/workflows/${encodeWorkflowName(name)}/versions`)).json();
+  const versions = await (await fetch(`${API_BASE}/api/workflows/${encodeWorkflowName(name)}/versions`)).json();
   if (versions.length === 0) {
     container.innerHTML = '<p style="color:var(--muted)">Noch keine früheren Versionen — erst ab dem zweiten "Speichern" gibt es etwas zu archivieren.</p>';
     return;
@@ -2638,7 +2649,7 @@ async function renderVersionsList() {
     restoreBtn.textContent = "Wiederherstellen";
     restoreBtn.addEventListener("click", async () => {
       if (!(await confirmDialog(`Diesen Stand von "${name}" wiederherstellen? Der aktuelle Stand wird dabei selbst archiviert.`, "Wiederherstellen"))) return;
-      const res = await fetch(`/api/workflows/${encodeWorkflowName(name)}/versions/${version.id}/restore`, {
+      const res = await fetch(`${API_BASE}/api/workflows/${encodeWorkflowName(name)}/versions/${version.id}/restore`, {
         method: "POST",
       });
       if (!res.ok) {
@@ -2661,7 +2672,7 @@ async function renderVersionsList() {
       }
       if (!preview.textContent) {
         const detail = await (
-          await fetch(`/api/workflows/${encodeWorkflowName(name)}/versions/${version.id}`)
+          await fetch(`${API_BASE}/api/workflows/${encodeWorkflowName(name)}/versions/${version.id}`)
         ).json();
         preview.textContent = detail.content_yaml;
       }
@@ -2680,7 +2691,7 @@ async function addCredential() {
     toast("Bitte Name und Wert angeben.", "error");
     return;
   }
-  const res = await fetch("/api/credentials", {
+  const res = await fetch(`${API_BASE}/api/credentials`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name, value }),
@@ -2710,7 +2721,7 @@ function cronDescription(cron) {
 async function renderSchedulesPanel() {
   const container = el("schedules-list");
   container.innerHTML = "Lädt...";
-  const schedules = await (await fetch("/api/schedules")).json();
+  const schedules = await (await fetch(`${API_BASE}/api/schedules`)).json();
   if (schedules.length === 0) {
     container.innerHTML = '<p style="color:var(--muted)">Noch keine Zeitpläne.</p>';
     return;
@@ -2741,7 +2752,7 @@ async function renderSchedulesPanel() {
     toggleBtn.title = s.enabled ? "Deaktivieren" : "Aktivieren";
     toggleBtn.setAttribute("aria-label", s.enabled ? "Zeitplan deaktivieren" : "Zeitplan aktivieren");
     toggleBtn.addEventListener("click", async () => {
-      await fetch(`/api/schedules/${s.id}/toggle`, { method: "POST" });
+      await fetch(`${API_BASE}/api/schedules/${s.id}/toggle`, { method: "POST" });
       renderSchedulesPanel();
     });
 
@@ -2752,7 +2763,7 @@ async function renderSchedulesPanel() {
     delBtn.setAttribute("aria-label", `Zeitplan "${s.name}" löschen`);
     delBtn.addEventListener("click", async () => {
       if (!(await confirmDialog(`Zeitplan "${s.name}" wirklich löschen?`))) return;
-      await fetch(`/api/schedules/${s.id}`, { method: "DELETE" });
+      await fetch(`${API_BASE}/api/schedules/${s.id}`, { method: "DELETE" });
       renderSchedulesPanel();
       toast(`Zeitplan "${s.name}" gelöscht.`, "success");
     });
@@ -2771,7 +2782,7 @@ async function addSchedule() {
   }
   const payload = currentWorkflowPayload();
   const queueName = el("wf-queue").value.trim();
-  const res = await fetch("/api/schedules", {
+  const res = await fetch(`${API_BASE}/api/schedules`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -2799,7 +2810,7 @@ async function addSchedule() {
 async function renderHolidaysPanel() {
   const container = el("holidays-list");
   container.innerHTML = "Lädt...";
-  const holidays = await (await fetch("/api/holidays")).json();
+  const holidays = await (await fetch(`${API_BASE}/api/holidays`)).json();
   if (holidays.length === 0) {
     container.innerHTML = '<p style="color:var(--muted)">Noch keine Feiertage gepflegt.</p>';
     return;
@@ -2817,7 +2828,7 @@ async function renderHolidaysPanel() {
     delBtn.title = "Löschen";
     delBtn.setAttribute("aria-label", `Feiertag "${holiday.date}" löschen`);
     delBtn.addEventListener("click", async () => {
-      await fetch(`/api/holidays/${holiday.date}`, { method: "DELETE" });
+      await fetch(`${API_BASE}/api/holidays/${holiday.date}`, { method: "DELETE" });
       renderHolidaysPanel();
     });
     row.append(label, delBtn);
@@ -2832,7 +2843,7 @@ async function addHoliday() {
     toast("Bitte ein Datum wählen.", "error");
     return;
   }
-  const res = await fetch("/api/holidays", {
+  const res = await fetch(`${API_BASE}/api/holidays`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ date, name }),
@@ -2863,7 +2874,7 @@ async function importExcelToQueue() {
   }
   const formData = new FormData();
   formData.append("file", file);
-  const res = await fetch(`/api/queues/${encodeURIComponent(name)}/import-excel`, {
+  const res = await fetch(`${API_BASE}/api/queues/${encodeURIComponent(name)}/import-excel`, {
     method: "POST",
     body: formData,
   });
@@ -2915,7 +2926,7 @@ function startInlineRename(row, oldName, mode) {
       cleanup();
       return;
     }
-    const data = await (await fetch(`/api/workflows/${encodeWorkflowName(oldName)}`)).json();
+    const data = await (await fetch(`${API_BASE}/api/workflows/${encodeWorkflowName(oldName)}`)).json();
     data.name = newName;
     // Never clobber a different workflow that happens to carry the target name:
     // ask the server to refuse first, then let the user decide (the edit stays
@@ -2935,7 +2946,7 @@ function startInlineRename(row, oldName, mode) {
       return;
     }
     if (mode === "rename") {
-      await fetch(`/api/workflows/${encodeWorkflowName(oldName)}`, { method: "DELETE" });
+      await fetch(`${API_BASE}/api/workflows/${encodeWorkflowName(oldName)}`, { method: "DELETE" });
     }
     await renderWorkflowsPanel();
     await loadWorkflowList();
@@ -2965,7 +2976,7 @@ function workflowFolderOf(name) {
 async function renderWorkflowsPanel() {
   const container = el("workflows-list");
   container.innerHTML = "Lädt...";
-  const names = await (await fetch("/api/workflows")).json();
+  const names = await (await fetch(`${API_BASE}/api/workflows`)).json();
   if (names.length === 0) {
     container.innerHTML = '<p style="color:var(--muted)">Noch keine Workflows gespeichert.</p>';
     return;
@@ -3044,7 +3055,7 @@ async function renderWorkflowsPanel() {
     delBtn.setAttribute("aria-label", `Workflow "${name}" löschen`);
     delBtn.addEventListener("click", async () => {
       if (!(await confirmDialog(`Workflow "${name}" wirklich löschen?`))) return;
-      await fetch(`/api/workflows/${encodeWorkflowName(name)}`, { method: "DELETE" });
+      await fetch(`${API_BASE}/api/workflows/${encodeWorkflowName(name)}`, { method: "DELETE" });
       await renderWorkflowsPanel();
       await loadWorkflowList();
       toast(`Workflow "${name}" gelöscht.`, "success");
@@ -3097,14 +3108,14 @@ async function openRunDetail(job) {
   el("run-detail-title").textContent = `${job.name} · ${job.status}`;
   el("run-detail-logs").textContent = "Lädt...";
   el("run-detail-panel").classList.remove("hidden");
-  const logs = await (await fetch(`/api/jobs/${job.id}/logs`)).json();
+  const logs = await (await fetch(`${API_BASE}/api/jobs/${job.id}/logs`)).json();
   el("run-detail-logs").textContent = logs.length ? logs.map((l) => l.message).join("\n") : "Keine Logs für diesen Lauf.";
 }
 
 async function renderRunsView() {
   const container = el("runs-list");
   container.innerHTML = "Lädt...";
-  const jobs = await (await fetch("/api/jobs")).json();
+  const jobs = await (await fetch(`${API_BASE}/api/jobs`)).json();
   if (jobs.length === 0) {
     container.innerHTML = '<p style="color:var(--muted)">Noch keine Läufe.</p>';
     return;
@@ -3121,10 +3132,10 @@ async function renderDashboard() {
   const statsBox = el("dashboard-stats");
   statsBox.innerHTML = '<p style="color:var(--muted)">Lädt...</p>';
   const [workflowNames, jobs, queues, schedules] = await Promise.all([
-    fetch("/api/workflows").then((r) => r.json()),
-    fetch("/api/jobs").then((r) => r.json()),
-    fetch("/api/queues").then((r) => r.json()),
-    fetch("/api/schedules").then((r) => r.json()),
+    fetch(`${API_BASE}/api/workflows`).then((r) => r.json()),
+    fetch(`${API_BASE}/api/jobs`).then((r) => r.json()),
+    fetch(`${API_BASE}/api/queues`).then((r) => r.json()),
+    fetch(`${API_BASE}/api/schedules`).then((r) => r.json()),
   ]);
 
   const successCount = jobs.filter((j) => j.status === "success").length;
@@ -3251,8 +3262,8 @@ function init() {
     if (e.target === el("versions-overlay")) closeVersionsOverlay();
   });
   el("btn-logout").addEventListener("click", async () => {
-    await fetch("/logout", { method: "POST" });
-    location.href = "/";
+    await fetch(`${API_BASE}/logout`, { method: "POST" });
+    location.href = `${API_BASE}/`;
   });
   el("btn-close-log").addEventListener("click", () => el("log-panel").classList.add("hidden"));
   el("btn-close-run-detail").addEventListener("click", () => el("run-detail-panel").classList.add("hidden"));

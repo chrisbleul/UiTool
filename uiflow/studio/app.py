@@ -182,7 +182,39 @@ def create_app() -> Flask:
 
     @app.before_request
     def require_login() -> Response | None:
-        if request.path in ("/login", "/logout", "/api/me") or request.path.startswith("/static/"):
+        if request.path in ("/login", "/logout", "/api/me", "/api/health") or request.path.startswith(
+            "/static/"
+        ):
+            return None
+        # Zentrale Plattform-Anmeldung (cgo-app.de/uiflow/, nginx auth_request
+        # gegen cgo-auth) hat Vorrang vor den Modi unten. nginx setzt diese
+        # Header selbst und verwirft jeden vom Client mitgeschickten Wert
+        # (siehe docs/arbeitsanweisung-app-plattform.md Abschnitt 3a im
+        # cgo-platform-Repo) -- sie sind vertrauenswuerdig, solange diese App
+        # nur an 127.0.0.1 bindet und nie direkt von aussen erreichbar ist.
+        # Rollen bleiben lokal in der users-Tabelle: die Plattform kennt nur
+        # userId+email, kein viewer/operator/admin. Ein Platform-Nutzer ohne
+        # passenden Eintrag dort bekommt bewusst KEINEN Default-Zugriff --
+        # Konten muessen weiterhin explizit angelegt werden (uiflow
+        # create-user), nur eben keyed per E-Mail statt per freiem Namen.
+        header_email = request.headers.get("X-Auth-User-Email")
+        if header_email:
+            user = db.get_user(header_email)
+            if user is None:
+                if request.path.startswith("/api/"):
+                    return jsonify({"error": "kein uiflow-Konto fuer diese Identitaet"}), 403
+                return Response("Kein uiflow-Konto fuer diese Identitaet.", status=403)
+            session["username"] = header_email
+            session["role"] = user["role"]
+            workflow_name = _workflow_name_from_request()
+            effective_role = (
+                _effective_role(header_email, user["role"], workflow_name)
+                if workflow_name is not None
+                else user["role"]
+            )
+            required = _required_role(request.method, request.path)
+            if _ROLE_ORDER.get(effective_role, -1) < _ROLE_ORDER[required]:
+                return jsonify({"error": "forbidden"}), 403
             return None
         if db.any_users_exist():
             username = session.get("username")
@@ -262,11 +294,27 @@ def create_app() -> Flask:
 
     @app.get("/api/me")
     def whoami() -> Response:
+        header_email = request.headers.get("X-Auth-User-Email")
+        if header_email:
+            user = db.get_user(header_email)
+            role = user["role"] if user else None
+            return jsonify({"username": header_email, "role": role, "multiuser": True})
         if db.any_users_exist():
             username = session.get("username")
             return jsonify({"username": username, "role": session.get("role") if username else None, "multiuser": True})
         logged_in = (not studio_password) or bool(session.get("authenticated"))
         return jsonify({"username": None, "role": "admin" if logged_in else None, "multiuser": False})
+
+    @app.get("/api/health")
+    def health() -> Response:
+        # Laeuft intern, ohne Praefix (Plattform-Vertrag Abschnitt 3.5) --
+        # ausgenommen von require_login wie /api/me.
+        try:
+            db.any_users_exist()
+            ok = True
+        except Exception:
+            ok = False
+        return jsonify({"status": "ok" if ok else "degraded", "database": "up" if ok else "down"})
 
     @app.get("/")
     def index() -> Response:
