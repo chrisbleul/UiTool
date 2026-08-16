@@ -10,6 +10,7 @@ jobs:
     uses: chrisbleul/CGOPlattform/.github/workflows/verify-python.yml@main
     with:
       verify-commands: |
+        ruff check uiflow tests
         python -m pytest tests/ -q
 
   deploy:
