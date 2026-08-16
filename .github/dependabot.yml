@@ -1,0 +1,13 @@
+# AP4.3 aus dem Arbeitsauftrag [B09]: woechentlich, nach Dev-/Prod-Abhaengigkeiten
+# gruppiert. pip statt npm -- einziges Python-Repo der Plattform.
+version: 2
+updates:
+  - package-ecosystem: 'pip'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+    groups:
+      production-dependencies:
+        dependency-type: 'production'
+      development-dependencies:
+        dependency-type: 'development'
