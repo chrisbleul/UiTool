@@ -95,7 +95,7 @@ class DesktopBackend:
         # against another window having stolen focus between steps.
         try:
             self._window.set_focus()
-        except Exception:  # noqa: BLE001 - best-effort; resolution below still proceeds
+        except Exception:  # noqa: BLE001, S110 - best-effort; resolution below still proceeds
             pass
         control = self._window.child_window(**selector)
         control.wait("exists enabled visible ready", timeout=timeout)
@@ -168,7 +168,7 @@ class DesktopBackend:
         if self._window is not None:
             try:
                 self._window.set_focus()
-            except Exception:  # noqa: BLE001 - best-effort; send_keys below still proceeds
+            except Exception:  # noqa: BLE001, S110 - best-effort; send_keys below still proceeds
                 pass
         send_keys(_translate_hotkey(keys))
 
@@ -185,5 +185,5 @@ class DesktopBackend:
         if self._window is not None:
             try:
                 self._window.close()
-            except Exception:  # noqa: BLE001 - best-effort cleanup
+            except Exception:  # noqa: BLE001, S110 - best-effort cleanup
                 pass

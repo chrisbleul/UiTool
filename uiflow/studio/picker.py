@@ -103,12 +103,12 @@ def inspect_web_selector(url: str, selector: str, timeout: float = 15.0) -> dict
             page = browser.new_page()
             try:
                 page.goto(url, timeout=int(timeout * 1000))
-            except Exception as exc:  # noqa: BLE001 - wrap any navigation failure (bad URL, timeout, ...)
+            except Exception as exc:
                 raise ValueError(f"Seite konnte nicht geladen werden: {exc}") from exc
             try:
                 locator = page.locator(selector)
                 count = locator.count()
-            except Exception as exc:  # noqa: BLE001 - an invalid selector raises deep inside Playwright
+            except Exception as exc:
                 raise ValueError(f"Ungültiger Selector: {exc}") from exc
             matches = []
             for i in range(min(count, _MAX_INSPECT_MATCHES)):
@@ -161,12 +161,12 @@ def inspect_desktop_selector(
             else Application(backend="uia").connect(path=Path(focus_path).name, timeout=timeout)
         )
         window = app.top_window()
-    except Exception as exc:  # noqa: BLE001 - wrap any connect/timeout failure (app not running, ...)
+    except Exception as exc:
         raise ValueError(f"Anwendung nicht erreichbar: {exc}") from exc
 
     try:
         elements = window.descendants(**selector) if selector else [window]
-    except Exception as exc:  # noqa: BLE001 - an invalid selector raises deep inside pywinauto
+    except Exception as exc:
         raise ValueError(f"Ungültiger Selector: {exc}") from exc
 
     count = len(elements)
@@ -200,7 +200,7 @@ def _most_specific_element_at(x: int, y: int):
     for descendant in top.descendants():
         try:
             r = descendant.rectangle()
-        except Exception:  # noqa: BLE001 - some elements fail to report a rectangle
+        except Exception:  # noqa: BLE001, S112 - some elements fail to report a rectangle
             continue
         if not (r.left <= x <= r.right and r.top <= y <= r.bottom):
             continue
@@ -243,7 +243,7 @@ class _HighlightOverlay:
         wc.hbrBackground = brush
         try:
             win32gui.RegisterClass(wc)
-        except Exception:  # noqa: BLE001 - already registered from a previous pick
+        except Exception:  # noqa: BLE001, S110 - already registered from a previous pick
             pass
 
         ex_style = (
@@ -285,7 +285,7 @@ class _HighlightOverlay:
         for hwnd in self._bars:
             try:
                 self._win32gui.DestroyWindow(hwnd)
-            except Exception:  # noqa: BLE001 - best-effort cleanup
+            except Exception:  # noqa: BLE001, S110 - best-effort cleanup
                 pass
         self._bars = []
 
@@ -326,7 +326,7 @@ def pick_desktop_element(
     if focus_title or focus_path:
         try:
             _focus_scope_window(focus_title, focus_path)
-        except Exception:  # noqa: BLE001 - best-effort; fall back to the plain delay below
+        except Exception:  # noqa: BLE001, S110 - best-effort; fall back to the plain delay below
             pass
 
     if delay > 0:
@@ -359,7 +359,7 @@ def pick_desktop_element(
             if rect != last_rect[0]:
                 overlay_holder[0].show(*rect)
                 last_rect[0] = rect
-        except Exception:  # noqa: BLE001 - transient hit-test failures are expected while moving
+        except Exception:  # noqa: BLE001, S110 - transient hit-test failures are expected while moving
             pass
 
     def on_click(x, y, button, pressed):
@@ -396,5 +396,5 @@ def pick_desktop_element(
             "title": info.name or "",
             "class_name": info.class_name or "",
         }
-    except Exception as exc:  # noqa: BLE001 - surface resolution failure to the caller
+    except Exception as exc:
         raise RuntimeError(str(exc)) from exc

@@ -2,7 +2,13 @@ import logging
 
 import pytest
 
-from uiflow.engine import BusinessError, StepError, WorkflowCancelled, WorkflowEngine, substitute_variables
+from uiflow.engine import (
+    BusinessError,
+    StepError,
+    WorkflowCancelled,
+    WorkflowEngine,
+    substitute_variables,
+)
 from uiflow.models import Step, Workflow
 
 
@@ -1703,7 +1709,7 @@ def test_shipped_reframework_example_re_raises_a_technical_failure_after_the_cat
     workflow = _load_shipped_workflow("beispiel_reframework.yaml")
     backend = _FailingBackend()
 
-    with pytest.raises(StepError) as excinfo:
+    with pytest.raises(StepError):
         WorkflowEngine(backend).run(
             workflow,
             variables={"item": {"betrag": 500, "rechnungsnummer": "R1"}},
