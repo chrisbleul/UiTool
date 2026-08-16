@@ -290,7 +290,7 @@ def init_db() -> None:
         except sqlite3.OperationalError as exc:
             last_error = exc
             time.sleep(0.2)
-    raise last_error  # noqa: RSE102 - re-raising the last observed OperationalError
+    raise last_error
 
 
 # --- jobs -----------------------------------------------------------------
@@ -1054,7 +1054,7 @@ def notify_job_failed(job_id: str, job_name: str, error_message: str | None) -> 
             f"uiflow: Job '{job_name}' fehlgeschlagen",
             f"Job-ID: {job_id}\nName: {job_name}\nFehler: {error_message or '(keine Meldung)'}",
         )
-    except Exception:  # noqa: BLE001 - a notification hiccup must never fail the job itself
+    except Exception:
         import logging
 
         logging.getLogger("uiflow").warning("Fehlerbenachrichtigung konnte nicht gesendet werden", exc_info=True)

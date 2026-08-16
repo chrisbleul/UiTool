@@ -34,7 +34,7 @@ def test_read_pdf_text_on_blank_pages_returns_empty_string(pdf_path):
 
 
 def test_read_pdf_text_missing_file_raises(tmp_path):
-    with pytest.raises(Exception):
+    with pytest.raises(FileNotFoundError):
         read_pdf_text(str(tmp_path / "missing.pdf"))
 
 

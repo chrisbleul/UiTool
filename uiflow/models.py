@@ -34,7 +34,7 @@ class Step:
     retry_delay: float = 2.0
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Step":
+    def from_dict(cls, data: dict[str, Any]) -> Step:
         data = dict(data)
         try:
             action = data.pop("action")
@@ -85,7 +85,7 @@ class Workflow:
     variables: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_raw(cls, raw: dict[str, Any]) -> "Workflow":
+    def from_raw(cls, raw: dict[str, Any]) -> Workflow:
         backend = raw.get("backend", "web")
         if backend not in VALID_BACKENDS:
             raise ValueError(f"Unknown backend '{backend}', expected one of {VALID_BACKENDS}")
@@ -94,7 +94,10 @@ class Workflow:
             raise ValueError(f"Unknown browser_channel '{browser_channel}', expected one of {VALID_BROWSER_CHANNELS}")
         variables = raw.get("variables") or {}
         if not isinstance(variables, dict):
-            raise ValueError("'variables' must be a mapping of name -> default value")
+            # ValueError on purpose, not TypeError: every validation branch in
+            # from_raw() raises ValueError uniformly so callers (studio/app.py)
+            # can catch it as one contract and turn it into a 4xx response.
+            raise ValueError("'variables' must be a mapping of name -> default value")  # noqa: TRY004
         reserved = [name for name in variables if name in RESERVED_VARIABLE_NAMES]
         if reserved:
             raise ValueError(f"'{reserved[0]}' is a reserved name and can't be declared as a variable")
@@ -108,7 +111,7 @@ class Workflow:
         )
 
     @classmethod
-    def load(cls, path: str | Path) -> "Workflow":
+    def load(cls, path: str | Path) -> Workflow:
         path = Path(path)
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         raw.setdefault("name", path.stem)

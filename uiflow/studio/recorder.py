@@ -23,8 +23,9 @@ from __future__ import annotations
 import math
 import queue
 import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 from .picker import _most_specific_element_at
 
@@ -50,7 +51,7 @@ _MODIFIER_COMBO_ORDER = ["ctrl", "alt", "shift"]
 # it counts as a drag instead of a click.
 _DRAG_THRESHOLD_PX = 8
 
-OwnerLookup = Callable[[int], "tuple[Optional[int], Optional[int]]"]
+OwnerLookup = Callable[[int], "tuple[int | None, int | None]"]
 
 
 def _selector_fields(el: Any) -> dict[str, str]:
@@ -66,7 +67,7 @@ def _selector_fields(el: Any) -> dict[str, str]:
     }
 
 
-def _default_owner_pid_of(hwnd: int) -> "tuple[Optional[int], Optional[int]]":
+def _default_owner_pid_of(hwnd: int) -> tuple[int | None, int | None]:
     """Windows' own "this popup belongs to that window" relationship (used for
     modal dialogs, common-dialog broker processes, etc.), independent of
     process id - the same mismatch that forced `DesktopBackend.launch()` to
@@ -90,14 +91,14 @@ class _RecordingSession:
     modifiers, in-scope processes) and pure decisions, so it can be driven
     directly from tests with fake elements."""
 
-    def __init__(self, scope_pid: int, owner_pid_of: Optional[OwnerLookup] = None) -> None:
+    def __init__(self, scope_pid: int, owner_pid_of: OwnerLookup | None = None) -> None:
         self._scope_pids = {scope_pid}
         self._owner_pid_of = owner_pid_of
         self.pending_text: list[str] = []
-        self.last_target: Optional[dict[str, str]] = None
+        self.last_target: dict[str, str] | None = None
         self.held_modifiers: set[str] = set()
-        self._press: Optional[tuple[int, int, str]] = None
-        self._pending_scroll: Optional[dict[str, Any]] = None
+        self._press: tuple[int, int, str] | None = None
+        self._pending_scroll: dict[str, Any] | None = None
 
     # --- scope -----------------------------------------------------------
 
@@ -199,7 +200,7 @@ class _RecordingSession:
 
     # --- keyboard ------------------------------------------------------------
 
-    def handle_key_press(self, name: Optional[str], char: Optional[str]) -> list[dict]:
+    def handle_key_press(self, name: str | None, char: str | None) -> list[dict]:
         modifier = _MODIFIER_KEY_NAMES.get(name or "")
         if modifier:
             self.held_modifiers.add(modifier)
@@ -229,7 +230,7 @@ class _RecordingSession:
             return []
         return []  # other special keys (arrows, bare function keys, ...) - ignored for the MVP
 
-    def handle_key_release(self, name: Optional[str]) -> None:
+    def handle_key_release(self, name: str | None) -> None:
         modifier = _MODIFIER_KEY_NAMES.get(name or "")
         if modifier:
             self.held_modifiers.discard(modifier)
@@ -237,13 +238,13 @@ class _RecordingSession:
 
 class Recorder:
     def __init__(self) -> None:
-        self.events: "queue.Queue[dict[str, Any]]" = queue.Queue()
-        self._raw: "queue.Queue[tuple]" = queue.Queue()
+        self.events: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._raw: queue.Queue[tuple] = queue.Queue()
         self._stop_event = threading.Event()
         self._mouse_listener: Any = None
         self._keyboard_listener: Any = None
         self._worker: threading.Thread | None = None
-        self._session: Optional[_RecordingSession] = None
+        self._session: _RecordingSession | None = None
 
     def start(self, focus_title: str | None, focus_path: str | None) -> None:
         from pynput import keyboard, mouse

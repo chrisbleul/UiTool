@@ -13,7 +13,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, Response, jsonify, redirect, request, send_from_directory, session
+from flask import (
+    Flask,
+    Response,
+    jsonify,
+    redirect,
+    request,
+    send_from_directory,
+    session,
+)
 from werkzeug.security import check_password_hash
 
 from .. import models
@@ -65,14 +73,14 @@ def _required_role(method: str, path: str) -> str:
     variables) is admin-only; any other state-changing request needs at least
     "operator"; a plain read (GET) only needs to be logged in at all
     ("viewer")."""
-    if (
-        path.startswith("/api/users")
-        or path.startswith("/api/credentials")
-        or path.startswith("/api/globals")
-        or path.startswith("/api/audit-log")
-        or path.startswith("/api/notifications")
-        or path.startswith("/api/folder-permissions")
-    ):
+    if path.startswith((
+        "/api/users",
+        "/api/credentials",
+        "/api/globals",
+        "/api/audit-log",
+        "/api/notifications",
+        "/api/folder-permissions",
+    )):
         return "admin"
     if path.startswith("/api/worker/"):
         # A remote worker executes workflows and reads global variables via
@@ -312,7 +320,7 @@ def create_app() -> Flask:
         try:
             db.any_users_exist()
             ok = True
-        except Exception:
+        except Exception:  # noqa: BLE001 - health endpoint reports degraded, never crashes
             ok = False
         return jsonify({"status": "ok" if ok else "degraded", "database": "up" if ok else "down"})
 
@@ -1112,7 +1120,9 @@ def create_app() -> Flask:
         if not date:
             return jsonify({"error": "date required"}), 400
         try:
-            datetime.strptime(date, "%Y-%m-%d")
+            # Format check only -- the parsed value is discarded, the
+            # original string is stored below, so no timezone is needed.
+            datetime.strptime(date, "%Y-%m-%d")  # noqa: DTZ007
         except ValueError:
             return jsonify({"error": "date must be YYYY-MM-DD"}), 400
         db.add_holiday(date, (data.get("name") or "").strip() or None)

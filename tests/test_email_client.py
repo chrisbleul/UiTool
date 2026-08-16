@@ -1,10 +1,13 @@
 import email.utils
+from typing import ClassVar
 
 from uiflow.email_client import read_emails, send_email
 
 
 class _FakeSmtp:
-    sent = []
+    # Deliberately shared across instances -- tests clear it themselves
+    # before each assertion (see the .clear() calls below).
+    sent: ClassVar[list] = []
 
     def __init__(self, host, port, timeout=None):
         self.host, self.port = host, port

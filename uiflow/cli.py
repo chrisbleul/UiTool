@@ -7,6 +7,8 @@ import sys
 from .engine import StepError, WorkflowEngine
 from .models import Step, Workflow
 
+logger = logging.getLogger("uiflow")
+
 
 def _cli_breakpoint(index: int, step: Step, variables: dict) -> None:
     print(f"\n>> Haltepunkt bei Schritt {index} ('{step.action}'). Weiter mit Enter...")
@@ -59,7 +61,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             print("Dry-Run erfolgreich - keine Fehler in Ausdrücken/Variablen/Struktur gefunden.")
         return 0
     except StepError as exc:
-        logging.error(str(exc))
+        logger.error(str(exc))
         return 1
     finally:
         close = getattr(backend, "close", None)

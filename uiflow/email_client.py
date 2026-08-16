@@ -107,5 +107,5 @@ def read_emails(
     finally:
         try:
             client.logout()
-        except Exception:  # noqa: BLE001 - best-effort cleanup
+        except Exception:  # noqa: BLE001, S110 - best-effort cleanup
             pass

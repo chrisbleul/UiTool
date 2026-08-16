@@ -37,9 +37,9 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from . import db
 from ..engine import BusinessError, StepError, WorkflowCancelled, WorkflowEngine
 from ..models import Workflow, resolve_sub_workflows
+from . import db
 
 logger = logging.getLogger("uiflow")
 
@@ -132,7 +132,7 @@ def _run_workflow_once(
             if callable(close):
                 try:
                     close()
-                except Exception:  # noqa: BLE001 - best-effort cleanup
+                except Exception:  # noqa: BLE001, S110 - best-effort cleanup
                     pass
 
 
@@ -148,7 +148,7 @@ def _heartbeat_loop(job_id: str, store: Any, interval: float, stop_event: thread
     while not stop_event.wait(interval):
         try:
             store.heartbeat_job(job_id)
-        except Exception:  # noqa: BLE001 - a missed heartbeat must not crash the run itself
+        except Exception:
             logger.warning("Heartbeat for job '%s' failed (will retry)", job_id, exc_info=True)
 
 

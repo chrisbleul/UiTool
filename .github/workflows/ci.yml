@@ -15,6 +15,7 @@ jobs:
           python-version: '3.12'
 
       - run: pip install -e ".[dev]"
+      - run: ruff check uiflow tests
       - run: python -m pytest tests/ -q
 
   deploy:

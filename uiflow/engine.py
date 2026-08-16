@@ -4,7 +4,8 @@ import builtins
 import logging
 import re
 import time
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 
 from . import object_repository
 from .models import Step, Workflow, load_workflow_by_name, parse_steps
@@ -71,8 +72,8 @@ def safe_eval(expression: str, variables: dict[str, Any]) -> Any:
     workflow definitions are authored by the same person running them, like a
     local script, not untrusted remote input."""
     try:
-        return eval(expression, {"__builtins__": _SAFE_BUILTINS}, dict(variables))  # noqa: S307
-    except Exception as exc:  # noqa: BLE001 - wrapped with context by the caller
+        return eval(expression, {"__builtins__": _SAFE_BUILTINS}, dict(variables))
+    except Exception as exc:
         raise ValueError(f"Could not evaluate expression '{expression}': {exc}") from exc
 
 
@@ -148,18 +149,18 @@ class WorkflowEngine:
         # See run()'s `on_request_approval` parameter - None outside a context
         # that can actually wait on a human (e.g. bare `uiflow run`), in which
         # case a `request_approval` step raises rather than hanging forever.
-        self._on_request_approval: Optional[OnRequestApproval] = None
+        self._on_request_approval: OnRequestApproval | None = None
 
     def run(
         self,
         workflow: Workflow,
-        on_breakpoint: Optional[OnBreakpoint] = None,
-        should_stop: Optional[ShouldStop] = None,
-        variables: Optional[dict[str, Any]] = None,
-        global_variables: Optional[dict[str, Any]] = None,
-        sub_workflows: Optional[dict[str, Workflow]] = None,
+        on_breakpoint: OnBreakpoint | None = None,
+        should_stop: ShouldStop | None = None,
+        variables: dict[str, Any] | None = None,
+        global_variables: dict[str, Any] | None = None,
+        sub_workflows: dict[str, Workflow] | None = None,
         dry_run: bool = False,
-        on_request_approval: Optional[OnRequestApproval] = None,
+        on_request_approval: OnRequestApproval | None = None,
     ) -> None:
         self._dry_run = dry_run
         self._on_request_approval = on_request_approval
@@ -204,8 +205,8 @@ class WorkflowEngine:
     def _run_steps(
         self,
         steps: list[Step],
-        on_breakpoint: Optional[OnBreakpoint],
-        should_stop: Optional[ShouldStop],
+        on_breakpoint: OnBreakpoint | None,
+        should_stop: ShouldStop | None,
         prefix: str = "",
     ) -> None:
         for position, step in enumerate(steps):
@@ -235,8 +236,8 @@ class WorkflowEngine:
         step: Step,
         index: int,
         path: str,
-        on_breakpoint: Optional[OnBreakpoint],
-        should_stop: Optional[ShouldStop],
+        on_breakpoint: OnBreakpoint | None,
+        should_stop: ShouldStop | None,
     ) -> None:
         """Applies the step's own `on_error` policy around its dispatch -
         independent of whether it sits inside a `try`/`catch` block. Without
@@ -262,7 +263,7 @@ class WorkflowEngine:
                     return
                 raise
 
-    def _sleep_unless_stopped(self, seconds: float, index: int, should_stop: Optional[ShouldStop]) -> None:
+    def _sleep_unless_stopped(self, seconds: float, index: int, should_stop: ShouldStop | None) -> None:
         """Waits out a retry delay in short slices so a stop request lands
         promptly instead of only after the full delay has elapsed."""
         remaining = seconds
@@ -280,8 +281,8 @@ class WorkflowEngine:
         step: Step,
         index: int,
         path: str,
-        on_breakpoint: Optional[OnBreakpoint],
-        should_stop: Optional[ShouldStop],
+        on_breakpoint: OnBreakpoint | None,
+        should_stop: ShouldStop | None,
     ) -> None:
         if step.action == "if":
             self._run_if(step, index, path, on_breakpoint, should_stop)
@@ -329,8 +330,8 @@ class WorkflowEngine:
         step: Step,
         index: int,
         path: str,
-        on_breakpoint: Optional[OnBreakpoint],
-        should_stop: Optional[ShouldStop],
+        on_breakpoint: OnBreakpoint | None,
+        should_stop: ShouldStop | None,
     ) -> None:
         condition = step.params.get("condition", "False")
         try:
@@ -346,8 +347,8 @@ class WorkflowEngine:
         step: Step,
         index: int,
         path: str,
-        on_breakpoint: Optional[OnBreakpoint],
-        should_stop: Optional[ShouldStop],
+        on_breakpoint: OnBreakpoint | None,
+        should_stop: ShouldStop | None,
     ) -> None:
         expression = step.params.get("expression", "")
         try:
@@ -369,8 +370,8 @@ class WorkflowEngine:
         step: Step,
         index: int,
         path: str,
-        on_breakpoint: Optional[OnBreakpoint],
-        should_stop: Optional[ShouldStop],
+        on_breakpoint: OnBreakpoint | None,
+        should_stop: ShouldStop | None,
     ) -> None:
         items_expr = step.params.get("items", "[]")
         try:
@@ -397,8 +398,8 @@ class WorkflowEngine:
         step: Step,
         index: int,
         path: str,
-        on_breakpoint: Optional[OnBreakpoint],
-        should_stop: Optional[ShouldStop],
+        on_breakpoint: OnBreakpoint | None,
+        should_stop: ShouldStop | None,
     ) -> None:
         try_body = self._sub_steps(step.params.get("steps"))
         catch_body = self._sub_steps(step.params.get("catch"))
@@ -438,8 +439,8 @@ class WorkflowEngine:
         step: Step,
         index: int,
         path: str,
-        on_breakpoint: Optional[OnBreakpoint],
-        should_stop: Optional[ShouldStop],
+        on_breakpoint: OnBreakpoint | None,
+        should_stop: ShouldStop | None,
     ) -> None:
         """Runs another workflow file as a building block of this one.
 
@@ -463,7 +464,7 @@ class WorkflowEngine:
         if sub is None:
             try:
                 sub = load_workflow_by_name(name)
-            except Exception as exc:  # noqa: BLE001 - wrap a missing/broken file with step context
+            except Exception as exc:
                 raise StepError(index, step, exc) from exc
         if sub.backend != self._backend_name:
             raise StepError(
@@ -590,7 +591,7 @@ class WorkflowEngine:
             from .excel import read_excel_rows
 
             rows = read_excel_rows(path, sheet=step.params.get("sheet"))
-        except Exception as exc:  # noqa: BLE001 - wrap any openpyxl/file error with step context
+        except Exception as exc:
             raise StepError(index, step, exc) from exc
         self._log("[%d] read_excel '%s' -> %d row(s) into '%s'", index, path, len(rows), save_as)
         self.variables[save_as] = rows
@@ -614,7 +615,7 @@ class WorkflowEngine:
             from .excel import write_excel_rows
 
             count = write_excel_rows(path, list(rows), sheet=step.params.get("sheet"))
-        except Exception as exc:  # noqa: BLE001 - wrap any openpyxl/file error with step context
+        except Exception as exc:
             raise StepError(index, step, exc) from exc
         self._log("[%d] write_excel '%s' -> %d row(s)", index, path, count)
         if step.save_as:
@@ -651,7 +652,7 @@ class WorkflowEngine:
                 data=resolved.get("data"),
                 timeout=float(resolved.get("timeout", 30)),
             )
-        except Exception as exc:  # noqa: BLE001 - wrap any network/requests error with step context
+        except Exception as exc:
             raise StepError(index, step, exc) from exc
         self._log("[%d] http_request %s %s -> %s", index, resolved.get("method", "GET"), url, result["status_code"])
         if step.save_as:
@@ -665,7 +666,7 @@ class WorkflowEngine:
             from .credentials import get_credential
 
             value = get_credential(name)
-        except Exception as exc:  # noqa: BLE001 - wrap any keyring/backend error with step context
+        except Exception as exc:
             raise StepError(index, step, exc) from exc
         # Deliberately never logs `value` - see _redact_secrets, which uses this set to
         # mask later step-parameter logging (e.g. if the credential is used in a `type` step).
@@ -694,7 +695,7 @@ class WorkflowEngine:
                 use_tls=bool(resolved.get("use_tls", True)),
                 from_addr=resolved.get("from_addr"),
             )
-        except Exception as exc:  # noqa: BLE001 - wrap any smtplib error with step context
+        except Exception as exc:
             raise StepError(index, step, exc) from exc
         self._log("[%d] send_email -> %s", index, resolved.get("to"))
         if step.save_as:
@@ -721,7 +722,7 @@ class WorkflowEngine:
                 use_ssl=bool(resolved.get("use_ssl", True)),
                 mark_as_read=bool(resolved.get("mark_as_read", False)),
             )
-        except Exception as exc:  # noqa: BLE001 - wrap any imaplib error with step context
+        except Exception as exc:
             raise StepError(index, step, exc) from exc
         self._log("[%d] read_emails -> %d message(s) into '%s'", index, len(messages), step.save_as)
         self.variables[step.save_as] = messages
@@ -734,7 +735,7 @@ class WorkflowEngine:
             from .documents import read_pdf_text
 
             text = read_pdf_text(path, pages=step.params.get("pages"))
-        except Exception as exc:  # noqa: BLE001 - wrap any pypdf/file error with step context
+        except Exception as exc:
             raise StepError(index, step, exc) from exc
         self._log("[%d] read_pdf '%s' -> %d char(s) into '%s'", index, path, len(text), step.save_as)
         self.variables[step.save_as] = text
@@ -747,7 +748,7 @@ class WorkflowEngine:
             from .documents import ocr_image_text
 
             text = ocr_image_text(path, lang=step.params.get("lang", "eng"))
-        except Exception as exc:  # noqa: BLE001 - wrap any pytesseract/Tesseract-binary error with step context
+        except Exception as exc:
             raise StepError(index, step, exc) from exc
         self._log("[%d] ocr_image '%s' -> %d char(s) into '%s'", index, path, len(text), step.save_as)
         self.variables[step.save_as] = text
@@ -833,7 +834,7 @@ class WorkflowEngine:
                 try:
                     if exists(**fields):
                         return fields
-                except Exception:  # noqa: BLE001 - a candidate that can't even be checked just isn't a match
+                except Exception:  # noqa: BLE001, S112 - a candidate that can't even be checked just isn't a match
                     continue
         return candidates[0]
 
@@ -846,7 +847,7 @@ class WorkflowEngine:
         self._log("[%d] %s(%s)", index, step.action, resolved_params)
         try:
             result = handler(**resolved_params)
-        except Exception as exc:  # noqa: BLE001 - wrap any backend failure with step context
+        except Exception as exc:
             raise StepError(index, step, exc) from exc
         if step.save_as:
             self.variables[step.save_as] = result

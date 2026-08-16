@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "ruff>=0.16.3"]
 
 [project.scripts]
 uiflow = "uiflow.cli:main"
@@ -30,3 +30,17 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["uiflow*"]
+
+[tool.ruff]
+target-version = "py310"
+
+# AP5.4: erste Einfuehrung eines Linters auf 13k+ Zeilen ohne jede
+# vorherige statische Pruefung. ruff-format ist bewusst nicht Teil dieses
+# Pakets -- "ruff format --check" haette 28 von 39 Dateien als
+# nicht-konform gemeldet, reine Formatierungsdiffs ueber fast den
+# gesamten Code. Das ist eine eigene, groessere Entscheidung, kein
+# Nebeneffekt der Linter-Einfuehrung.
+[tool.ruff.lint]
+# ruffs eigener Default-Regelsatz ist deutlich breiter als der klassische
+# E/F-Kern (siehe "ruff check --show-settings") -- unveraendert uebernommen,
+# nicht selbst zusammengestellt.

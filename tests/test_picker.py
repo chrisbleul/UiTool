@@ -210,9 +210,7 @@ class _FakeDesktopWindow:
                 return False
             if "title" in criteria and info.name != criteria["title"]:
                 return False
-            if "auto_id" in criteria and info.automation_id != criteria["auto_id"]:
-                return False
-            return True
+            return not ("auto_id" in criteria and info.automation_id != criteria["auto_id"])
 
         return [el for el in self._elements if matches(el)]
 
