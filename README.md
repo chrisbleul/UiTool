@@ -3,9 +3,6 @@
 MVP eines UI-Automatisierungstools (à la UiPath), das **Windows-Desktop-Apps** und
 **Browser** über ein gemeinsames YAML-Workflow-Format steuert.
 
-> Hinweis: `DoubleUI.exe` im Repo-Root ist ein unabhängiges Altprojekt (eine
-> WPF-Banktransaktions-Simulation) und hat mit `uiflow` nichts zu tun.
-
 ## Architektur
 
 ```
@@ -51,7 +48,7 @@ Das hält den Kern klein: neue Fähigkeiten = neue Backend-Methode, kein Engine-
 cd "Sandbox\UiTool"
 python -m venv .venv
 .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -e ".[dev]"
 playwright install chromium   # nur für Web-Workflows nötig
 ```
 
