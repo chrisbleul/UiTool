@@ -103,6 +103,74 @@ def test_static_assets_are_reachable_without_auth(protected_client):
     assert res.status_code == 200
 
 
+# --- central platform login (X-Auth-User-Email) vs. the Studio's own login ---
+#
+# AP6.3 (Arbeitsauftrag): behind cgo-app.de/uiflow/, nginx's auth_request
+# already establishes identity via X-Auth-User-Email before a request ever
+# reaches this app - the audit's concern was a "double login" (the platform's
+# once, then this app's own /login on top). These pin down that the header
+# path in require_login (studio/app.py:200) actually takes precedence and
+# never falls through to /login, including when UIFLOW_STUDIO_PASSWORD is
+# set - the one setting most likely to otherwise gate every request. The
+# Studio's own login stays (fixtures above): it's how the tool authenticates
+# when run standalone, without a platform in front of it at all.
+
+
+@pytest.fixture
+def platform_fronted_app(isolated_db, monkeypatch, tmp_path):
+    """A deployment matching cgo-app.de/uiflow/: a platform account exists here
+    (created the same way `uiflow create-user` would, keyed by email like the
+    real installation), AND UIFLOW_STUDIO_PASSWORD is set - the worst case for
+    a double login, since the app's own gate would otherwise apply to every
+    unauthenticated request."""
+    from werkzeug.security import generate_password_hash
+
+    monkeypatch.setattr("uiflow.models.WORKFLOWS_DIR", tmp_path / "workflows")
+    monkeypatch.setattr("uiflow.object_repository.WORKFLOWS_DIR", tmp_path / "workflows")
+    monkeypatch.setenv("UIFLOW_STUDIO_PASSWORD", "hunter2")
+    db.create_user("platform-user@example.com", generate_password_hash("unused"), "admin")
+    app = create_app()
+    app.config.update(TESTING=True)
+    return app.test_client()
+
+
+def test_platform_header_grants_access_without_ever_touching_login(platform_fronted_app):
+    res = platform_fronted_app.get("/", headers={"X-Auth-User-Email": "platform-user@example.com"})
+
+    assert res.status_code == 200
+    assert "/login" not in res.headers.get("Location", "")
+
+
+def test_platform_header_reports_identity_without_a_session_login(platform_fronted_app):
+    me = platform_fronted_app.get("/api/me", headers={"X-Auth-User-Email": "platform-user@example.com"}).get_json()
+
+    assert me == {"username": "platform-user@example.com", "role": "admin", "multiuser": True}
+
+
+def test_platform_header_for_an_unknown_email_is_denied_not_redirected_to_login(platform_fronted_app):
+    # No account for this email was created via `uiflow create-user` -
+    # deliberately no default access (see the comment on require_login),
+    # but still not a second login prompt: a clean 403, not a redirect.
+    res = platform_fronted_app.get("/", headers={"X-Auth-User-Email": "nobody@example.com"})
+
+    assert res.status_code == 403
+    assert "/login" not in res.headers.get("Location", "")
+
+
+def test_platform_header_still_enforces_roles(platform_fronted_app, monkeypatch, tmp_path, isolated_db):
+    from werkzeug.security import generate_password_hash
+
+    db.create_user("viewer@example.com", generate_password_hash("unused"), "viewer")
+
+    res = platform_fronted_app.post(
+        "/api/workflows/some-workflow",
+        headers={"X-Auth-User-Email": "viewer@example.com"},
+        json={"name": "some-workflow", "backend": "web", "steps": []},
+    )
+
+    assert res.status_code == 403
+
+
 # --- multi-user RBAC (see db.any_users_exist / studio/app.py's require_login) ---
 
 
