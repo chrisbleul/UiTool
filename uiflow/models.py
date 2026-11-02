@@ -6,12 +6,14 @@ from typing import Any
 
 import yaml
 
+from .paths import DATA_ROOT
+
 VALID_BACKENDS = ("web", "desktop")
 
 # Where workflows referenced *by name* are looked up - the `run_workflow` action
 # and the Studio both resolve against this one directory, so a sub-workflow is
 # the same file the builder saves and lists.
-WORKFLOWS_DIR = Path(__file__).resolve().parent.parent / "workflows"
+WORKFLOWS_DIR = DATA_ROOT / "workflows"
 
 
 VALID_ON_ERROR = ("continue", "retry")

@@ -20,6 +20,7 @@ from .. import models
 from ..engine import StepError, WorkflowEngine
 from ..models import Workflow, resolve_sub_workflows
 from ..orchestrator import db
+from ..paths import DATA_ROOT
 from .schema import ACTION_SCHEMAS, activity_catalog
 
 
@@ -41,7 +42,7 @@ class _ListLogHandler(logging.Handler):
         self._sink.append(self.format(record))
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+PROJECT_ROOT = DATA_ROOT
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 # `global` and `item` are placeholder namespaces, not variable names - a global

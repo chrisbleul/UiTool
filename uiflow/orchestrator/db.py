@@ -17,10 +17,11 @@ import sqlite3
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any
 
-DB_PATH = Path(__file__).resolve().parent.parent.parent / "orchestrator.db"
+from ..paths import DATA_ROOT
+
+DB_PATH = DATA_ROOT / "orchestrator.db"
 
 # Retry backoff bounds (see retry_delay_seconds). Kept small: a queue-driven job
 # waits these out in-process, so the ceiling is what a single job can idle for.
